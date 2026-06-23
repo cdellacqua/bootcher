@@ -51,6 +51,16 @@ post = "echo 'run post-deploy smoke test'"
 
 Each hook runs with `sh -c` from the project root. The terminal is handed over — the hook may print freely, prompt, or `sudo`. A non-zero exit aborts the run.
 
+## Continuous deployment
+
+`deploy` (push an update to the registry) and `provision` (build a disk artifact)
+both run unattended given the right env: the admin key via `--ssh-key`, the pull
+credential via `BOOTCHER_PULL_USER` / `BOOTCHER_PULL_TOKEN`, and a signing
+passphrase via `BOOTCHER_SIGN_PASSPHRASE` (so a missing TTY never blocks them).
+The [`recipes/ci/`](https://github.com/cdellacqua/bootcher/tree/main/recipes/ci)
+recipe has copy-pasteable GitHub Actions and GitLab CI pipelines that wire this up
+against the registry associated with your repo.
+
 ## Multi-arch builds
 
 If `[general.disk_types]` lists more than one architecture, `build` fans out per-arch builds in parallel (up to `[concurrency] build` workers), then assembles them into a single multi-arch manifest list. `upgrade` does the same for the per-device SSH rollout (up to `[concurrency] upgrade` workers).

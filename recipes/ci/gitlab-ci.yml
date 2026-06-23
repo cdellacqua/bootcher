@@ -1,0 +1,111 @@
+# bootcher CI for GitLab.
+#
+# Copy this to your bootcher project as `.gitlab-ci.yml` at the repo root.
+#
+# Two jobs:
+#   deploy    — on the default branch and on tags: `bootcher deploy` builds the
+#               container and pushes `<registry>/<name>:latest` to this project's
+#               Container Registry. Devices self-update.
+#   provision — a manual job: `bootcher deploy`'s sibling for first install —
+#               `bootcher provision` builds the container + disk image and saves
+#               `output/` as a job artifact for you to download and flash.
+#
+# Runs inside the official bootcher image (it bundles podman + qemu). Both jobs
+# need a PRIVILEGED job container: podman builds containers, and the image-builder
+# disk step launches a privileged container. GitLab.com's hosted `saas-linux-*`
+# runners already run in privileged mode (each job gets an isolated, ephemeral VM),
+# so both jobs work as-is — no runner setup needed. A self-managed runner
+# (`privileged = true`, or a shell runner on a podman host) is only needed if you
+# want to narrow the privilege grant or route a build step to a `vm`/`/dev/kvm`.
+#
+# bootcher.toml must point its registry at this project's registry:
+#
+#   [deploy]
+#   registry = "registry.gitlab.com/<group>/<project>"   # == $CI_REGISTRY_IMAGE
+#
+# CI/CD variables (Settings → CI/CD → Variables; mask them):
+#   ADMIN_SSH_PUBKEY         (provision) the admin SSH PUBLIC key (the `.pub` line),
+#                            baked into the disk as the `admin` login. Not secret — a
+#                            plain (unmasked) variable is fine. Keep the matching
+#                            private key wherever you SSH to devices from.
+#   BOOTCHER_PULL_USER /     (provision, registry mode) a LONG-LIVED read-only
+#   BOOTCHER_PULL_TOKEN      credential baked into the disk so the device can pull
+#                            updates. Use a Deploy Token with `read_registry` scope
+#                            — NOT $CI_JOB_TOKEN, which expires with the pipeline.
+#                            bootcher reads these env vars directly. Public
+#                            registry? Drop them and add `--anonymous` below.
+#   BOOTCHER_SIGN_PASSPHRASE (optional) the cosign key passphrase, if you enabled
+#                            signing and your key has one. Set it even when empty (to
+#                            "") so cosign doesn't prompt on the non-interactive runner.
+# Secure Files (Settings → CI/CD → Secure Files), only if you enabled signing:
+#   cosign.key               the cosign PRIVATE key `[deploy] registry.key` points at.
+#                            A Secure File, not a CI variable, because a PEM is
+#                            multi-line and so can't be a *masked* variable. The deploy
+#                            job fetches it before signing the push (see below).
+#                            Note: Secure Files can't be scoped to protected branches
+#                            the way a Protected variable can — protect your default
+#                            branch and keep deploy default-branch-only (it is) so only
+#                            trusted pipelines can fetch the key.
+
+default:
+  # The published bootcher image (multi-arch, bundles podman + qemu). Pin `:latest`
+  # to a released `:vX.Y.Z` for reproducible builds.
+  image:
+    name: ghcr.io/cdellacqua/bootcher:latest
+    entrypoint: [""] # the image's entrypoint is bootcher itself; we drive it from sh
+
+stages: [deploy, provision]
+
+# Push an update to the registry. Container build + `podman push`; no disk step,
+# so no sudo needed here.
+deploy:
+  stage: deploy
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG
+  # Signing? Uncomment to set the cosign key's passphrase (use "" if it has none);
+  # the env var wins over cosign's TTY prompt even when empty, so the non-interactive
+  # runner doesn't hang/fail.
+  # variables:
+  #   BOOTCHER_SIGN_PASSPHRASE: ""
+  script:
+    - echo "$CI_REGISTRY_PASSWORD" | podman login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
+    # Signing? The cosign key `[deploy] registry.key` points at is git-ignored, so fetch
+    # it from GitLab Secure Files (uploaded as cosign.key) before deploy signs the push.
+    # The installer downloads every secure file into ./.secure_files/; copy the key to
+    # where the manifest expects it (cosign.key), leaving the committed path unchanged
+    # for local runs. curl ships as curl-minimal (still /usr/bin/curl), so the guard is
+    # a no-op there and only installs a client on an image lacking one entirely.
+    # - command -v curl >/dev/null || dnf install -y --setopt=install_weak_deps=False curl >/dev/null
+    # - curl --silent "https://gitlab.com/gitlab-org/incubation-engineering/mobile-devops/download-secure-files/-/raw/main/installer" | bash
+    # - install -m 600 .secure_files/cosign.key cosign.key
+    # Skipping the per-device `bootc upgrade` keeps the admin SSH key out of CI and
+    # doesn't assume the runner can reach the fleet — devices pick the update up on
+    # their auto-update timer. Drop the flag (and add the key) to roll immediately.
+    - bootcher deploy --skip-bootc-upgrade
+
+# Build a disk image to flash. The image-builder disk step shells out to `sudo`,
+# which the base image doesn't ship — install it (root needs no password).
+provision:
+  stage: provision
+  rules:
+    # Manual must live INSIDE the rule: a job-level `when: manual` is ignored once
+    # `rules` is present (a matched rule with no `when` defaults to on_success), so
+    # it would otherwise run automatically. `allow_failure: true` keeps this optional
+    # job from blocking the pipeline — start it from the UI when you need a disk.
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: true
+  script:
+    - dnf install -y --setopt=install_weak_deps=False sudo >/dev/null
+    # provision reads only the `.pub` sibling of `--ssh-key`, so the public key is all
+    # CI needs (`admin_key` itself never has to exist). Keeping the private key out of
+    # CI is safe: these jobs never SSH to a device.
+    - printf '%s\n' "$ADMIN_SSH_PUBKEY" > admin_key.pub
+    # The disk bakes the admin pubkey and, in registry mode, the pull token
+    # ($BOOTCHER_PULL_USER/$BOOTCHER_PULL_TOKEN, read from the environment). For a
+    # public registry, append `--anonymous` instead.
+    - bootcher provision --ssh-key admin_key
+  artifacts:
+    paths: [output/]
+    expire_in: 1 week
