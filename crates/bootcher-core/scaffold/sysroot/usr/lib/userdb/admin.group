@@ -1,0 +1,6 @@
+{
+    "groupName": "admin",
+    "disposition": "regular",
+    "gid": 1000,
+    "members": ["admin"]
+}

@@ -1,0 +1,76 @@
+FROM quay.io/fedora/fedora-bootc:latest
+
+# Install jq + fish (deps of the admin user record: jq for the derivation
+# below, fish as admin's login shell) and stamp the userdb derivation script
+# at a stable path so leaf images can re-run it after layering their own
+# userdb records on top.
+#
+RUN dnf install -y jq fish
+
+# Security baseline packages. firewalld + chrony are typically in the
+# fedora-bootc base already (dnf install is a no-op if so); fail2ban isn't.
+# Pinned here rather than inside derive-userdb.sh because they're image-wide
+# concerns, not dependencies of the userdb derivation that script runs.
+RUN dnf install -y firewalld fail2ban chrony
+
+# Enable the security services + bootc's auto-update timer.
+#   - chronyd: keep system time accurate so cert validation and journal
+#     timestamps don't drift on power-cycled SBCs without an RTC.
+#   - firewalld: applies the zone config copied to /etc/firewalld/ above.
+#   - fail2ban: needs firewalld up to install its ban rules at runtime.
+#   - bootc-fetch-apply-updates.timer: fedora-bootc enables it by default
+#     today (see standard/autoupdates.yaml upstream), but enabling it here
+#     pins the behavior so a future base-image change can't silently turn it
+#     off.
+RUN systemctl enable \
+        chronyd.service \
+        firewalld.service \
+        fail2ban.service \
+        bootc-fetch-apply-updates.timer
+
+# Drop dnf metadata/cache last so any future `dnf install` step added above
+# this line still benefits from the previous layer's cached repo metadata.
+RUN dnf clean all
+
+COPY sysroot/ /
+
+# Create the dir the sshd drop-in's `AuthorizedKeysFile /etc/ssh/authorized_keys.d/%u`
+# points at. fedora-bootc ships none, and `bootcher provision` drops the admin key
+# into it via image-builder — which won't create a missing parent — so bake it here (0755,
+# root-owned) to keep the image self-consistent.
+RUN mkdir -p /etc/ssh/authorized_keys.d && chmod 0755 /etc/ssh/authorized_keys.d
+
+# Dirs the image-signing files land in when signing is enabled (via `[deploy] registry`
+# inline table): the cosign public key (/etc/pki/containers) and the
+# use-sigstore-attachments drop-in (/etc/containers/registries.d). `bootcher provision`
+# injects those files via image-builder, which won't create a missing parent, so bake the dirs
+# here. Harmless when signing is off (two empty dirs).
+RUN mkdir -p /etc/pki/containers /etc/containers/registries.d \
+        && chmod 0755 /etc/pki/containers /etc/containers/registries.d
+
+# Passwordless sudo for wheel. Required because the JSON user record sets no
+# password — without this, key-auth SSH works but sudo would have no way to authenticate.
+# Mode 0440 is mandatory; sudo refuses to read drop-ins with looser permissions.
+RUN chmod 0440 /etc/sudoers.d/wheel-nopasswd
+
+# The admin SSH authorized key and (in registry mode) the /etc/ostree/auth.json
+# pull secret are NOT baked here — `bootcher provision` injects them into the
+# device's persistent /etc, where the ostree 3-way merge keeps them across
+# upgrades. The image stays secret-free.
+RUN chmod 0755 /usr/libexec/derive-userdb.sh
+
+# The derivation generates nss-systemd metadata from /usr/lib/userdb/*.user:
+#   - <uid>.user / <gid>.group reverse-lookup symlinks. Without these sshd's
+#     login_get_lastlog dies with "Cannot find account for uid N" post-auth.
+#   - <user>.user-privileged → <uid>.user-privileged symlink, if present, and
+#     the privileged file itself chmod'd to 0600 (nss-systemd refuses to read
+#     it otherwise — it holds sshAuthorizedKeys and must be root-only).
+#   - <user>:<group>.membership markers for the primary group + every memberOf
+#     entry. nss-systemd treats the JSON record's memberOf field as advisory —
+#     these marker files are what actually grants the group membership.
+# Idempotent: re-running it just recreates the symlinks/markers, so leaves
+# that drop additional userdb/*.user files pick them up cleanly.
+# Ref. https://www.freedesktop.org/software/systemd/man/latest/nss-systemd.html#Static%20Drop-In%20JSON%20User/Group%20Records
+RUN /usr/libexec/derive-userdb.sh
+
+RUN bootc container lint

@@ -1,0 +1,19 @@
+# Bootcher base fail2ban config. The sshd jail is largely defense-in-depth /
+# log-noise reduction: password auth is disabled (see sshd_config.d/10-hardening.conf)
+# so brute-force can't succeed, but banning repeat offenders still cleans up the
+# journal and saves a bit of CPU on key-exchange handshakes from scanners.
+#
+# backend=systemd reads from the journal, which is where Fedora sends sshd logs
+# by default — there's no /var/log/secure on a minimal bootc system.
+# banaction=firewallcmd-rich-rules integrates with the firewalld zone shipped
+# under /etc/firewalld/zones/public.xml.
+
+[DEFAULT]
+backend = systemd
+banaction = firewallcmd-rich-rules
+bantime = 1h
+findtime = 10m
+maxretry = 5
+
+[sshd]
+enabled = true

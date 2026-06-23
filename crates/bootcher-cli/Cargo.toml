@@ -1,0 +1,47 @@
+[package]
+name = "bootcher-cli"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+description = "A standalone CLI for building, customizing, and deploying bootc images for any target — servers, VMs, cloud, appliances, and single-board computers."
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "bootcher"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.102"
+bootcher-core = { path = "../bootcher-core" }
+clap = { version = "4.6.1", features = ["derive"] }
+
+[features]
+# Opt-in for the slow VM end-to-end tests (tests/e2e_vm.rs, e2e_registry.rs,
+# e2e_lan_to_registry.rs, e2e_registry_sign.rs): with it off, those tests are
+# `#[ignore]`d (but still compiled); enabling it un-ignores them. Run via
+# `cargo test -p bootcher-cli --features e2e` (or `just e2e`).
+e2e = []
+# Opt-in for the *cross-arch* builder e2e (tests/e2e_cross_arch.rs) — a separate,
+# far slower test (foreign-arch build + boot entirely under TCG emulation) with
+# different prerequisites (foreign qemu + firmware + qemu-user binfmt; no KVM/sudo),
+# so it's gated apart from `e2e`. Run via `just e2e-cross`.
+e2e_cross = []
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+# The VM e2e test (tests/e2e_vm.rs) drives a booted bootc disk through the shared
+# qemu RAII + ssh helpers in bootcher-core::qemu.
+bootcher-core = { path = "../bootcher-core" }
+duct = "1.1.1"
+# The takeover e2e (tests/e2e_takeover.rs) builds a NoCloud CIDATA seed for the
+# stock Debian guest, same FAT-image approach as bootcher-core's vm builder.
+fatfs = "0.3"
+predicates = "3.1.4"
+tempfile = "3.27.0"
+
+[lints]
+workspace = true

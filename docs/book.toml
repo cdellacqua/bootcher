@@ -1,0 +1,15 @@
+[book]
+title = "bootcher"
+description = "An opinionated tool for crafting bootc images."
+src = "src"
+language = "en"
+
+[output.html]
+git-repository-url = "https://github.com/cdellacqua/bootcher"
+edit-url-template = "https://github.com/cdellacqua/bootcher/edit/main/docs/{path}"
+additional-js = ["mermaid.min.js", "mermaid-init.js"]
+
+[preprocessor]
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"

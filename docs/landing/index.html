@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>bootcher — an opinionated tool for crafting bootc images</title>
+    <meta
+      name="description"
+      content="An opinionated tool for crafting bootc images. bootcher scaffolds a self-contained project with a security baseline you own and edit, then drives the lifecycle: build the container, turn it into a bootable disk image, and roll subsequent updates to running devices."
+    />
+    <link rel="icon" href="favicon.svg" />
+    <meta property="og:title" content="bootcher" />
+    <meta
+      property="og:description"
+      content="An opinionated tool for crafting bootc images: scaffold a project, build the container, turn it into a bootable disk image, and roll updates to running devices."
+    />
+    <meta property="og:type" content="website" />
+    <style>
+      :root {
+        --ink: #e7e9f3;
+        --muted: #99a0c0;
+        --pur: #a78bfa;
+        --cyan: #38bdf8;
+        --ok: #34d399;
+        --card: rgba(255, 255, 255, 0.04);
+        --line: rgba(255, 255, 255, 0.1);
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html {
+        scroll-behavior: smooth;
+      }
+      body {
+        margin: 0;
+        font-family:
+          "Segoe UI",
+          system-ui,
+          -apple-system,
+          sans-serif;
+        color: var(--ink);
+        background:
+          radial-gradient(
+            1100px 600px at 75% -10%,
+            rgba(56, 189, 248, 0.14),
+            transparent 60%
+          ),
+          radial-gradient(
+            900px 600px at 10% 0%,
+            rgba(167, 139, 250, 0.16),
+            transparent 55%
+          ),
+          #0b0e1f;
+        line-height: 1.6;
+        -webkit-font-smoothing: antialiased;
+      }
+      a {
+        color: var(--cyan);
+        text-decoration: none;
+      }
+      .wrap {
+        max-width: 1080px;
+        margin: 0 auto;
+        padding: 0 24px;
+      }
+
+      /* top bar */
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 22px 0;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 11px;
+        font-weight: 700;
+        font-size: 20px;
+      }
+      .brand img {
+        width: 26px;
+        height: 26px;
+      }
+      nav a {
+        color: var(--muted);
+        margin-left: 22px;
+        font-size: 15px;
+      }
+      nav a:hover {
+        color: var(--ink);
+      }
+
+      /* hero */
+      .hero {
+        text-align: center;
+        padding: 30px 0 10px;
+      }
+      .tag {
+        display: inline-block;
+        font-size: 13px;
+        letter-spacing: 0.4px;
+        color: var(--pur);
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        padding: 5px 14px;
+        margin-bottom: 22px;
+        background: var(--card);
+      }
+      h1 {
+        font-size: clamp(32px, 5.5vw, 54px);
+        line-height: 1.1;
+        margin: 0 0 18px;
+      }
+      h1 .grad {
+        background: linear-gradient(92deg, var(--pur), var(--cyan));
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+      .lede {
+        font-size: clamp(16px, 2.2vw, 20px);
+        color: var(--muted);
+        max-width: 640px;
+        margin: 0 auto 30px;
+      }
+
+      .cta {
+        display: flex;
+        gap: 14px;
+        justify-content: center;
+        flex-wrap: wrap;
+        margin-bottom: 14px;
+      }
+      .btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 12px 22px;
+        border-radius: 10px;
+        font-weight: 600;
+        font-size: 15.5px;
+        border: 1px solid transparent;
+        transition:
+          transform 0.12s ease,
+          box-shadow 0.12s ease;
+      }
+      .btn:hover {
+        transform: translateY(-2px);
+      }
+      .btn-primary {
+        color: #0b0e1f;
+        background: linear-gradient(92deg, var(--pur), var(--cyan));
+        box-shadow: 0 8px 30px rgba(56, 189, 248, 0.25);
+      }
+      .btn-ghost {
+        color: var(--ink);
+        border-color: var(--line);
+        background: var(--card);
+      }
+
+      /* animated diagram */
+      .stage {
+        margin: 26px auto 8px;
+        max-width: 920px;
+      }
+      .stage img {
+        width: 100%;
+        height: auto;
+        display: block;
+      }
+      @media (max-width: 800px) {
+        .stage {
+          max-width: 320px;
+        }
+      }
+
+      /* feature cards */
+      .features {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 18px;
+        margin: 46px 0;
+      }
+      .card {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 22px;
+      }
+      .card h3 {
+        margin: 0 0 8px;
+        font-size: 17px;
+      }
+      .card h3 .dot {
+        color: var(--cyan);
+      }
+      .card p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 14.5px;
+      }
+
+      /* deploy modes */
+      .modes {
+        margin: 46px 0;
+      }
+      .modes h2 {
+        text-align: center;
+        font-size: 24px;
+        margin: 0 0 6px;
+      }
+      .modes .sub2 {
+        text-align: center;
+        color: var(--muted);
+        font-size: 15px;
+        margin: 0 0 22px;
+      }
+      .modes .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+        gap: 18px;
+      }
+      .modes h3 .pill {
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--ok);
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        padding: 2px 9px;
+        margin-left: 8px;
+        vertical-align: middle;
+      }
+
+      /* quick start */
+      .quick {
+        margin: 40px 0 50px;
+      }
+      .quick h2 {
+        text-align: center;
+        font-size: 24px;
+        margin: 0 0 18px;
+      }
+      pre {
+        background: #0d1124;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 20px 22px;
+        overflow-x: auto;
+        font-size: 14.5px;
+        line-height: 1.8;
+        font-family: "Cascadia Code", "SF Mono", Menlo, Consolas, monospace;
+        max-width: 620px;
+        margin: 0 auto;
+      }
+      pre .c {
+        color: var(--muted);
+      }
+      pre .k {
+        color: var(--pur);
+      }
+      pre .g {
+        color: var(--ok);
+      }
+
+      footer {
+        border-top: 1px solid var(--line);
+        padding: 26px 0 40px;
+        color: var(--muted);
+        font-size: 14px;
+        text-align: center;
+      }
+      footer a {
+        color: var(--muted);
+      }
+      footer a:hover {
+        color: var(--ink);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <header>
+        <span class="brand"><img src="favicon.svg" alt="" />bootcher</span>
+        <nav>
+          <a href="book/">Docs</a>
+          <a href="book/api/bootcher/">API</a>
+          <a href="https://github.com/cdellacqua/bootcher">GitHub</a>
+        </nav>
+      </header>
+
+      <section class="hero">
+        <span class="tag">built on bootc</span>
+        <h1>
+          From Containerfile<br />to <span class="grad">running device</span>
+        </h1>
+        <p class="lede">
+          bootcher scaffolds a self-contained project — one bootc image with a
+          security baseline you own and edit — then drives the lifecycle: build
+          the container, turn it into a bootable disk image, and roll subsequent
+          updates to running devices.
+        </p>
+        <div class="cta">
+          <a class="btn btn-primary" href="book/">Read the docs →</a>
+          <a class="btn btn-ghost" href="book/installation.html">Install</a>
+          <a class="btn btn-ghost" href="https://github.com/cdellacqua/bootcher"
+            >GitHub</a
+          >
+        </div>
+      </section>
+
+      <figure class="stage">
+        <picture>
+          <source media="(max-width: 800px)" srcset="lifecycle-vertical.svg" />
+          <img
+            src="lifecycle.svg"
+            alt="The bootcher lifecycle in three steps: provision builds the disk and a device takes its first boot; deploy pushes an update and the device shows upgraded; then deploy loops on each release and the single device becomes a fleet of five, all upgraded at once."
+          />
+        </picture>
+      </figure>
+
+      <section class="features">
+        <div class="card">
+          <h3><span class="dot">●</span> Scaffold</h3>
+          <p>
+            <code>bootcher init</code> stamps out a self-contained project — one
+            bootc image with a security baseline that's yours to edit.
+          </p>
+        </div>
+        <div class="card">
+          <h3><span class="dot">●</span> Provision</h3>
+          <p>
+            <code>bootcher provision</code> builds the image and turns it into a
+            bootable disk, ready to flash and boot.
+          </p>
+        </div>
+        <div class="card">
+          <h3><span class="dot">●</span> Deploy</h3>
+          <p>
+            <code>bootcher deploy</code> rebuilds and pushes the update to your
+            running devices, then upgrades them in place.
+          </p>
+        </div>
+      </section>
+
+      <section class="modes">
+        <h2>Two ways to deploy</h2>
+        <p class="sub2">
+          bootcher picks the path automatically from your project config.
+        </p>
+        <div class="grid">
+          <div class="card">
+            <h3>LAN<span class="pill">default</span></h3>
+            <p>
+              Push straight to devices on your network over your existing SSH
+              connection. Everything rides the secure tunnel, so it works out of
+              the box — ideal for a workshop bench or an air-gapped LAN.
+            </p>
+          </div>
+          <div class="card">
+            <h3>Registry</h3>
+            <p>
+              Push to a container registry and point devices at it. Updates
+              become genuine over-the-air: ship a release from your machine or a
+              CI runner and devices pull on their own.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section class="quick">
+        <h2>Up and running</h2>
+        <pre><span class="c"># scaffold a new project</span>
+<span class="k">bootcher</span> init my-os
+cd my-os
+
+<span class="c"># create a bootable disk</span>
+<span class="k">bootcher</span> provision
+
+<span class="c"># roll updates to your devices</span>
+<span class="k">bootcher</span> <span class="g">deploy</span></pre>
+      </section>
+
+      <footer>
+        bootcher — MIT licensed · <a href="book/">Documentation</a> ·
+        <a href="https://github.com/cdellacqua/bootcher">Source on GitHub</a>
+      </footer>
+    </div>
+  </body>
+</html>

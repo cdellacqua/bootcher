@@ -1,0 +1,9 @@
+{
+    "userName": "admin",
+    "disposition": "regular",
+    "uid": 1000,
+    "gid": 1000,
+    "memberOf": ["wheel"],
+    "homeDirectory": "/var/home/admin",
+    "shell": "/usr/bin/fish"
+}

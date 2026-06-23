@@ -1,0 +1,6 @@
+# image-builder artifacts.
+/output/
+
+# Image-signing private key(s) from `bootcher sign keygen` — never commit these.
+# The public `*.pub` half is safe to commit (it's what devices verify against).
+*.key

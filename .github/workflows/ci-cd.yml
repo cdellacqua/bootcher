@@ -1,0 +1,194 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+# Default to read-only; jobs that need more (e.g. release) opt in locally.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Format, lint, and test on a single Linux host. bootcher is Linux-only
+  # (Podman is native Linux), so there's no cross-OS matrix to verify.
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          # Cache the registry index/cache and git db (not the regenerable
+          # extracted ~/.cargo/registry/src), plus the build artifacts.
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          # Exact match only: a partial restore could warm-start from artifacts
+          # built with a different toolchain/deps and flake the build. Bust the
+          # cache when the lockfile or the pinned toolchain changes.
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+      # Fetch with --locked (needs network, verifies the lockfile is current),
+      # then build/test with --frozen so the rest of the run is offline and
+      # can't mutate Cargo.lock or pull anything unexpected.
+      # Install the `just` task runner so CI runs the exact same recipe a
+      # developer runs locally (`just ci`), keeping the two from drifting. Same
+      # `cargo install --locked` pattern as cargo-audit below; lands in the
+      # cached ~/.cargo/bin/.
+      - name: Install just
+        run: cargo install just --locked
+      - name: Fetch dependencies
+        run: cargo fetch --locked
+      # cargo_flags=--frozen keeps the run offline and pins Cargo.lock; locally
+      # the recipe defaults to no extra flags.
+      - name: Verify (just ci)
+        run: just cargo_flags=--frozen ci
+
+  # Build and deploy the landing page + mdBook + rustdoc site to GitHub Pages on
+  # every push to main. `just docs` assembles docs/site/: the landing page at the
+  # root, the mdBook under book/, and rustdoc under book/api/. Requires GitHub
+  # Pages to be configured with source "GitHub Actions" in the repository settings.
+  pages:
+    needs: [verify, audit]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+      - name: Install just
+        run: cargo install just --locked
+      - name: Install mdbook
+        run: cargo install mdbook --locked
+      - name: Fetch dependencies
+        run: cargo fetch --locked
+      - name: Build docs
+        run: just cargo_flags=--frozen docs
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        with:
+          path: docs/site/
+      - id: deploy
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
+
+  # Scan dependencies against the RUSTSEC advisory database. Reads only
+  # Cargo.lock, so it needs no system deps.
+  audit:
+    needs: [verify]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit
+        run: cargo audit
+
+  # Build release binaries for the two arches bootcher targets, on native
+  # runners (no cross-compilation needed). Tags only.
+  release:
+    needs: [verify, audit]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Fetch dependencies
+        run: cargo fetch --locked
+      - name: Build
+        run: cargo build --release --frozen -p bootcher-cli
+      - name: Package
+        run: tar -C target/release -czf bootcher-${{ matrix.target }}.tar.gz bootcher
+      - name: Upload to release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          files: bootcher-${{ matrix.target }}.tar.gz
+
+  # Build and publish the container image to ghcr.io. The image wraps the
+  # Linux-only binary so bootcher can run on macOS/Windows via the Podman/Docker
+  # machine VM (see Containerfile + README). Built per-arch on native runners —
+  # emulated cross-arch builds are slow and historically flaky — then stitched
+  # into one multi-arch manifest by the merge job below. Uses podman (preinstalled
+  # on the runners), so no extra third-party actions to pin. Tags only.
+  image:
+    needs: [verify, audit]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      # ghcr.io requires a lowercase repo path; github.repository preserves the
+      # owner's casing, so normalize it once into the job env.
+      - name: Resolve image name
+        run: echo "IMAGE=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+      - name: Log in to ghcr.io
+        run: echo '${{ secrets.GITHUB_TOKEN }}' | podman login ghcr.io -u '${{ github.actor }}' --password-stdin
+      # Native build for this runner's arch; tag with the arch suffix so the
+      # merge job can assemble the manifest list from both.
+      - name: Build
+        run: podman build --platform linux/${{ matrix.arch }} -f Containerfile -t "$IMAGE:${{ github.ref_name }}-${{ matrix.arch }}" .
+      - name: Push
+        run: podman push "$IMAGE:${{ github.ref_name }}-${{ matrix.arch }}"
+
+  # Combine the per-arch images into multi-arch manifest lists and tag them
+  # `vX.Y.Z` and `latest`, so `podman pull ghcr.io/<owner>/bootcher` resolves to
+  # the puller's architecture.
+  image-manifest:
+    needs: image
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Resolve image name
+        run: echo "IMAGE=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+      - name: Log in to ghcr.io
+        run: echo '${{ secrets.GITHUB_TOKEN }}' | podman login ghcr.io -u '${{ github.actor }}' --password-stdin
+      - name: Create and push manifests
+        run: |
+          version="${{ github.ref_name }}"
+          for tag in "$version" latest; do
+            podman manifest create "$IMAGE:$tag"
+            podman manifest add "$IMAGE:$tag" "docker://$IMAGE:$version-amd64"
+            podman manifest add "$IMAGE:$tag" "docker://$IMAGE:$version-arm64"
+            podman manifest push --all "$IMAGE:$tag" "docker://$IMAGE:$tag"
+            podman manifest rm "$IMAGE:$tag"
+          done

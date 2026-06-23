@@ -1,0 +1,172 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 540" role="img"
+     aria-labelledby="title desc" font-family="'Segoe UI', system-ui, sans-serif">
+  <title id="title">The bootcher device lifecycle, scaling from one device to a fleet</title>
+  <desc id="desc">
+    A three-step loop. First, provision builds the disk and a single device takes
+    its first boot. Then a packet moves down to deploy, which pushes an update and
+    the same device shows "upgraded". Finally deploy loops over itself, the single
+    device becomes a fleet of five, and they all blink "upgraded" at once.
+  </desc>
+
+  <style>
+    :root {
+      --ink:   #e7e9f3;
+      --muted: #99a0c0;
+      --line:  rgba(255,255,255,.16);
+      --fill:  rgba(255,255,255,.04);
+      --pur:   #a78bfa;
+      --cyan:  #38bdf8;
+      --ok:    #34d399;
+      --amber: #fbbf24;
+      --scr:   #1f2440;
+    }
+    .node  { fill: var(--fill); stroke: var(--line); stroke-width: 1.5; }
+    .label { fill: var(--ink); font-size: 18px; font-weight: 600; text-anchor: middle; }
+    .sub   { fill: var(--muted); font-size: 11.5px; text-anchor: middle; }
+    .loopt { fill: var(--pur); font-size: 12.5px; font-weight: 600; text-anchor: middle; }
+    .wire  { stroke: var(--cyan); stroke-width: 2; fill: none; opacity: .6; }
+    .status{ font-size: 13px; font-weight: 600; text-anchor: middle; }
+
+    /* ---- master 12s timeline, three 4s frames (0-33% / 33-66% / 66-100%) ---- */
+    .p0  { animation: p0  12s linear infinite; }
+    .p1  { animation: p1  12s linear infinite; }
+    .p3  { animation: p3  12s linear infinite; }
+    .p23 { animation: p23 12s linear infinite; }
+    /* init owns the opening beat while the packet travels to provision (~12%);
+       provision (and the device's first boot) only begin once it arrives. */
+    @keyframes p0  { 0%{opacity:1} 11%{opacity:1} 13%{opacity:0} 100%{opacity:0} }
+    @keyframes p1  { 0%,12%{opacity:0} 15%{opacity:1} 30%{opacity:1} 33%{opacity:0} 100%{opacity:0} }
+    @keyframes p3  { 0%,66%{opacity:0} 70%{opacity:1} 97%{opacity:1} 100%{opacity:0} }
+    @keyframes p23 { 0%,33%{opacity:0} 37%{opacity:1} 97%{opacity:1} 100%{opacity:0} }
+
+    /* boot progress bar fills during frame 1 */
+    .boot { transform-box: fill-box; transform-origin: left center; animation: boot 12s linear infinite; }
+    @keyframes boot {
+      0%,12%{transform:scaleX(0); opacity:0} 15%{opacity:1}
+      30%{transform:scaleX(1); opacity:1} 33%{transform:scaleX(1); opacity:0}
+      100%{transform:scaleX(0); opacity:0}
+    }
+
+    /* "upgrading" progress bar — mirrors first boot. The centre device upgrades
+       when the packet reaches deploy (frame 2, ~45%), then re-fills together with
+       the whole fleet on the "next release" loop (frame 3); the fleet bars fill in
+       sync. (The bar resets while invisible at ~67% so there's no visible snap.) */
+    .upg  { transform-box: fill-box; transform-origin: left center; animation: upg  12s linear infinite; }
+    .upgF { transform-box: fill-box; transform-origin: left center; animation: upgF 12s linear infinite; }
+    .upgt { animation: upgt 12s linear infinite; }
+    @keyframes upg {
+      0%,45%{transform:scaleX(0); opacity:0} 48%{transform:scaleX(.05); opacity:1}
+      62%{transform:scaleX(1); opacity:1} 66%{transform:scaleX(1); opacity:1}
+      67%{transform:scaleX(1); opacity:0} 68%{transform:scaleX(0); opacity:0}
+      72%{transform:scaleX(.05); opacity:1} 90%{transform:scaleX(1); opacity:1}
+      97%{transform:scaleX(1); opacity:1} 100%{transform:scaleX(1); opacity:0}
+    }
+    @keyframes upgF {
+      0%,68%{transform:scaleX(0); opacity:0} 72%{transform:scaleX(.05); opacity:1}
+      90%{transform:scaleX(1); opacity:1} 97%{transform:scaleX(1); opacity:1}
+      100%{transform:scaleX(1); opacity:0}
+    }
+    @keyframes upgt { 0%,44%{opacity:0} 48%{opacity:1} 97%{opacity:1} 100%{opacity:0} }
+
+    @media (prefers-reduced-motion: reduce) {
+      * { animation: none !important; }
+      .dot { visibility: hidden !important; }       /* freeze on the final fleet frame */
+      .p0, .p1, .boot { opacity: 0 !important; }
+      .p3, .p23, .upgt { opacity: 1 !important; }
+      .upg, .upgF { opacity: 1 !important; }       /* bars rest at full width */
+    }
+  </style>
+
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#38bdf8"/>
+    </marker>
+
+    <!-- a fleet device: dark screen + "upgrading" progress bar -->
+    <g id="fleetdev">
+      <rect x="-32" y="-22" width="64" height="44" rx="6" fill="var(--scr)" stroke="rgba(255,255,255,.18)" stroke-width="1.5"/>
+      <rect x="-25" y="-15" width="50" height="4" rx="2" fill="rgba(255,255,255,.16)"/>
+      <rect x="-25" y="-6"  width="34" height="4" rx="2" fill="rgba(255,255,255,.10)"/>
+      <rect class="upgF" x="-26" y="12" width="52" height="4" rx="2" fill="var(--ok)"/>
+      <rect x="-8" y="22" width="16" height="9" rx="2" fill="rgba(255,255,255,.14)"/>
+      <rect x="-18" y="31" width="36" height="4" rx="2" fill="rgba(255,255,255,.14)"/>
+    </g>
+  </defs>
+
+  <!-- ============================ pipeline ============================ -->
+  <!-- connectors init -> provision -> deploy (vertical) -->
+  <line class="wire" x1="160" y1="82"  x2="160" y2="116" marker-end="url(#ah)" opacity=".6"/>
+  <line class="wire" x1="160" y1="176" x2="160" y2="210" marker-end="url(#ah)" opacity=".6"/>
+
+  <!-- nodes (centres: init 52, provision 146, deploy 240) -->
+  <g>
+    <rect class="node" x="85" y="24" width="150" height="56" rx="12"/>
+    <rect class="p0" x="85" y="24" width="150" height="56" rx="12" fill="none" stroke="var(--cyan)" stroke-width="2.5"/>
+    <text class="label" x="160" y="58">init</text>
+  </g>
+  <g>
+    <rect class="node" x="85" y="118" width="150" height="56" rx="12"/>
+    <rect class="p1" x="85" y="118" width="150" height="56" rx="12" fill="none" stroke="var(--cyan)" stroke-width="2.5"/>
+    <text class="label" x="160" y="142">provision</text>
+    <text class="sub"   x="160" y="160">build + disk</text>
+  </g>
+  <g>
+    <rect class="node" x="85" y="212" width="150" height="56" rx="12"/>
+    <rect class="p23" x="85" y="212" width="150" height="56" rx="12" fill="none" stroke="var(--ok)" stroke-width="2.5"/>
+    <text class="label" x="160" y="236">deploy</text>
+    <text class="sub"   x="160" y="254">build + push</text>
+  </g>
+
+  <!-- deploy self-loop ("next release"), frame 3, sitting below the deploy node in
+       the gap before the fleet. The loop circle and the moving dot share this exact
+       path so the dot rides on the stroke. -->
+  <path class="p3" d="M160 272 A22 22 0 0 1 160 316 A22 22 0 0 1 160 272" fill="none" stroke="var(--pur)" stroke-width="2" stroke-dasharray="4 4"/>
+  <path class="p3" d="M155 316 l10 -5 l0 10 z" fill="var(--pur)"/>
+  <text class="loopt p3" x="160" y="338">next release</text>
+
+  <!-- ===================== the fleet (4 extra devices) ===================== -->
+  <!-- 3-over-2 cluster around the persistent centre device (160,340) -->
+  <g class="p3">
+    <use href="#fleetdev" x="80"  y="378"/>
+    <use href="#fleetdev" x="240" y="378"/>
+    <use href="#fleetdev" x="110" y="478"/>
+    <use href="#fleetdev" x="210" y="478"/>
+  </g>
+
+  <!-- ===================== the centre device (always present) ============== -->
+  <g transform="translate(160,378)">
+    <rect x="-32" y="-22" width="64" height="44" rx="6" fill="var(--scr)" stroke="rgba(255,255,255,.18)" stroke-width="1.5"/>
+    <rect x="-25" y="-15" width="50" height="4" rx="2" fill="rgba(255,255,255,.16)"/>
+    <rect x="-25" y="-6"  width="34" height="4" rx="2" fill="rgba(255,255,255,.10)"/>
+    <!-- booting: amber progress bar fills in frame 1 -->
+    <rect class="boot" x="-26" y="12" width="52" height="4" rx="2" fill="var(--amber)"/>
+    <!-- upgrading: green progress bar fills in frames 2 & 3 (same spot as boot) -->
+    <rect class="upg" x="-26" y="12" width="52" height="4" rx="2" fill="var(--ok)"/>
+    <rect x="-8" y="22" width="16" height="9" rx="2" fill="rgba(255,255,255,.14)"/>
+    <rect x="-18" y="31" width="36" height="4" rx="2" fill="rgba(255,255,255,.14)"/>
+    <!-- status label swaps first boot -> upgrading -->
+    <text class="status p1"   x="0" y="50" fill="var(--amber)">first boot</text>
+    <text class="status upgt" x="0" y="50" fill="var(--ok)">upgrading</text>
+  </g>
+
+  <!-- ===================== travelling packet (3 phases) =================== -->
+  <circle class="dot" r="6" fill="var(--cyan)">
+    <animateMotion dur="12s" repeatCount="indefinite" calcMode="linear"
+      path="M160 52 L160 146" keyPoints="0;1;1" keyTimes="0;0.12;1"/>
+    <animate attributeName="opacity" dur="12s" repeatCount="indefinite"
+      values="1;1;0;0" keyTimes="0;0.32;0.33;1"/>
+  </circle>
+  <circle class="dot" r="6" fill="var(--cyan)">
+    <animateMotion dur="12s" repeatCount="indefinite" calcMode="linear"
+      path="M160 146 L160 240" keyPoints="0;0;1;1" keyTimes="0;0.33;0.45;1"/>
+    <animate attributeName="opacity" dur="12s" repeatCount="indefinite"
+      values="0;0;1;1;0;0" keyTimes="0;0.32;0.33;0.65;0.66;1"/>
+  </circle>
+  <circle class="dot" r="6" fill="var(--pur)">
+    <animateMotion dur="12s" repeatCount="indefinite" calcMode="linear"
+      path="M160 272 A22 22 0 0 1 160 316 A22 22 0 0 1 160 272" keyPoints="0;0;1" keyTimes="0;0.66;1"/>
+    <animate attributeName="opacity" dur="12s" repeatCount="indefinite"
+      values="0;0;1;1;0" keyTimes="0;0.655;0.66;0.99;1"/>
+  </circle>
+
+</svg>

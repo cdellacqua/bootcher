@@ -1,0 +1,11 @@
+/output/
+/docs/book/
+/docs/site/
+.DS_Store
+
+# Rendered secrets in the embedded scaffold (admin.user-privileged from setkey,
+# auth.json from registry-login) are ignored by crates/bootcher/scaffold/.gitignore,
+# which is itself stamped into every project `bootcher init` creates.
+
+/target/
+TODO.md

@@ -1,0 +1,17 @@
+# Build-context excludes. Podman reads this file from the project root before
+# sending any files to the image build. Only sysroot/ is COPYed into the image;
+# everything below is either secret material, bulky build output, or OS/editor
+# detritus that has no place inside a container image.
+
+# image-builder output — can be gigabytes of raw/qcow2 disk images.
+output/
+
+# Signing private key — keep out of every context, not just the image.
+# The public *.pub half is safe to include if needed.
+*.key
+
+.git/
+.github/
+
+# OS / editor junk
+.DS_Store

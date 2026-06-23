@@ -1,0 +1,22 @@
+[workspace]
+members = ["crates/bootcher-core", "crates/bootcher-cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.0"
+authors = ["Carlo Dell'Acqua <carlo.dellacqua97@gmail.com>"]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/cdellacqua/bootcher"
+keywords = ["bootc", "ostree", "appliance", "containers", "cli"]
+categories = ["command-line-utilities", "os"]
+# Distributed as a `cargo install --git` / GitHub-release binary, not on crates.io.
+publish = false
+
+[workspace.lints.rust]
+# Flag a `pub` item the outside can't reach (a `pub` inside a non-pub module) so
+# it's written `pub(crate)` — keeps the crate's public surface honest.
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }

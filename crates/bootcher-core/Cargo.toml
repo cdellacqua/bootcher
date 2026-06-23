@@ -1,0 +1,49 @@
+[package]
+name = "bootcher-core"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+description = "Library for building and deploying bootc images for servers, VMs, cloud, appliances, and single-board computers."
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = "1.0.102"
+base64 = "0.22.1"
+# CalVer registry tags (`YYYYMMDD.HH.MM`, UTC): `Timestamp::now().strftime` formats
+# the current instant in UTC — no timezone DB needed for a UTC-only wall clock.
+jiff = "0.2"
+# Image-signing enroll: produce the cosign/sigstore "ENCRYPTED SIGSTORE PRIVATE
+# KEY" format podman's `--sign-by-sigstore-private-key` consumes (scrypt-KDF +
+# NaCl secretbox over the PKCS#8 PEM of a P-256 key). Pinned to one stable
+# RustCrypto generation (elliptic-curve 0.13 / aead 0.5) so they share deps.
+crypto_secretbox = "0.1"
+duct = "1.1.1"
+fatfs = "0.3"
+getrandom = "0.2"
+p256 = { version = "0.13", features = ["pem", "pkcs8"] }
+pem-rfc7468 = { version = "0.7", features = ["alloc"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+scrypt = { version = "0.11", default-features = false }
+include_dir = "0.7.4"
+indicatif = "0.18.4"
+inquire = "0.9.4"
+rustix = { version = "1.1.4", features = ["process"] }
+serde = { version = "1.0.228", features = ["derive"] }
+shlex = "2.0.1"
+serde_json = "1.0.150"
+sha2 = "0.11"
+signal-hook = "0.4.4"
+strum = { version = "0.28", features = ["derive"] }
+tempfile = "3.27.0"
+tiny_http = "0.12.0"
+toml = "1.1.2"
+toml_edit = "0.25.12"
+ureq = "3.3.0"
+schemars = "1.2.1"
+
+[lints]
+workspace = true

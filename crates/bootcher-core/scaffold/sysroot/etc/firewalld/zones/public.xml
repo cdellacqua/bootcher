@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Bootcher base public zone: deny all inbound except DHCPv6 client and
+  rate-limited SSH (10 new connections/minute per firewalld's accounting).
+  `<forward/>` is kept so podman / container networks can still forward
+  traffic between interfaces in the zone.
+
+  Leaf images that need to expose extra services should ship their own
+  drop-in under /etc/firewalld/ rather than editing this file — see
+  https://firewalld.org/documentation/ for the zone/service schema.
+-->
+<zone target="DROP">
+  <short>Public</short>
+  <description>Bootcher base: deny inbound except DHCPv6 client and rate-limited SSH.</description>
+  <service name="dhcpv6-client"/>
+  <forward/>
+  <rule>
+    <service name="ssh"/>
+    <accept>
+      <limit value="10/m"/>
+    </accept>
+  </rule>
+</zone>

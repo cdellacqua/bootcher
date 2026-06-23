@@ -1,0 +1,8 @@
+# Keep the build context small and reproducible: never ship local build
+# artifacts or generated output into the image build (the builder stage
+# regenerates target/ from source anyway).
+/target/
+/output/
+.git/
+.github/
+.DS_Store

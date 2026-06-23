@@ -1,0 +1,60 @@
+# Deploy updates
+
+After first provisioning, rolling an update to running devices is:
+
+```sh
+bootcher deploy
+```
+
+`deploy` builds the container and then pushes it + triggers `bootc upgrade`, in sequence. Pass `--skip-build` to skip the container build and ship an image an earlier `bootcher build` already produced.
+
+## What deploy does
+
+1. **Build** the container image with `podman build` (same as `bootcher build`; skipped with `--skip-build`).
+2. Collect the freshly-built per-arch images into a local multi-arch manifest list (`localhost/<name>:latest`).
+3. **Push + upgrade** — push the update and trigger `bootc upgrade` on each device. The push backend depends on the manifest:
+   - **LAN mode** — serve the image from a loopback registry and forward it over SSH; see [LAN backend](../concepts/deploy-backends.md).
+   - **Registry mode** — `podman push` to `<registry>/<name>:latest`; SSH into each `[deploy] remotes` device and run `bootc upgrade`.
+
+In registry mode with no `[deploy] remotes` configured, the push to the registry is the whole operation. Devices self-update on their `bootc-fetch-apply-updates.timer` schedule.
+
+## Skipping the build
+
+Every action command builds the container first by default. `--skip-build` opts out, acting on an image an earlier `bootcher build` already produced:
+
+| Command | What it does |
+|---|---|
+| `bootcher build` | Build the container image and assemble the local multi-arch manifest list |
+| `bootcher deploy --skip-build` | Push the already-built image and trigger `bootc upgrade` on remotes (no rebuild) |
+| `bootcher provision --skip-build` | Build the disk artifact from the already-built container (no rebuild) |
+| `bootcher takeover --skip-build` | Convert live hosts from the already-built container (no rebuild) |
+
+These are useful when iterating on a single phase, or when orchestrating a pipeline that runs `build` and the deploy/provision step as separate jobs.
+
+## Lifecycle hooks
+
+Each phase can be wrapped with `pre` / `post` shell commands defined in `bootcher.toml`. Hooks fire wherever the phase runs — so `[hooks.build]` wraps the container build in both `build` and `deploy`.
+
+```toml
+[hooks.build]
+pre  = "echo 'prepare build artifacts'"
+post = "echo 'clean up after build'"
+
+[hooks.disk]
+pre  = "echo 'pre-disk step'"
+post = "dd if=output/... of=/dev/sdX   # embed into target"
+
+[hooks.upgrade]
+pre  = "echo 'drain traffic before rollout'"
+post = "echo 'run post-deploy smoke test'"
+```
+
+Each hook runs with `sh -c` from the project root. The terminal is handed over — the hook may print freely, prompt, or `sudo`. A non-zero exit aborts the run.
+
+## Multi-arch builds
+
+If `[general.disk_types]` lists more than one architecture, `build` fans out per-arch builds in parallel (up to `[concurrency] build` workers), then assembles them into a single multi-arch manifest list. `upgrade` does the same for the per-device SSH rollout (up to `[concurrency] upgrade` workers).
+
+## Signing
+
+In registry mode with signing configured (via `[deploy] registry` inline table), the `upgrade` step signs the pushed manifest list before any device sees it. See [Image signing](../concepts/signing.md).
