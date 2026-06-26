@@ -62,7 +62,10 @@ just install      # cargo install --path crates/bootcher-cli
 
 Releases are tagged, not published to crates.io. Pushing a `vX.Y.Z` tag triggers
 the `release` (binaries) and `image` (ghcr.io) jobs in
-[ci-cd.yml](.github/workflows/ci-cd.yml), which are gated on `refs/tags/v*`.
+[release.yml](.github/workflows/release.yml). That workflow runs on tags only and
+does not re-run the test suite: the tagged commit already passed
+[ci.yml](.github/workflows/ci.yml) when it landed on `main`, so only tag commits
+that are green on `main`.
 
 `just release` does the whole dance from a clean `main` — bump the workspace
 version, commit, tag, push:
