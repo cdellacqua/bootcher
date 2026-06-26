@@ -36,6 +36,8 @@ RUN dnf install -y --setopt=install_weak_deps=False \
       cloud-utils-growpart \
       util-linux \
       openssh-clients \
+      curl \
+      which \
       tar \
       systemd-libs \
  && dnf clean all

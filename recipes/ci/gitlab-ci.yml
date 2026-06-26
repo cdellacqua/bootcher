@@ -79,9 +79,8 @@ deploy:
     # it from GitLab Secure Files (uploaded as cosign.key) before deploy signs the push.
     # The installer downloads every secure file into ./.secure_files/; copy the key to
     # where the manifest expects it (cosign.key), leaving the committed path unchanged
-    # for local runs. curl ships as curl-minimal (still /usr/bin/curl), so the guard is
-    # a no-op there and only installs a client on an image lacking one entirely.
-    # - command -v curl >/dev/null || dnf install -y --setopt=install_weak_deps=False curl >/dev/null
+    # for local runs. The bootcher image bundles curl and which (the installer probes for
+    # curl with `which curl`), so no dependency install is needed here.
     # - curl --silent "https://gitlab.com/gitlab-org/incubation-engineering/mobile-devops/download-secure-files/-/raw/main/installer" | bash
     # - install -m 600 .secure_files/cosign.key cosign.key
     # Skipping the per-device `bootc upgrade` keeps the admin SSH key out of CI and
