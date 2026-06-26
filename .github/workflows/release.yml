@@ -1,0 +1,102 @@
+name: Release
+
+# Tags only. A v* tag points at a commit that already passed CI (ci.yml) when it
+# landed on main, so this workflow only packages and publishes — it does not
+# re-run verify/audit. Tag commits that are green on main.
+on:
+  push:
+    tags: ["v*"]
+
+# Default to read-only; jobs that need more opt in locally.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Build release binaries for the two arches bootcher targets, on native
+  # runners (no cross-compilation needed).
+  release:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Fetch dependencies
+        run: cargo fetch --locked
+      - name: Build
+        run: cargo build --release --frozen -p bootcher-cli
+      - name: Package
+        run: tar -C target/release -czf bootcher-${{ matrix.target }}.tar.gz bootcher
+      - name: Upload to release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          files: bootcher-${{ matrix.target }}.tar.gz
+
+  # Build and publish the container image to ghcr.io. The image wraps the
+  # Linux-only binary so bootcher can run on macOS/Windows via the Podman/Docker
+  # machine VM (see Containerfile + README). Built per-arch on native runners —
+  # emulated cross-arch builds are slow and historically flaky — then stitched
+  # into one multi-arch manifest by the merge job below. Uses podman (preinstalled
+  # on the runners), so no extra third-party actions to pin.
+  image:
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      # ghcr.io requires a lowercase repo path; github.repository preserves the
+      # owner's casing, so normalize it once into the job env.
+      - name: Resolve image name
+        run: echo "IMAGE=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+      - name: Log in to ghcr.io
+        run: echo '${{ secrets.GITHUB_TOKEN }}' | podman login ghcr.io -u '${{ github.actor }}' --password-stdin
+      # Native build for this runner's arch; tag with the arch suffix so the
+      # merge job can assemble the manifest list from both.
+      - name: Build
+        run: podman build --platform linux/${{ matrix.arch }} -f Containerfile -t "$IMAGE:${{ github.ref_name }}-${{ matrix.arch }}" .
+      - name: Push
+        run: podman push "$IMAGE:${{ github.ref_name }}-${{ matrix.arch }}"
+
+  # Combine the per-arch images into multi-arch manifest lists and tag them
+  # `vX.Y.Z` and `latest`, so `podman pull ghcr.io/<owner>/bootcher` resolves to
+  # the puller's architecture.
+  image-manifest:
+    needs: image
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Resolve image name
+        run: echo "IMAGE=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+      - name: Log in to ghcr.io
+        run: echo '${{ secrets.GITHUB_TOKEN }}' | podman login ghcr.io -u '${{ github.actor }}' --password-stdin
+      - name: Create and push manifests
+        run: |
+          version="${{ github.ref_name }}"
+          for tag in "$version" latest; do
+            podman manifest create "$IMAGE:$tag"
+            podman manifest add "$IMAGE:$tag" "docker://$IMAGE:$version-amd64"
+            podman manifest add "$IMAGE:$tag" "docker://$IMAGE:$version-arm64"
+            podman manifest push --all "$IMAGE:$tag" "docker://$IMAGE:$tag"
+            podman manifest rm "$IMAGE:$tag"
+          done
