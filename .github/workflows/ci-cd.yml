@@ -24,9 +24,14 @@ jobs:
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           # Cache the registry index/cache and git db (not the regenerable
-          # extracted ~/.cargo/registry/src), plus the build artifacts.
+          # extracted ~/.cargo/registry/src), plus the build artifacts. The
+          # .crates.toml/.crates2.json ledger lives at the root of ~/.cargo
+          # (not under bin/); without it `cargo install` can't tell a tool is
+          # already present and rebuilds it even on a cache hit.
           path: |
             ~/.cargo/bin/
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
@@ -71,6 +76,8 @@ jobs:
         with:
           path: |
             ~/.cargo/bin/
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
@@ -97,6 +104,22 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      # Cache ~/.cargo/bin/ so the compiled cargo-audit binary is restored
+      # across runs; the install step below then becomes a fast no-op. The
+      # .crates.toml/.crates2.json ledger is required for `cargo install` to
+      # recognize the tool as already installed and skip rebuilding it. No
+      # target/ here — this job only runs cargo-audit, it doesn't build the
+      # crate. Keyed on Cargo.lock so a dependency change re-resolves the tool.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-audit-${{ hashFiles('**/Cargo.lock') }}
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: Audit
