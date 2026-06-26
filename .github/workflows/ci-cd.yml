@@ -17,7 +17,20 @@ env:
 jobs:
   # Format, lint, and test on a single Linux host. bootcher is Linux-only
   # (Podman is native Linux), so there's no cross-OS matrix to verify.
+  #
+  # A release commits "release vX.Y.Z" to main and pushes a matching v* tag at
+  # the same time, firing two near-identical runs for the same commit. The tag
+  # run is the canonical one (it also builds the release binaries and image), so
+  # skip the redundant main-branch run, identified by its "release " commit
+  # message. The other jobs all chain off verify via `needs`, so skipping it here
+  # collapses the whole duplicate run. head_commit is only populated for push
+  # events; for PRs/dispatch it's null and startsWith treats it as empty, so this
+  # condition can only ever match a push to main.
   verify:
+    if: >-
+      ${{ !(github.event_name == 'push'
+            && github.ref == 'refs/heads/main'
+            && startsWith(github.event.head_commit.message, 'release ')) }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -62,9 +75,13 @@ jobs:
   # Pages to be configured with source "GitHub Actions" in the repository settings.
   pages:
     needs: [verify, audit]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    # Temporarily disabled: GitHub Pages can't be published from a private repo
+    # on the Free plan. Re-enable (drop the `false &&`) once the repo is public
+    # or the account is on Pro/Team/Enterprise.
+    if: false && github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-24.04
     permissions:
+      contents: read
       pages: write
       id-token: write
     environment:
