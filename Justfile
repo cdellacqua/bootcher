@@ -42,6 +42,36 @@ image tag="bootcher:dev":
 test:
     cargo test {{cargo_flags}}
 
+# Cut a release: bump the workspace version (patch|minor|major, or an explicit
+# X.Y.Z), commit, tag vX.Y.Z, and push — which triggers the release/image jobs
+# in .github/workflows/ci-cd.yml (they're gated on `refs/tags/v*`). The version
+# bump itself is done by the dev-only `housekeeper` binary so we don't depend on
+# cargo-edit/cargo-release; everything else is plain git. Must be on a clean
+# `main`. Examples:
+#   just release            # patch bump (default)
+#   just release minor
+#   just release 1.0.0
+[group('dev')]
+release bump="patch":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    test -z "$(git status --porcelain)" || { echo "working tree is dirty — commit or stash first"; exit 1; }
+    test "$(git rev-parse --abbrev-ref HEAD)" = "main" || { echo "not on main"; exit 1; }
+    # `set X.Y.Z` vs `bump <kind>`: route an explicit version to the set subcommand.
+    if [[ "{{bump}}" =~ ^(patch|minor|major)$ ]]; then
+        version=$(cargo run --quiet -p housekeeper -- bump "{{bump}}")
+    else
+        version=$(cargo run --quiet -p housekeeper -- set "{{bump}}")
+    fi
+    tag="v${version}"
+    git rev-parse "$tag" >/dev/null 2>&1 && { echo "tag $tag already exists"; exit 1; }
+    # Restore Cargo.lock too: bumping the version dirties the workspace members' lock entries.
+    cargo update --workspace --offline >/dev/null 2>&1 || true
+    git commit -am "release $tag"
+    git tag -a "$tag" -m "Release $tag"
+    git push origin main "$tag"
+    echo "pushed $tag — watch the release/image jobs in CI"
+
 # Slow VM end-to-end: boot real bootc disks and exercise the LAN rotate + upgrade
 # lifecycle (e2e_vm), the plain registry lifecycle + pull-token rotation + signing
 # enrollment (e2e_registry), the LAN→registry origin switch (e2e_lan_to_registry),

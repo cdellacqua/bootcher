@@ -58,6 +58,30 @@ just fix          # auto-fix fmt and clippy warnings
 just install      # cargo install --path crates/bootcher-cli
 ```
 
+## Cutting a release
+
+Releases are tagged, not published to crates.io. Pushing a `vX.Y.Z` tag triggers
+the `release` (binaries) and `image` (ghcr.io) jobs in
+[ci-cd.yml](.github/workflows/ci-cd.yml), which are gated on `refs/tags/v*`.
+
+`just release` does the whole dance from a clean `main` — bump the workspace
+version, commit, tag, push:
+
+```sh
+just release         # patch bump (default): 0.0.1 -> 0.0.2
+just release minor   # 0.0.1 -> 0.1.0
+just release major   # 0.0.1 -> 1.0.0
+just release 1.2.3   # set an explicit version
+```
+
+The version bump is done by the dev-only [`housekeeper`](crates/housekeeper/)
+binary (a [cargo-xtask](https://github.com/matklad/cargo-xtask)-style helper) so
+the workflow needs no external tooling like `cargo-edit`/`cargo-release` — it
+edits `[workspace.package].version` in [Cargo.toml](Cargo.toml) in place with
+`toml_edit` (preserving comments) and `semver`, and prints the new version for
+the recipe to tag. Both member crates inherit the version via
+`version.workspace = true`, so that one field is the single source of truth.
+
 ## End-to-end tests
 
 The e2e tests boot real bootc disk images and are opt-in: plain `cargo test`
@@ -112,3 +136,4 @@ just ci e2e_cross=1
 - [`crates/bootcher-core/`](crates/bootcher-core/) — library: builders, jobs, pipelines, LAN registry, lifecycle hooks
 - [`crates/bootcher-core/scaffold/`](crates/bootcher-core/scaffold/) — embedded project template stamped out by `bootcher init`
 - [`crates/bootcher-cli/`](crates/bootcher-cli/) — the `bootcher` binary
+- [`crates/housekeeper/`](crates/housekeeper/) — dev-only release helper (version bumps for `just release`); never published
