@@ -27,7 +27,7 @@ impl Builder for LocalBuilder {
 		#[rustfmt::skip]
 		let build_cmd = cmd!(
 			"podman", "build",
-			"--platform", image.arch.podman_platform(),
+			"--os", "linux", "--arch", image.arch.oci_arch(),
 			"-t", image.tag(),
 			"-f", image.build_ctx.join("Containerfile"),
 			&image.build_ctx,
@@ -297,7 +297,7 @@ fn build_lock_layer(
 	#[rustfmt::skip]
 	let build = cmd!(
 		"podman", "build",
-		"--platform", arch.podman_platform(),
+		"--os", "linux", "--arch", arch.oci_arch(),
 		"-t", locked,
 		"-f", ctx.join("Containerfile"),
 		ctx,

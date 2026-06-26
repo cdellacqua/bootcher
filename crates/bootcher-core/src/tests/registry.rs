@@ -53,7 +53,7 @@ fn serves_a_local_image_that_podman_can_pull() {
 	};
 	let tag = image.tag();
 
-	cmd!("podman", "build", "--platform", arch.podman_platform(), "-t", &tag, ctx.path())
+	cmd!("podman", "build", "--os", "linux", "--arch", arch.oci_arch(), "-t", &tag, ctx.path())
 		.run()
 		.expect("podman build of the test image failed");
 

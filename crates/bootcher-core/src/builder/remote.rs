@@ -72,12 +72,12 @@ impl Builder for RemoteBuilder {
 		let _ctx = RemoteScratch { builder: self, dir: ctx_dir.clone(), image_refs: vec![] };
 		self.upload_context(&image.build_ctx, &ctx_dir, job)?;
 
-		// 2. Build natively on the remote (it's target-arch, so `--platform` here
+		// 2. Build natively on the remote (it's target-arch, so naming the arch here
 		//    is a no-op rather than emulation — the whole point of relocating).
 		//    `FROM localhost/base:…` resolves because the caller built base first.
 		let build = format!(
-			"sudo podman build --platform {plat} -t {tag} -f {ctx_dir}/Containerfile {ctx_dir}",
-			plat = image.arch.podman_platform(),
+			"sudo podman build --os linux --arch {arch} -t {tag} -f {ctx_dir}/Containerfile {ctx_dir}",
+			arch = image.arch.oci_arch(),
 		);
 		let argv = self.ssh.argv(&[], &build);
 		exec::run_argv_labeled(job, &argv, "podman build")?;

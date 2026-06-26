@@ -112,13 +112,16 @@ pub enum Arch {
 }
 
 impl Arch {
-	/// `podman build --platform` value. podman normalises `aarch64`/`x86_64` to
-	/// its OCI `arm64`/`amd64`, so the uname spelling is passed through directly.
+	/// Canonical OCI architecture name (`amd64`/`arm64`) — what appears in an
+	/// image config and a manifest list's `platform.architecture`. It's the value
+	/// every podman invocation passes via `--arch` (paired with a fixed `--os
+	/// linux`): on `podman build` it replaces a `--platform linux/<arch>` triple,
+	/// and on `podman manifest add` it stamps the member's platform.
 	#[must_use]
-	pub fn podman_platform(self) -> &'static str {
+	pub fn oci_arch(self) -> &'static str {
 		match self {
-			Arch::Aarch64 => "linux/aarch64",
-			Arch::X86_64 => "linux/x86_64",
+			Arch::Aarch64 => "arm64",
+			Arch::X86_64 => "amd64",
 		}
 	}
 

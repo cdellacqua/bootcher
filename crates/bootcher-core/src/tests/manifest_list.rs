@@ -34,10 +34,33 @@ fn require_podman() {
 /// A throwaway single-arch member: `FROM scratch` + one file, built for `arch`.
 /// No `RUN` step, so the cross-arch build is a metadata-only relabel — no
 /// emulation needed.
-fn build_member(image: &ImageRef, ctx: &std::path::Path) {
-	cmd!("podman", "build", "--platform", image.arch.podman_platform(), "-t", image.tag(), ctx)
-		.run()
-		.unwrap_or_else(|e| panic!("podman build of {} failed: {e}", image.tag()));
+///
+/// The file content is arch-specific so the two members never share a digest.
+/// Older podman (4.9 on CI) ignores the requested arch for the config
+/// architecture of a `FROM scratch` build, leaving both members byte-identical;
+/// identical digests then collapse to a single manifest-list entry. `manifest_list`
+/// stamps the per-entry platform from the known arch, but only distinct digests
+/// keep both members as separate entries.
+fn build_member(image: &ImageRef, ctx_root: &std::path::Path) {
+	let ctx = ctx_root.join(image.arch.to_string());
+	std::fs::create_dir_all(&ctx).unwrap();
+	std::fs::write(ctx.join("hello.txt"), format!("bootcher manifest-list test: {}\n", image.arch))
+		.unwrap();
+	std::fs::write(ctx.join("Containerfile"), b"FROM scratch\nCOPY hello.txt /hello.txt\n")
+		.unwrap();
+	cmd!(
+		"podman",
+		"build",
+		"--os",
+		"linux",
+		"--arch",
+		image.arch.oci_arch(),
+		"-t",
+		image.tag(),
+		&ctx
+	)
+	.run()
+	.unwrap_or_else(|e| panic!("podman build of {} failed: {e}", image.tag()));
 }
 
 #[test]
@@ -46,11 +69,9 @@ fn assembles_a_multi_arch_manifest_list_from_per_arch_members() {
 
 	let name = format!("bootcher-mltest-{}", std::process::id());
 
-	// Self-contained build context: one layer, no base image to fetch.
+	// Self-contained build context root: each member builds from its own arch
+	// subdir (filled by `build_member`), one layer, no base image to fetch.
 	let ctx = TempDir::new().unwrap();
-	std::fs::write(ctx.path().join("hello.txt"), b"bootcher manifest-list test\n").unwrap();
-	std::fs::write(ctx.path().join("Containerfile"), b"FROM scratch\nCOPY hello.txt /hello.txt\n")
-		.unwrap();
 
 	let image = |arch: Arch| ImageRef {
 		name: name.clone(),

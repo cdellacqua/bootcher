@@ -146,7 +146,29 @@ pub(crate) fn manifest_list(
 	run!(job, "podman", "manifest", "create", local_list_ref)?;
 	for image in images {
 		job.step(format!("add {}", image.arch));
-		run!(job, "podman", "manifest", "add", local_list_ref, image.tag())?;
+		// Reference the member via the explicit `containers-storage:` transport so
+		// podman resolves it from the local store and never falls back to a
+		// registry. Without the prefix, older podman (4.9 on CI) fails to resolve
+		// the just-built `localhost/<name>:latest-<arch>` image and tries to pull
+		// it from `localhost` over HTTPS, dialing `localhost:443` and erroring.
+		//
+		// Stamp the entry's platform from the known build arch rather than trusting
+		// podman to infer it from the image config: some podman versions mislabel a
+		// `FROM scratch` image's architecture, which silently collapses two members
+		// to one entry. `manifest_list` already knows each member's arch, so make it
+		// authoritative.
+		run!(
+			job,
+			"podman",
+			"manifest",
+			"add",
+			"--os",
+			"linux",
+			"--arch",
+			image.arch.oci_arch(),
+			local_list_ref,
+			&format!("containers-storage:{}", image.tag())
+		)?;
 	}
 	Ok(())
 }
