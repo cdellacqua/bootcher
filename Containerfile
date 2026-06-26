@@ -27,6 +27,7 @@ RUN cargo build --release --locked -p bootcher-cli
 FROM quay.io/fedora/fedora:44
 RUN dnf install -y --setopt=install_weak_deps=False \
       podman \
+      fuse-overlayfs \
       qemu-img \
       qemu-system-x86-core \
       qemu-system-aarch64-core \
