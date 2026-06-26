@@ -35,7 +35,7 @@ Registry mode introduces two distinct credentials:
 | **Pull token** | Every deployed device | Read-only | Injected at `provision`; rotatable with `bootcher rotate pull-token` |
 | **Push auth** | Builder / CI | Read-write | `podman login <registry>` on the builder, kept off devices |
 
-Use a least-privilege, read-only token for the pull credential (e.g. a GitLab deploy token with `read_registry` scope). The push auth stays on the machine running `bootcher deploy` — or in a CI secret — and bootcher leaves it to `podman login` to manage.
+Use a least-privilege, read-only token for the pull credential (e.g. a GitLab deploy token with `read_registry` scope, created under *Settings → Repository → Deploy tokens* — that page yields both a `gitlab+deploy-token-N` username and a secret). The push auth stays on the machine running `bootcher deploy` — or in a CI secret — and bootcher leaves it to `podman login` to manage.
 
 In a pipeline, log in before invoking `bootcher deploy`:
 

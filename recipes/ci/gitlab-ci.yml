@@ -30,8 +30,13 @@
 #                            private key wherever you SSH to devices from.
 #   BOOTCHER_PULL_USER /     (provision, registry mode) a LONG-LIVED read-only
 #   BOOTCHER_PULL_TOKEN      credential baked into the disk so the device can pull
-#                            updates. Use a Deploy Token with `read_registry` scope
-#                            — NOT $CI_JOB_TOKEN, which expires with the pipeline.
+#                            updates. Create a Deploy Token with `read_registry`
+#                            scope under Settings -> Repository -> Deploy tokens
+#                            (NOT Settings -> Access tokens, which gives no
+#                            username). Copy BOTH one-time fields: the username
+#                            (gitlab+deploy-token-..., or a custom name) ->
+#                            BOOTCHER_PULL_USER, the secret -> BOOTCHER_PULL_TOKEN.
+#                            NOT $CI_JOB_TOKEN, which expires with the pipeline.
 #                            bootcher reads these env vars directly. Public
 #                            registry? Drop them and add `--anonymous` below.
 #   BOOTCHER_SIGN_PASSPHRASE (optional) the cosign key passphrase, if you enabled

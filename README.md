@@ -188,8 +188,9 @@ backends, decided entirely by the manifest's `registry` field — there's no fla
 In registry mode, two distinct credentials are needed:
 
 - **Pull token** — ends up on *every deployed device*, so use a
-  least-privilege, read-only token (a GitLab `read_registry` deploy token, a
-  registry robot account, etc.).
+  least-privilege, read-only token (a GitLab `read_registry` deploy token from
+  *Settings → Repository → Deploy tokens*, which yields a
+  `gitlab+deploy-token-N` username plus a secret; a registry robot account; etc.).
 - **Push auth** — this builder's own `podman login <host>`, needed for `deploy`
   to push. It's powerful (write) and stays on the builder / in a CI secret;
   `bootcher` never puts it on a device. Log in separately:

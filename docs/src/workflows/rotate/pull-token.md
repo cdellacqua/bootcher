@@ -20,7 +20,7 @@ bootcher rotate pull-token
 
 | Variable | Purpose |
 |---|---|
-| `BOOTCHER_PULL_USER` | Registry username |
+| `BOOTCHER_PULL_USER` | Registry username (GitHub: your username/org; GitLab deploy token: `gitlab+deploy-token-N`) |
 | `BOOTCHER_PULL_TOKEN` | Registry pull token |
 
 ## What happens
