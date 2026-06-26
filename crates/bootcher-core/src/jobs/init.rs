@@ -115,33 +115,14 @@ const CONCURRENCY_EXAMPLE: &str = "\
 /// expand) and when signing is already live in the rendered manifest.
 const SIGNING_EXAMPLE: &str = "\
 # Image signing (optional): sign pushed images with a cosign key and make devices
-# reject unsigned/tampered ones on `bootc upgrade`. To enable:
-#   1. bootcher sign enroll   # writes cosign.key/.pub and patches bootcher.toml automatically
-#   2. add sysroot/usr/lib/bootc/install/30-bootcher-signing.toml:
-#        [install]
-#        enforce-container-sigpolicy = true
-#      (so a freshly provisioned device enforces signatures from first boot)
-# The signing passphrase comes from BOOTCHER_SIGN_PASSPHRASE (or a prompt); the
-# public key is injected into each device at `provision`. Rotate a leaked/expiring
-# key with `bootcher rotate sign-key`.
+# reject unsigned/tampered ones on `bootc upgrade`. To enable, run:
+#   bootcher sign enroll
+# which writes cosign.key/.pub, patches `[deploy] registry` to the signing form, and
+# bakes sysroot/usr/lib/bootc/install/30-bootcher-signing.toml so a freshly
+# provisioned device enforces signatures from first boot. The passphrase comes from
+# BOOTCHER_SIGN_PASSPHRASE (or a prompt); the public key is injected into each device
+# at `provision`. Rotate a leaked/expiring key with `bootcher rotate sign-key`.
 ";
-
-/// The bootc install drop-in `init` bakes (into the scaffolded `sysroot/`) when
-/// signing is enabled, so a freshly provisioned device enforces the signature
-/// policy from its very first boot — not only after the first `deploy` switches
-/// the origin. See `bootc-install-config(5)`.
-const ENFORCE_SIGPOLICY_CONFIG: &str = "\
-# Enforce the container signature policy (written by `bootcher init` with signing
-# enabled). Makes bootc record a verifying origin and reject an image whose
-# signature doesn't satisfy /etc/containers/policy.json. Remove this (and change
-# `[deploy] registry` back to a plain URL string) to go back to unsigned images.
-[install]
-enforce-container-sigpolicy = true
-";
-
-/// Where [`ENFORCE_SIGPOLICY_CONFIG`] lands in the project's `sysroot/` overlay
-/// (copied to `/` by the scaffold Containerfile's `COPY sysroot/ /`).
-const ENFORCE_SIGPOLICY_PATH: &str = "sysroot/usr/lib/bootc/install/30-bootcher-signing.toml";
 
 /// Resolve the destination first (so an invalid/occupied target fails before any
 /// prompting), collect the manifest settings per interaction mode, then scaffold.
@@ -166,8 +147,9 @@ struct Settings {
 	/// Root filesystem to format (`[general] rootfs`).
 	rootfs: Rootfs,
 	registry: Option<String>,
-	/// Whether to enable opt-in image signing. Only offered in registry mode;
-	/// expands `registry` to the signing inline-table form + bakes the
+	/// Whether to enable opt-in image signing. Only offered in registry mode; when
+	/// set, `write` calls `signing::enable_signing` to generate the keypair, upgrade
+	/// `registry` to the signing inline-table form, and bake the
 	/// `enforce-container-sigpolicy` install config so first boot enforces it.
 	signing: bool,
 	/// SSH deploy targets collected at init time (`[deploy] remotes`). Each is a
@@ -234,16 +216,10 @@ impl Target {
 		// every builder key explicitly — the scaffold doubles as documentation. The
 		// embedded files stay project-agnostic. `annotate_values` then prepends each
 		// enumerated key with a `# a, b, c` hint of its accepted values.
-		// Build the registry config: a plain URL, a signing-enabled inline table, or
-		// absent (LAN mode). Signing is only offered when a registry is set, so the
-		// WithSigning arm is only reachable with a Some registry.
-		let registry_config = match (&settings.registry, settings.signing) {
-			(Some(url), true) => {
-				Some(RegistryConfig::WithSigning { url: url.clone(), key: "cosign.key".to_owned() })
-			}
-			(Some(url), false) => Some(RegistryConfig::Url(url.clone())),
-			(None, _) => None,
-		};
+		// Build the registry config: always a plain URL here (or absent in LAN mode).
+		// When signing is enabled, `signing::enable_signing` below upgrades this entry
+		// to the inline-table signing form — the single code path that wires signing.
+		let registry_config = settings.registry.clone().map(RegistryConfig::Url);
 		let manifest = Manifest {
 			general: General {
 				name: self.name.clone(),
@@ -298,17 +274,15 @@ impl Target {
 		)
 		.with_context(|| format!("writing {}", manifest_path.display()))?;
 
-		// With signing enabled, bake the enforce-container-sigpolicy install config so
-		// first boot enforces signatures (not just post-`deploy`). Off ⇒ no such file,
-		// keeping unsigned installs working (the flag would reject a permissive policy).
+		// With signing enabled, fully wire it now (single path, shared with
+		// `bootcher sign enroll`): generate the keypair, upgrade `[deploy] registry`
+		// to the signing form, and bake the enforce-container-sigpolicy install config
+		// so first boot enforces signatures. Prompts for a passphrase (this is an
+		// interactive run — non-interactive `-y` leaves signing off). Doing it here
+		// means a signed scaffold is never left referencing a key that doesn't exist.
 		if settings.signing {
-			let path = self.dest.join(ENFORCE_SIGPOLICY_PATH);
-			if let Some(parent) = path.parent() {
-				fs::create_dir_all(parent)
-					.with_context(|| format!("creating {}", parent.display()))?;
-			}
-			fs::write(&path, ENFORCE_SIGPOLICY_CONFIG)
-				.with_context(|| format!("writing {}", path.display()))?;
+			crate::jobs::signing::enable_signing(&self.dest, "cosign", false)
+				.context("enrolling the signing key")?;
 		}
 
 		let where_ = if self.in_place {
@@ -318,10 +292,9 @@ impl Target {
 		};
 		let cd =
 			if self.in_place { String::new() } else { format!("  cd {}\n", self.dest.display()) };
-		// With signing enabled the user must create the keypair before provisioning,
-		// so lead the Next steps with it.
+		// Signing is already enrolled above; note the key so the user keeps it secret.
 		let sign = if settings.signing {
-			"  bootcher sign enroll   # create cosign.key/.pub the signing config references\n"
+			"  # signing enrolled: keep cosign.key secret (the scaffold .gitignore covers *.key)\n"
 		} else {
 			""
 		};
@@ -415,15 +388,16 @@ fn questionnaire() -> Result<Settings> {
 	let registry = Some(registry.trim().to_owned()).filter(|s| !s.is_empty());
 
 	// Image signing is registry-mode only (a LAN deploy's integrity rides the ssh
-	// channel), so only offer it when a registry is set. Enabling it expands the
-	// registry to the inline signing form and bakes the enforce-container-sigpolicy
-	// install config; the user still runs `bootcher sign enroll` to create the keypair.
+	// channel), so only offer it when a registry is set. Saying yes enrolls the
+	// signing key right away (generates the keypair — prompting for a passphrase —
+	// expands the registry to the signing form, and bakes the
+	// enforce-container-sigpolicy install config), so no separate step is needed.
 	let signing = registry.is_some()
 		&& inquire::Confirm::new("Enforce image signatures on devices?")
 			.with_default(false)
 			.with_help_message(
-				"signs pushes with a cosign key and makes devices reject unsigned/tampered images; \
-				 you'll run `bootcher sign enroll` next",
+				"signs pushes with a cosign key and makes devices reject unsigned/tampered \
+				 images; enrolls a cosign key now (prompts for a passphrase)",
 			)
 			.prompt()?;
 

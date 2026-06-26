@@ -259,14 +259,14 @@ impl Harness {
 			_store: store,
 		};
 
-		// Generate the cosign keypair the manifest references, then bake the
-		// signing-enforcement files the scaffold's signing path would: the
-		// enforce-container-sigpolicy install config + the guest's insecure-registry
-		// drop-in.
+		// Enroll the cosign keypair the manifest references. `sign enroll` also bakes
+		// the enforce-container-sigpolicy install drop-in into sysroot/ (we trust it to,
+		// rather than hand-writing the file). The guest's insecure-registry drop-in is
+		// test infra `enroll` knows nothing about, so write that one ourselves.
 		h.bootcher(&["sign", "enroll", "cosign"]).assert().success();
-		h.write_sysroot(
-			"usr/lib/bootc/install/30-bootcher-signing.toml",
-			"[install]\nenforce-container-sigpolicy = true\n",
+		assert!(
+			h.proj.join("sysroot/usr/lib/bootc/install/30-bootcher-signing.toml").is_file(),
+			"sign enroll should have baked the enforce-container-sigpolicy drop-in",
 		);
 		h.write_sysroot(
 			"etc/containers/registries.conf.d/10-bootcher-e2e.conf",

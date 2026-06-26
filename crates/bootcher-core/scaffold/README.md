@@ -58,21 +58,25 @@ enable it:
 bootcher sign enroll          # writes cosign.key (private, git-ignored) + cosign.pub
 ```
 
-Then expand `[deploy] registry` in `bootcher.toml` from a plain URL to the signing form:
+That single command does the whole wiring: it writes the keypair, rewrites
+`[deploy] registry` in `bootcher.toml` from a plain URL to the signing form (so the
+registry must already be set first):
 
 ```toml
 [deploy]
 registry = { url = "<your-registry>", key = "cosign.key" }
 ```
 
-and create `sysroot/usr/lib/bootc/install/30-bootcher-signing.toml` so a freshly
-provisioned device enforces signatures from first boot (`bootcher init` writes
-this for you when you enable signing during setup):
+and bakes `sysroot/usr/lib/bootc/install/30-bootcher-signing.toml` so a freshly
+provisioned device enforces signatures from first boot:
 
 ```toml
 [install]
 enforce-container-sigpolicy = true
 ```
+
+(`bootcher init` runs this for you when you enable signing during setup, so a
+project scaffolded with signing on is ready to `provision` straight away.)
 
 With this set, `deploy`/`upgrade` sign the pushed multi-arch image, and
 `provision` bakes the public key and a signature-requiring

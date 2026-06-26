@@ -83,6 +83,81 @@ pub fn enroll(key_path: &Path, pub_path: &Path, force: bool) -> Result<()> {
 	Ok(())
 }
 
+/// The bootc install drop-in [`enable_signing`] bakes into the project's `sysroot/`
+/// overlay, so a freshly provisioned device enforces the signature policy from its
+/// very first boot — not only after the first `deploy` switches the origin. See
+/// `bootc-install-config(5)`.
+const ENFORCE_SIGPOLICY_CONFIG: &str = "\
+# Enforce the container signature policy (written by `bootcher sign enroll`). Makes
+# bootc record a verifying origin and reject an image whose signature doesn't
+# satisfy /etc/containers/policy.json. Remove this (and change `[deploy] registry`
+# back to a plain URL string) to go back to unsigned images.
+[install]
+enforce-container-sigpolicy = true
+";
+
+/// Where the bootc install signature-enforcement drop-in lands in a project's
+/// `sysroot/` overlay (copied to `/` by the scaffold Containerfile's `COPY sysroot/ /`).
+pub const ENFORCE_SIGPOLICY_PATH: &str = "sysroot/usr/lib/bootc/install/30-bootcher-signing.toml";
+
+/// Outcome of [`enable_signing`]: the relative key/pub filenames it wrote, plus
+/// whether `[deploy] registry` was actually patched (false ⇒ LAN mode, no registry
+/// to wire — the caller should error).
+pub struct Enrolled {
+	/// The private-key filename, e.g. `cosign.key` (relative to the project root).
+	pub key: String,
+	/// The public-key filename, e.g. `cosign.pub`.
+	pub public: String,
+	/// `false` if `bootcher.toml` had no `[deploy] registry` entry to patch.
+	pub registry_patched: bool,
+}
+
+/// Fully enable image signing for the bootcher project rooted at `root`: generate a
+/// `<prefix>.key`/`<prefix>.pub` keypair, patch `[deploy] registry` to the signing
+/// inline-table form, and (when a registry is configured) bake the
+/// `enforce-container-sigpolicy` bootc install drop-in into `sysroot/`. This is the
+/// single source of truth for the signing wiring, shared by `bootcher sign enroll`
+/// (`root` = cwd) and `bootcher init` (`root` = the freshly scaffolded project dir),
+/// so the two can't drift.
+///
+/// The sigpolicy drop-in is written only when absent, so a key rotation
+/// (`enroll <newprefix>`) refreshes the keypair without clobbering a drop-in the
+/// user may have edited.
+///
+/// # Errors
+///
+/// Returns an error if the key already exists (without `force`), passphrase
+/// collection or key generation fails, or any file can't be read/written.
+pub fn enable_signing(root: &Path, prefix: &str, force: bool) -> Result<Enrolled> {
+	let key = format!("{prefix}.key");
+	let public = format!("{prefix}.pub");
+	enroll(&root.join(&key), &root.join(&public), force)?;
+
+	let registry_patched = patch_registry_key(&root.join(crate::context::MANIFEST), &key)?;
+
+	// The drop-in only matters alongside a configured registry; in LAN mode (no
+	// registry to patch) skip it and let the caller report the missing registry.
+	if registry_patched {
+		write_enforce_sigpolicy(root)?;
+	}
+	Ok(Enrolled { key, public, registry_patched })
+}
+
+/// Write [`ENFORCE_SIGPOLICY_CONFIG`] into `root`'s `sysroot/` overlay (creating
+/// parent dirs). A no-op when the file already exists, so re-enrolling for a key
+/// rotation leaves an existing — possibly user-edited — drop-in untouched.
+fn write_enforce_sigpolicy(root: &Path) -> Result<()> {
+	let path = root.join(ENFORCE_SIGPOLICY_PATH);
+	if path.exists() {
+		return Ok(());
+	}
+	if let Some(parent) = path.parent() {
+		fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+	}
+	fs::write(&path, ENFORCE_SIGPOLICY_CONFIG)
+		.with_context(|| format!("writing {}", path.display()))
+}
+
 /// Patch the `[deploy] registry` entry in `bootcher.toml` so it includes
 /// `key = <key_path>`, preserving all existing comments and formatting.
 ///

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use bootcher_core::context::{self, Manifest, ToSsh};
+use bootcher_core::context::{Manifest, ToSsh};
 use bootcher_core::progress::Scope;
 use bootcher_core::{cache, jobs, pipelines};
 use clap::{Parser, Subcommand};
@@ -315,27 +315,20 @@ fn run() -> Result<()> {
 fn run_sign(cmd: SignCmd) -> Result<()> {
 	match cmd {
 		SignCmd::Enroll { prefix, force } => {
-			let key_path = format!("{prefix}.key");
-			let pub_path = format!("{prefix}.pub");
-			jobs::signing::enroll(
-				std::path::Path::new(&key_path),
-				std::path::Path::new(&pub_path),
-				force,
-			)?;
-			let toml_patched = jobs::signing::patch_registry_key(
-				std::path::Path::new(context::MANIFEST),
-				&key_path,
-			)?;
-			if toml_patched {
+			let enrolled =
+				jobs::signing::enable_signing(std::path::Path::new("."), &prefix, force)?;
+			let jobs::signing::Enrolled { key, public, registry_patched } = enrolled;
+			if registry_patched {
 				eprintln!(
-					"sign: wrote {key_path} (private — keep it secret; the scaffold .gitignore \
-					 covers *.key), {pub_path}, and updated bootcher.toml."
+					"sign: wrote {key} (private — keep it secret; the scaffold .gitignore covers \
+					 *.key), {public}, patched bootcher.toml, and wrote {}.",
+					jobs::signing::ENFORCE_SIGPOLICY_PATH
 				);
 			} else {
 				anyhow::bail!(
-					"keypair written ({key_path}, {pub_path}) but no `registry` entry found in \
-					 bootcher.toml — add `[deploy] registry = {{ url = \"<url>\", key = \"{key_path}\" }}`, \
-					 commit {pub_path}, then run `bootcher provision`/`deploy`"
+					"keypair written ({key}, {public}) but no `registry` entry found in \
+					 bootcher.toml — add `[deploy] registry = {{ url = \"<url>\", key = \"{key}\" }}`, \
+					 commit {public}, then run `bootcher provision`/`deploy`"
 				);
 			}
 			Ok(())
