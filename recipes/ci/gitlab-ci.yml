@@ -137,6 +137,12 @@ deploy:
 # which the base image doesn't ship — install it (root needs no password).
 provision:
   stage: provision
+  # Empty `needs` detaches this job from stage ordering: without it, `provision`
+  # (a later stage) couldn't start until the `deploy` stage finished, even though
+  # the two are independent — so you could never run a disk build without first
+  # running (and passing) deploy. With `needs: []` the manual job is available
+  # from the start of the pipeline.
+  needs: []
   rules:
     # Manual must live INSIDE the rule: a job-level `when: manual` is ignored once
     # `rules` is present (a matched rule with no `when` defaults to on_success), so
