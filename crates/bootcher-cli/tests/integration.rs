@@ -212,6 +212,40 @@ fn build_outside_a_project_points_at_init() {
 		.stderr(predicate::str::contains("not a bootcher project"));
 }
 
+#[test]
+fn manifest_flag_loads_an_alternate_file() {
+	// `--manifest <path>` redirects which file is parsed, leaving the default
+	// `bootcher.toml` untouched. Prove it by writing a sibling manifest with a
+	// distinct image name plus a build.pre hook that dumps BOOTCHER_METADATA and
+	// exits non-zero (aborting before podman, like the other hook tests): if the
+	// alternate was loaded, the metadata carries *its* name, not the default's.
+	let (tmp, proj) = project("demo");
+	let alt = read(&proj, "bootcher.toml").replace(r#"name = "demo""#, r#"name = "demo-ci""#)
+		+ "\n[hooks.build]\npre = \"echo \\\"$BOOTCHER_METADATA\\\" > meta.json; exit 1\"\n";
+	fs::write(proj.join("bootcher.ci.toml"), alt).unwrap();
+
+	// The flag is global, so it's accepted before the subcommand (the documented form).
+	bootcher_in(tmp.path(), &proj)
+		.args(["--manifest", "bootcher.ci.toml", "build"])
+		.assert()
+		.failure();
+
+	let meta = read(&proj, "meta.json");
+	assert!(meta.contains(r#""image_name":"demo-ci""#), "alternate manifest not loaded: {meta}");
+}
+
+#[test]
+fn manifest_flag_error_names_the_missing_file() {
+	// A `--manifest` pointing at a nonexistent file fails naming *that* file, proving
+	// the flag — not the default `bootcher.toml` — drives the path that's read.
+	let (tmp, proj) = project("demo");
+	bootcher_in(tmp.path(), &proj)
+		.args(["--manifest", "nope.toml", "build"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("no nope.toml"));
+}
+
 // ---------------------------------------------------------------- hooks
 
 /// Append a raw `[hooks.<phase>]` table (the caller writes the whole block) to a

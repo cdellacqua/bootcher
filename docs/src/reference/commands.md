@@ -2,6 +2,8 @@
 
 All subcommands require a `bootcher.toml` in the current directory, except `init` (which creates one).
 
+A global `-m`/`--manifest <path>` flag (accepted before or after the subcommand, e.g. `bootcher --manifest bootcher.ci.toml provision`) loads the manifest from `<path>` instead of `./bootcher.toml` — for keeping per-pipeline overrides beside the default. Only the manifest is redirected: the build context and every relative path it names (Containerfile, `sysroot/`, keys) stay anchored to the working directory. `init` ignores it.
+
 ---
 
 ## `bootcher init [name] [-y] [-f]`

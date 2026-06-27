@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use bootcher_core::context::{Manifest, ToSsh};
+use bootcher_core::context::{MANIFEST, Manifest, ToSsh};
 use bootcher_core::progress::Scope;
 use bootcher_core::{cache, jobs, pipelines};
 use clap::{Parser, Subcommand};
@@ -8,6 +8,14 @@ use std::process::ExitCode;
 #[derive(Parser)]
 #[command(version, about = "bootc image provisioning pipeline")]
 struct Cli {
+	/// Load the project manifest from this file instead of `./bootcher.toml`, for
+	/// keeping per-pipeline overrides (e.g. `bootcher --manifest bootcher.ci.toml
+	/// provision`) beside the default. Only the manifest is redirected: the build
+	/// context and every relative path it names (Containerfile, `sysroot/`, keys) stay
+	/// anchored to the working directory, so an alternate manifest layers over the same
+	/// project tree. Ignored by `init`, which writes a fresh `bootcher.toml`.
+	#[arg(short = 'm', long = "manifest", global = true, default_value = MANIFEST)]
+	manifest: String,
 	#[command(subcommand)]
 	cmd: Cmd,
 }
@@ -250,10 +258,15 @@ fn run() -> Result<()> {
 	// builder::vm, the cleared progress bars) instead of killing the process and
 	// leaking them.
 	bootcher_core::signals::install()?;
-	match Cli::parse().cmd {
+	let cli = Cli::parse();
+	// The path the global `--manifest` selects (default `./bootcher.toml`). `init`
+	// ignores it — it always scaffolds a fresh `bootcher.toml` — but every other
+	// subcommand loads the manifest from here.
+	let manifest_path = cli.manifest.as_str();
+	match cli.cmd {
 		Cmd::Init { name, yes, force } => jobs::init::run(name, yes, force),
 		Cmd::Provision { ssh_key, skip_pull_check, anonymous, skip_build } => {
-			let manifest = Manifest::load()?;
+			let manifest = Manifest::load(manifest_path)?;
 			pipelines::provision::preflight(&manifest, skip_build)?;
 			let config = jobs::secrets::Provisioning::collect(
 				&manifest,
@@ -265,19 +278,19 @@ fn run() -> Result<()> {
 			pipelines::provision::run(&manifest, Some(&config), skip_build)
 		}
 		Cmd::Deploy { skip_bootc_upgrade, skip_build } => {
-			let manifest = Manifest::load()?;
+			let manifest = Manifest::load(manifest_path)?;
 			pipelines::deploy::preflight(&manifest, skip_bootc_upgrade, skip_build)?;
 			pipelines::deploy::run(&manifest, skip_bootc_upgrade, skip_build)
 		}
 		Cmd::Build => {
-			let manifest = Manifest::load()?;
+			let manifest = Manifest::load(manifest_path)?;
 			jobs::build::preflight(&manifest)?;
 			// `build::run` assembles the multi-arch manifest list as its final step, so a
 			// bare `build` leaves a usable `localhost/<name>:latest` like the pipelines do.
 			jobs::build::run(&manifest, &mut Scope::standalone())
 		}
 		Cmd::Takeover { ssh_key, login, skip_pull_check, anonymous, yes, skip_build } => {
-			let manifest = Manifest::load()?;
+			let manifest = Manifest::load(manifest_path)?;
 			// Pre-flight before collecting secrets or building: local build tools, plus
 			// the per-host over-SSH readiness checks (podman/sudo, arch, layout) — so a
 			// disqualified host fails fast rather than after a multi-GB build.
@@ -304,15 +317,15 @@ fn run() -> Result<()> {
 				skip_build,
 			)
 		}
-		Cmd::Sign(cmd) => run_sign(cmd),
-		Cmd::Rotate(cmd) => run_rotate(cmd),
+		Cmd::Sign(cmd) => run_sign(cmd, manifest_path),
+		Cmd::Rotate(cmd) => run_rotate(cmd, manifest_path),
 		Cmd::Clean => cache::clean(),
 	}
 }
 
 /// `bootcher sign <cmd>`. `enroll` generates a keypair in-process (no external
 /// tools); `verify` shells out to `podman`, so it preflights that.
-fn run_sign(cmd: SignCmd) -> Result<()> {
+fn run_sign(cmd: SignCmd, manifest_path: &str) -> Result<()> {
 	match cmd {
 		SignCmd::Enroll { prefix, force } => {
 			let enrolled =
@@ -338,7 +351,7 @@ fn run_sign(cmd: SignCmd) -> Result<()> {
 			let pubkey_path = if let Some(p) = pubkey {
 				std::path::PathBuf::from(p)
 			} else {
-				let manifest = Manifest::load()?;
+				let manifest = Manifest::load(manifest_path)?;
 				let signing = manifest.signing().ok_or_else(|| {
 					anyhow::anyhow!(
 						"no signing key configured in `[deploy] registry`; pass `--pubkey` explicitly"
@@ -354,8 +367,8 @@ fn run_sign(cmd: SignCmd) -> Result<()> {
 /// `bootcher rotate <cmd>`: each reaches the deployed devices over ssh; the
 /// pull-token path additionally pre-flights the new token locally via podman
 /// (unless `--skip-pull-check`).
-fn run_rotate(cmd: RotateCmd) -> Result<()> {
-	let manifest = Manifest::load()?;
+fn run_rotate(cmd: RotateCmd, manifest_path: &str) -> Result<()> {
+	let manifest = Manifest::load(manifest_path)?;
 	let pull_check = matches!(&cmd, RotateCmd::PullToken { skip_pull_check } if !skip_pull_check);
 	jobs::rotate::preflight(pull_check)?;
 	match cmd {

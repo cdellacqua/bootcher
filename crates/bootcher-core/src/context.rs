@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::ssh::Ssh;
 
@@ -914,23 +914,29 @@ impl Hooks {
 }
 
 impl Manifest {
-	/// Read and parse `./bootcher.toml`, failing with a pointer to `bootcher
-	/// init` when the cwd isn't a bootcher project.
+	/// Read and parse a manifest at `path` (default `./bootcher.toml`, see
+	/// [`MANIFEST`]), failing with a pointer to `bootcher init` when the cwd isn't a
+	/// bootcher project. The build context and every relative path the manifest names
+	/// (Containerfile, `sysroot/`, keys) stay anchored to the cwd, not to `path`, so a
+	/// `--manifest bootcher.ci.toml` is a per-pipeline override layered over the same
+	/// project tree.
 	///
 	/// # Errors
 	///
 	/// Returns an error if the manifest is missing, unreadable, or fails to parse.
-	pub fn load() -> Result<Self> {
-		let raw = match fs::read_to_string(MANIFEST) {
+	pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+		let path = path.as_ref();
+		let display = path.display();
+		let raw = match fs::read_to_string(path) {
 			Ok(raw) => raw,
 			Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(
-				"no {MANIFEST} in the current directory — not a bootcher project.\n\
+				"no {display} in the current directory — not a bootcher project.\n\
 				 Run `bootcher init <name>` to scaffold one, or cd into an existing project."
 			),
-			Err(e) => return Err(e).with_context(|| format!("reading {MANIFEST}")),
+			Err(e) => return Err(e).with_context(|| format!("reading {display}")),
 		};
 		let manifest: Manifest =
-			toml::from_str(&raw).with_context(|| format!("parsing {MANIFEST}"))?;
+			toml::from_str(&raw).with_context(|| format!("parsing {display}"))?;
 		// A present-but-empty `[general.disk_types]` table leaves nothing to build —
 		// the per-entry deserializer can't catch it (it never sees an arch), so reject
 		// it here where the whole table is in hand.
