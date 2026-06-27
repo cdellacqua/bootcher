@@ -247,7 +247,7 @@ fn manifest_flag_error_names_the_missing_file() {
 }
 
 /// Write an alternate manifest in the project that `extend`s `bootcher.toml` and
-/// adds a build.pre hook dumping BOOTCHER_METADATA (then exits non-zero, aborting
+/// adds a build.pre hook dumping `BOOTCHER_METADATA` (then exits non-zero, aborting
 /// before podman). The hook is how each test reads back what the merged manifest
 /// resolved to, podman-free. Returns the alternate manifest's filename.
 fn extending_manifest(proj: &Path, body: &str) -> &'static str {

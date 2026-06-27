@@ -959,7 +959,10 @@ fn resolve_extends(
 	let raw = match fs::read_to_string(&parent_path) {
 		Ok(raw) => raw,
 		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-			bail!("{} extends \"{parent_rel}\", but {parent_display} doesn't exist", child_path.display())
+			bail!(
+				"{} extends \"{parent_rel}\", but {parent_display} doesn't exist",
+				child_path.display()
+			)
 		}
 		Err(e) => return Err(e).with_context(|| format!("reading {parent_display}")),
 	};

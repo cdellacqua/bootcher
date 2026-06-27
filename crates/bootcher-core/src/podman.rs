@@ -1,5 +1,5 @@
-//! Shared podman invocation helpers: teardown primitives plus [`opts_shell`], the
-//! shell-string form of a builder's configured `podman_opts`.
+//! Shared podman invocation helpers: teardown primitives plus the shell-string
+//! form of a builder's configured `podman_opts`.
 //!
 //! Every RAII cleanup guard in the codebase — the build scratch guards, the
 //! interrupt-time working-container sweep, and the
