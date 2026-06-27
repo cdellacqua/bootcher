@@ -8,6 +8,17 @@
 # GitHub-hosted runners allow that. Pin `:latest` to a released `:vX.Y.Z` for
 # reproducible builds.
 #
+# Because each job runs bootcher *inside* a container, the job's root fs is
+# overlayfs, so rootful `podman build`'s store would fall back to fuse-overlayfs
+# (the kernel refuses overlay-on-overlay), whose userspace coherence breaks a
+# large `dnf install` — rpm "loses" base-provided sonames mid-transaction. The
+# first step of each job sidesteps it by relocating the podman store onto a
+# loopback ext4 image: a real fs, so podman does a single kernel overlay (no fuse,
+# and only deltas — unlike STORAGE_DRIVER=vfs, which ENOSPCs on a chromium build).
+# It self-skips on a non-overlay store, and needs the privileged container (loop
+# mount). Tune the ceiling with the BOOTCHER_STORE_SIZE env var (`df -h` on the
+# runner). GitHub workflow YAML has no anchors, so the step is duplicated per job.
+#
 # Two jobs, two triggers:
 #   deploy    — on push to the default branch and on `v*` tags: `bootcher deploy`
 #               builds the container and pushes `<registry>/<name>:latest` to GHCR
@@ -61,6 +72,24 @@ jobs:
       options: --privileged # podman builds the container image (nested)
     steps:
       - uses: actions/checkout@v4
+      # Real-fs container store (see the header note): a loopback ext4 so podman
+      # does one kernel overlay instead of fuse-overlayfs-on-overlay. Self-skips
+      # when the store is already on a real fs.
+      - name: Prepare container store
+        run: |
+          set -eu
+          if [ "$(stat -f -c %T / 2>/dev/null)" = "overlayfs" ]; then
+            : "${BOOTCHER_STORE_SIZE:=20G}"
+            img=/bootcher-store.img
+            truncate -s "$BOOTCHER_STORE_SIZE" "$img"
+            mkfs.ext4 -q -F "$img"
+            mkdir -p /var/lib/containers/storage
+            mount -o loop "$img" /var/lib/containers/storage
+            echo "relocated podman store onto loopback ext4 (${BOOTCHER_STORE_SIZE} ceiling)"
+          else
+            echo "container store already on a real fs; skipping loopback store"
+          fi
+          podman info --format 'podman store: {{.Store.GraphDriverName}} @ {{.Store.GraphRoot}} (rootless={{.Host.Security.Rootless}})'
       - name: Log in to GHCR
         run: echo "$GITHUB_TOKEN" | podman login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
         env:
@@ -90,6 +119,24 @@ jobs:
       options: --privileged
     steps:
       - uses: actions/checkout@v4
+      # Real-fs container store (see the header note): a loopback ext4 so podman
+      # does one kernel overlay instead of fuse-overlayfs-on-overlay. Self-skips
+      # when the store is already on a real fs.
+      - name: Prepare container store
+        run: |
+          set -eu
+          if [ "$(stat -f -c %T / 2>/dev/null)" = "overlayfs" ]; then
+            : "${BOOTCHER_STORE_SIZE:=20G}"
+            img=/bootcher-store.img
+            truncate -s "$BOOTCHER_STORE_SIZE" "$img"
+            mkfs.ext4 -q -F "$img"
+            mkdir -p /var/lib/containers/storage
+            mount -o loop "$img" /var/lib/containers/storage
+            echo "relocated podman store onto loopback ext4 (${BOOTCHER_STORE_SIZE} ceiling)"
+          else
+            echo "container store already on a real fs; skipping loopback store"
+          fi
+          podman info --format 'podman store: {{.Store.GraphDriverName}} @ {{.Store.GraphRoot}} (rootless={{.Host.Security.Rootless}})'
       # The image-builder disk step shells out to `sudo`, which the base image
       # doesn't ship — install it (we're root, so no password is needed).
       - name: Install sudo

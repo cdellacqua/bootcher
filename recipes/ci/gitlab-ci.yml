@@ -63,6 +63,46 @@ default:
   image:
     name: ghcr.io/cdellacqua/bootcher:latest
     entrypoint: [""] # the image's entrypoint is bootcher itself; we drive it from sh
+  before_script:
+    # --- real-fs container store (nested-overlay workaround) -------------------
+    # GitLab's hosted saas runners run each job inside a container whose root fs is
+    # itself overlayfs. Rootful `podman build`'s overlay store then can't use the
+    # kernel overlay driver (the kernel refuses overlay-on-overlay) and falls back
+    # to fuse-overlayfs, whose userspace copy-up/mmap coherence breaks a large
+    # `dnf install`: rpm re-reads the rpmdb mid-transaction and "loses" base-provided
+    # sonames (`libssl.so.3 is needed by ...`) even though they're present. Small
+    # installs don't trip it; a chromium-scale one does.
+    #
+    # Fix: put the store on a REAL filesystem. A loopback-mounted ext4 image is a
+    # genuine block fs no matter where its backing file lives, so podman does a
+    # single, un-nested *kernel* overlay — no fuse, correct coherence. Unlike
+    # STORAGE_DRIVER=vfs (a full copy per layer → ENOSPC on a chromium build),
+    # ext4+overlay stores only deltas, so it fits the same disk. Needs the
+    # privileged job container (loop mount); the runner VM is ephemeral, so there's
+    # nothing to tear down.
+    #
+    # Self-managed shell/host runner whose store is already on a real fs? The guard
+    # detects the non-overlay case and skips itself, so this is safe to leave in.
+    - |
+      set -eu
+      if [ "$(stat -f -c %T / 2>/dev/null)" = "overlayfs" ]; then
+        # Ceiling, not a reservation: the sparse image grows to the build's actual
+        # delta size, capped by the runner's free disk. Tune to `df -h` — smaller
+        # on saas-linux-small, larger if you have the room.
+        : "${BOOTCHER_STORE_SIZE:=20G}"
+        img=/bootcher-store.img
+        truncate -s "$BOOTCHER_STORE_SIZE" "$img"
+        mkfs.ext4 -q -F "$img"
+        mkdir -p /var/lib/containers/storage
+        mount -o loop "$img" /var/lib/containers/storage
+        echo "relocated podman store onto loopback ext4 (${BOOTCHER_STORE_SIZE} ceiling)"
+      else
+        echo "container store already on a real fs; skipping loopback store"
+      fi
+      # Confirm the driver took: expect `overlay` (kernel), NOT `fuse-overlayfs`. If
+      # it still reads fuse-overlayfs, the store's storage.conf is forcing a
+      # mount_program — clear it before the build.
+      podman info --format 'podman store: {{.Store.GraphDriverName}} @ {{.Store.GraphRoot}} (rootless={{.Host.Security.Rootless}})'
 
 stages: [deploy, provision]
 

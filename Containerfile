@@ -35,6 +35,7 @@ RUN dnf install -y --setopt=install_weak_deps=False \
       edk2-aarch64 \
       cloud-utils-growpart \
       util-linux \
+      e2fsprogs \
       openssh-clients \
       curl \
       which \
