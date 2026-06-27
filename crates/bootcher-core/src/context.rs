@@ -239,6 +239,15 @@ pub enum Rootfs {
 #[derive(Clone, Debug, Deserialize, Serialize, schemars::JsonSchema)]
 #[schemars(title = "bootcher.toml", description = "The bootcher project manifest.")]
 pub struct Manifest {
+	/// Inherit from another manifest: the named file (a path relative to *this*
+	/// file's directory) is loaded first and this file's keys are layered over it —
+	/// tables merge key-by-key, while scalars and arrays replace wholesale. Use it to
+	/// keep a pipeline-specific override (e.g. a `bootcher.ci.toml` that only sets
+	/// `[builder] build = "vm"`) beside the base `bootcher.toml` without restating it.
+	/// `extend` chains are followed and cycles rejected. Resolved at load time, so it
+	/// never appears in a serialized manifest. See [`Manifest::load`].
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub extend: Option<String>,
 	pub general: General,
 	/// Where the build and image steps run; see [`BuilderConfig`]. Defaults to
 	/// all-`local` when the table is absent.
@@ -913,6 +922,74 @@ impl Hooks {
 	}
 }
 
+/// Canonicalize `path` for `extend`-cycle detection, falling back to the path
+/// as-written when it can't be resolved — so two spellings of the same file
+/// (`bootcher.toml` vs `./bootcher.toml`) still compare equal.
+fn canonical(path: &Path) -> PathBuf {
+	path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Resolve a manifest's `extend` chain into a single merged table. `child` is the
+/// already-parsed table (its `extend` key still present), `child_path` is where it
+/// was read (parents resolve relative to its directory), and `chain` holds the
+/// canonical paths already on the inheritance path so a cycle is caught instead of
+/// looping forever.
+fn resolve_extends(
+	mut child: toml::Table,
+	child_path: &Path,
+	chain: &mut Vec<PathBuf>,
+) -> Result<toml::Table> {
+	let parent_rel = match child.remove("extend") {
+		Some(toml::Value::String(s)) => s,
+		Some(_) => {
+			bail!("`extend` in {} must be a string path to another manifest", child_path.display())
+		}
+		None => return Ok(child),
+	};
+	let base = child_path.parent().unwrap_or_else(|| Path::new(""));
+	let parent_path = base.join(&parent_rel);
+	let parent_display = parent_path.display();
+	let canon = canonical(&parent_path);
+	if chain.contains(&canon) {
+		bail!(
+			"`extend` cycle: {} eventually extends itself (via {parent_display})",
+			child_path.display()
+		);
+	}
+	let raw = match fs::read_to_string(&parent_path) {
+		Ok(raw) => raw,
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+			bail!("{} extends \"{parent_rel}\", but {parent_display} doesn't exist", child_path.display())
+		}
+		Err(e) => return Err(e).with_context(|| format!("reading {parent_display}")),
+	};
+	let parent: toml::Table =
+		toml::from_str(&raw).with_context(|| format!("parsing {parent_display}"))?;
+	chain.push(canon);
+	// Resolve the parent's own `extend` first (grandparents apply underneath), then
+	// layer this child over the fully-resolved parent.
+	let parent = resolve_extends(parent, &parent_path, chain)?;
+	Ok(deep_merge(parent, child))
+}
+
+/// Recursively merge `over` onto `base`: a key that is a table in both is merged
+/// field-by-field (so a child overrides one key of a section without restating the
+/// rest), while every other value — scalars and arrays alike — is replaced wholesale
+/// by `over`'s.
+fn deep_merge(mut base: toml::Table, over: toml::Table) -> toml::Table {
+	for (key, val) in over {
+		match (base.remove(&key), val) {
+			(Some(toml::Value::Table(b)), toml::Value::Table(o)) => {
+				base.insert(key, toml::Value::Table(deep_merge(b, o)));
+			}
+			(_, val) => {
+				base.insert(key, val);
+			}
+		}
+	}
+	base
+}
+
 impl Manifest {
 	/// Read and parse a manifest at `path` (default `./bootcher.toml`, see
 	/// [`MANIFEST`]), failing with a pointer to `bootcher init` when the cwd isn't a
@@ -935,8 +1012,20 @@ impl Manifest {
 			),
 			Err(e) => return Err(e).with_context(|| format!("reading {display}")),
 		};
-		let manifest: Manifest =
+		let table: toml::Table =
 			toml::from_str(&raw).with_context(|| format!("parsing {display}"))?;
+		// A manifest may layer onto another via a top-level `extend = "<path>"`: the
+		// parent is loaded first and this file's keys merged over it (tables merge
+		// recursively, scalars/arrays replace), so a pipeline variant restates only its
+		// overrides. Resolve the whole chain into one table before deserializing. The
+		// common no-`extend` case stays on the original path, keeping toml's
+		// line-located type errors that a post-merge deserialize would lose.
+		let manifest: Manifest = if table.contains_key("extend") {
+			let merged = resolve_extends(table, path, &mut vec![canonical(path)])?;
+			toml::Value::Table(merged).try_into().with_context(|| format!("parsing {display}"))?
+		} else {
+			toml::from_str(&raw).with_context(|| format!("parsing {display}"))?
+		};
 		// A present-but-empty `[general.disk_types]` table leaves nothing to build —
 		// the per-entry deserializer can't catch it (it never sees an arch), so reject
 		// it here where the whole table is in hand.
@@ -1632,5 +1721,32 @@ mod tests {
 		let m = parse("[general]\nname = \"x\"\nplatform = \"x86_64\"\n");
 		assert!(m.registry().is_none());
 		assert!(m.signing().is_none());
+	}
+
+	fn table(toml: &str) -> toml::Table {
+		toml::from_str(toml).unwrap()
+	}
+
+	#[test]
+	fn deep_merge_recurses_tables_and_replaces_leaves() {
+		// Sub-tables merge field-by-field: the override touches one key of `[general]`
+		// and adds a `[builder]` section, while leaving the base's other `[general]`
+		// keys intact. Scalars present in both take the override's value.
+		let base = table("[general]\nname = \"base\"\nrootfs = \"ext4\"\n");
+		let over = table("[general]\nname = \"ci\"\n[builder]\nbuild = \"vm\"\n");
+		let merged = deep_merge(base, over);
+		let m: Manifest = toml::Value::Table(merged).try_into().unwrap();
+		assert_eq!(m.general.name, "ci"); // override wins
+		assert_eq!(m.general.rootfs, Rootfs::Ext4); // base key preserved
+		assert_eq!(m.build_builder(Arch::host().unwrap_or(Arch::X86_64)).spec(), "vm"); // added
+	}
+
+	#[test]
+	fn deep_merge_replaces_arrays_wholesale() {
+		// An array isn't concatenated — the override's list replaces the base's entirely.
+		let base = table("x86_64 = [\"raw\", \"qcow2\"]\n");
+		let over = table("x86_64 = [\"qcow2\"]\n");
+		let dt: DiskTypes = toml::Value::Table(deep_merge(base, over)).try_into().unwrap();
+		assert_eq!(dt.types(Arch::X86_64), [DiskType::Qcow2]);
 	}
 }

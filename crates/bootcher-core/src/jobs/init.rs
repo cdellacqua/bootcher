@@ -221,6 +221,8 @@ impl Target {
 		// to the inline-table signing form — the single code path that wires signing.
 		let registry_config = settings.registry.clone().map(RegistryConfig::Url);
 		let manifest = Manifest {
+			// A scaffold is a standalone base, never an `extend` override.
+			extend: None,
 			general: General {
 				name: self.name.clone(),
 				rootfs: settings.rootfs,

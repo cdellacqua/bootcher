@@ -61,6 +61,31 @@ remotes = []               # SSH targets: "admin@host" or { remote = "...", ssh_
 
 ---
 
+## `extend` *(top-level, optional)*
+
+Inherit from another manifest. The named file (a path relative to *this* manifest's directory) is loaded first and this file's keys are layered over it. Use it to keep a pipeline-specific variant beside the base `bootcher.toml` without restating it — paired with the global `--manifest` flag:
+
+```toml
+# bootcher.ci.toml
+extend = "bootcher.toml"
+
+[builder]
+build = "vm"          # CI builds in a VM; everything else inherited from bootcher.toml
+```
+
+```sh
+bootcher --manifest bootcher.ci.toml provision
+```
+
+Merge semantics:
+
+- **Tables merge recursively** — `[builder] build = "vm"` above overrides only that one key; the base's `image`, `[general]`, `[deploy]`, etc. are inherited intact.
+- **Scalars and arrays replace wholesale** — a child that sets `x86_64 = ["qcow2"]` replaces the base's list rather than appending to it.
+
+`extend` chains are followed (a parent may itself `extend` a grandparent, applied underneath) and cycles are rejected. Only the manifest is redirected: the build context and every other relative path (Containerfile, `sysroot/`, keys) stay anchored to the working directory, so a variant layers over the same project tree. `extend` is resolved at load time and never appears in a serialized manifest.
+
+---
+
 ## `[general]`
 
 ### `name` *(required)*

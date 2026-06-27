@@ -246,6 +246,72 @@ fn manifest_flag_error_names_the_missing_file() {
 		.stderr(predicate::str::contains("no nope.toml"));
 }
 
+/// Write an alternate manifest in the project that `extend`s `bootcher.toml` and
+/// adds a build.pre hook dumping BOOTCHER_METADATA (then exits non-zero, aborting
+/// before podman). The hook is how each test reads back what the merged manifest
+/// resolved to, podman-free. Returns the alternate manifest's filename.
+fn extending_manifest(proj: &Path, body: &str) -> &'static str {
+	let name = "bootcher.ci.toml";
+	let manifest = format!(
+		"extend = \"bootcher.toml\"\n{body}\n\
+		 [hooks.build]\npre = \"echo \\\"$BOOTCHER_METADATA\\\" > meta.json; exit 1\"\n"
+	);
+	fs::write(proj.join(name), manifest).unwrap();
+	name
+}
+
+#[test]
+fn extend_inherits_the_base_and_layers_overrides() {
+	// A child manifest that only declares `extend` + a `[hooks]` table inherits the
+	// base's `[general]` (name, disk_types) wholesale — the merged metadata still
+	// carries the base project's name and local image ref, proving the parent was
+	// loaded underneath.
+	let (tmp, proj) = project("demo");
+	let ci = extending_manifest(&proj, "");
+	bootcher_in(tmp.path(), &proj).args(["--manifest", ci, "build"]).assert().failure();
+	let meta = read(&proj, "meta.json");
+	assert!(meta.contains(r#""image_name":"demo""#), "base [general] not inherited: {meta}");
+	assert!(meta.contains(r#""image_ref":"localhost/demo:latest""#), "meta: {meta}");
+}
+
+#[test]
+fn extend_child_overrides_a_base_scalar() {
+	// The child overrides one `[general]` scalar (the image name) while inheriting the
+	// rest: the merge is a deep one, not a wholesale section replacement that would
+	// drop the base's disk_types and fail to build.
+	let (tmp, proj) = project("demo");
+	let ci = extending_manifest(&proj, "[general]\nname = \"demo-ci\"");
+	bootcher_in(tmp.path(), &proj).args(["--manifest", ci, "build"]).assert().failure();
+	let meta = read(&proj, "meta.json");
+	assert!(meta.contains(r#""image_name":"demo-ci""#), "child override not applied: {meta}");
+}
+
+#[test]
+fn extend_missing_parent_is_a_clear_error() {
+	// Extending a file that doesn't exist fails naming both the child and the missing
+	// parent, rather than a bare "not a bootcher project".
+	let (tmp, proj) = project("demo");
+	fs::write(proj.join("bootcher.ci.toml"), "extend = \"nope.toml\"\n").unwrap();
+	bootcher_in(tmp.path(), &proj)
+		.args(["--manifest", "bootcher.ci.toml", "build"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("extends \"nope.toml\""));
+}
+
+#[test]
+fn extend_cycle_is_rejected() {
+	// Two manifests extending each other must be caught, not looped on.
+	let (tmp, proj) = project("demo");
+	fs::write(proj.join("a.toml"), "extend = \"b.toml\"\n").unwrap();
+	fs::write(proj.join("b.toml"), "extend = \"a.toml\"\n").unwrap();
+	bootcher_in(tmp.path(), &proj)
+		.args(["--manifest", "a.toml", "build"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("cycle"));
+}
+
 // ---------------------------------------------------------------- hooks
 
 /// Append a raw `[hooks.<phase>]` table (the caller writes the whole block) to a
