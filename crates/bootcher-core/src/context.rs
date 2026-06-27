@@ -406,49 +406,103 @@ impl DiskTypes {
 	}
 }
 
-/// A `[builder]` spec: either a bare string (`"local"`, `"vm"`, or an ssh
-/// destination) or an inline table pairing a remote destination with extra ssh
-/// args. Mirrors [`RemoteConfig`]'s dual-shape for the deploy `remotes` array.
+/// A `[builder]` spec: either a bare-string shorthand (`"local"`, `"vm"`, or an
+/// ssh destination) for the no-opts common case, or an explicit table tagged by
+/// `type` ([`BuilderTable`]) when it carries extra ssh args and/or `podman` flags.
 ///
 /// ```toml
-/// # bare string — local, vm, or a remote with default ssh:
+/// # shorthand — local, vm, or a remote with default ssh, no extra opts:
 /// build = "user@build-host"
 ///
-/// # inline table — remote with extra ssh args:
-/// build = { remote = "user@build-host", ssh_opts = ["-i", "/path/to/key"] }
+/// # explicit table — each `type` exposes only its valid fields:
+/// build = { type = "local",  podman_opts = ["--network=host"] }
+/// build = { type = "vm",     podman_opts = ["--network=host"] }
+/// build = { type = "remote", host = "user@build-host", ssh_opts = ["-i", "/key"] }
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum BuilderSpec {
-	/// Bare string: `"local"`, `"vm"`, or an ssh destination with no extra args.
+	/// Bare-string shorthand: `"local"`, `"vm"`, or an ssh destination, with no
+	/// extra opts. Sugar for the corresponding [`BuilderTable`] variant.
 	Str(String),
-	/// An ssh destination plus per-connection extra ssh args.
-	WithOpts {
-		remote: String,
+	/// Explicit table form, tagged by `type` — carries the extra opts the
+	/// shorthand can't.
+	Table(BuilderTable),
+}
+
+/// The explicit `[builder]` table form, tagged by `type` so each builder kind
+/// exposes *only* the fields valid for it — `host`/`ssh_opts` exist solely on
+/// `remote`, never silently ignored on a `local`/`vm` builder. `podman_opts` is
+/// the one field common to all three (see [`BuilderSpec::podman_opts`]).
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum BuilderTable {
+	/// In-process builder on this host (`type = "local"`).
+	Local {
+		/// See [`BuilderSpec::podman_opts`].
+		#[serde(default, skip_serializing_if = "Vec::is_empty")]
+		podman_opts: Vec<String>,
+	},
+	/// Throwaway local VM matching the target arch (`type = "vm"`).
+	Vm {
+		/// See [`BuilderSpec::podman_opts`].
+		#[serde(default, skip_serializing_if = "Vec::is_empty")]
+		podman_opts: Vec<String>,
+	},
+	/// Native-arch remote driven over ssh (`type = "remote"`).
+	Remote {
+		/// ssh destination: `"[user@]host"` or `"ssh://[user@]host[:port]"`.
+		host: String,
 		/// Extra `ssh` args prepended to every connection to the build host —
 		/// e.g. `["-i", "/path/to/key"]`. For a remote whose ssh needs more than
 		/// the user's `~/.ssh/config` provides, without a config file.
 		#[serde(default, skip_serializing_if = "Vec::is_empty")]
 		ssh_opts: Vec<String>,
+		/// See [`BuilderSpec::podman_opts`].
+		#[serde(default, skip_serializing_if = "Vec::is_empty")]
+		podman_opts: Vec<String>,
 	},
 }
 
 impl BuilderSpec {
-	/// The bare spec string: `"local"`, `"vm"`, or the ssh destination.
+	/// The bare spec string the builder selector resolves: `"local"`, `"vm"`, or
+	/// the ssh destination.
 	#[must_use]
 	pub fn spec(&self) -> &str {
 		match self {
 			Self::Str(s) => s,
-			Self::WithOpts { remote, .. } => remote,
+			Self::Table(BuilderTable::Local { .. }) => "local",
+			Self::Table(BuilderTable::Vm { .. }) => "vm",
+			Self::Table(BuilderTable::Remote { host, .. }) => host,
 		}
 	}
 
-	/// Extra ssh args for this spec (empty for `Str` variants).
+	/// Extra ssh args for this spec — only a `remote` table carries them; empty
+	/// for everything else (a bare string, `local`, or `vm`).
 	#[must_use]
 	pub fn ssh_opts(&self) -> &[String] {
 		match self {
+			Self::Table(BuilderTable::Remote { ssh_opts, .. }) => ssh_opts,
+			_ => &[],
+		}
+	}
+
+	/// Extra flags spliced into this builder's `podman` invocation — the container
+	/// build's `podman build` for the `build` role, the privileged image-builder
+	/// `podman run` for the `image` role. Passed through verbatim (an escape hatch,
+	/// e.g. `["--network=host"]` where podman's default per-container networking
+	/// can't be set up); a flag clashing with one bootcher already sets (`--arch`,
+	/// `--privileged`) is the caller's problem. Scoped to this builder + role + arch
+	/// by where the spec sits in the `[builder]` table. Empty for a bare string.
+	#[must_use]
+	pub fn podman_opts(&self) -> &[String] {
+		match self {
 			Self::Str(_) => &[],
-			Self::WithOpts { ssh_opts, .. } => ssh_opts,
+			Self::Table(
+				BuilderTable::Local { podman_opts }
+				| BuilderTable::Vm { podman_opts }
+				| BuilderTable::Remote { podman_opts, .. },
+			) => podman_opts,
 		}
 	}
 }
@@ -1291,10 +1345,10 @@ mod tests {
 
 	#[test]
 	fn builder_spec_with_ssh_opts_parses_and_threads_opts() {
-		// Inline-table form: the destination and ssh_opts reach the resolved spec.
+		// Explicit `type = "remote"` table: host and ssh_opts reach the resolved spec.
 		let m = parse(
 			"[general]\nname = \"x\"\nplatform = \"x86_64\"\n\
-			 [builder]\nbuild = { remote = \"user@build-host\", ssh_opts = [\"-i\", \"/key\"] }\n",
+			 [builder]\nbuild = { type = \"remote\", host = \"user@build-host\", ssh_opts = [\"-i\", \"/key\"] }\n",
 		);
 		let spec = m.build_builder(Arch::X86_64);
 		assert_eq!(spec.spec(), "user@build-host");
@@ -1310,6 +1364,34 @@ mod tests {
 		let spec = m.build_builder(Arch::X86_64);
 		assert_eq!(spec.spec(), "user@build-host");
 		assert!(spec.ssh_opts().is_empty());
+		assert!(spec.podman_opts().is_empty());
+	}
+
+	#[test]
+	fn builder_spec_local_table_carries_podman_opts() {
+		// Explicit `type = "local"` resolves to the in-process builder yet still
+		// carries its podman_opts — the cross-arch-local case.
+		let m = parse(
+			"[general]\nname = \"x\"\nplatform = \"x86_64\"\n\
+			 [builder]\nbuild = { type = \"local\", podman_opts = [\"--network=host\"] }\n",
+		);
+		let spec = m.build_builder(Arch::X86_64);
+		assert_eq!(spec.spec(), "local");
+		assert!(crate::builder::is_local(spec));
+		assert!(spec.ssh_opts().is_empty());
+		assert_eq!(spec.podman_opts(), &["--network=host"]);
+	}
+
+	#[test]
+	fn builder_spec_remote_table_threads_podman_opts() {
+		// `type = "remote"` host + podman_opts coexist and both reach the resolved spec.
+		let m = parse(
+			"[general]\nname = \"x\"\nplatform = \"x86_64\"\n\
+			 [builder]\nimage = { type = \"remote\", host = \"user@h\", podman_opts = [\"--network=host\"] }\n",
+		);
+		let spec = m.image_builder(Arch::X86_64);
+		assert_eq!(spec.spec(), "user@h");
+		assert_eq!(spec.podman_opts(), &["--network=host"]);
 	}
 
 	#[test]

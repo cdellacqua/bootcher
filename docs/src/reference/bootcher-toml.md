@@ -28,7 +28,7 @@ rootfs = "ext4"            # root filesystem (default: ext4)
 x86_64 = "qcow2"           # one type, or a list: ["qcow2", "bootc-installer"]
 
 [builder]
-build = "local"            # container-build backend: "local", "vm", "[user@]host" or a rich { remote = "user@build-host", ssh_opts = ["-i", "/path/to/key"] }
+build = "local"            # container-build backend: "local", "vm", "[user@]host" or a rich { type = "remote", host = "user@build-host", ssh_opts = ["-i", "/path/to/key"] }
 image = "local"            # disk-image (image-builder) backend
 
 # [builder.aarch64]          # per-arch override: route cross-arch image-builder to a VM
@@ -117,12 +117,16 @@ Root filesystem format (`--bootc-default-fs`). Default: `ext4`. Also accepts `xf
 
 Builder spec for the container build (the `build` step shared by `build`/`provision`/`deploy`/`takeover`) and the image-builder disk-image step (the disk step of `provision`) respectively.
 
+Each value is either a **bare-string shorthand** for the no-opts common case, or an **explicit table** tagged by `type` when it carries extra `ssh_opts` and/or `podman_opts`. Each `type` exposes only the fields valid for it (`host`/`ssh_opts` live on `remote` alone).
+
 | Value | Meaning |
 |---|---|
-| `"local"` *(default)* | Run in-process on the build host |
-| `"vm"` | Use a throwaway local QEMU VM matching the target arch |
-| `"[user@]host"` or `"ssh://[user@]host[:port]"` | Use a remote native-arch machine over SSH |
-| `{ remote = "…", ssh_opts = […] }` | Remote with extra ssh args (identity file, port, etc.) |
+| `"local"` *(default)* | Shorthand: run in-process on the build host |
+| `"vm"` | Shorthand: a throwaway local QEMU VM matching the target arch |
+| `"[user@]host"` or `"ssh://[user@]host[:port]"` | Shorthand: a remote native-arch machine over SSH |
+| `{ type = "local", podman_opts = […] }` | In-process, with extra `podman` flags; see [`podman_opts`](#podman_opts) |
+| `{ type = "vm", podman_opts = […] }` | Local VM, with extra `podman` flags |
+| `{ type = "remote", host = "…", ssh_opts = […], podman_opts = […] }` | Remote with extra ssh args (identity file, port, …) and/or `podman` flags |
 
 **Which backend when** — the tradeoffs differ sharply by whether you're building for the host arch or cross-arch, and `bootcher init` defaults/recommends accordingly:
 
@@ -133,11 +137,11 @@ Builder spec for the container build (the `build` step shared by `build`/`provis
 
 So: a cross-arch `image` step on a host with no same-arch remote means `vm` (slow but reliable); with a same-arch remote, prefer the remote. For same-arch, stay on `local` unless you specifically want the VM's isolation.
 
-When a remote builder needs ssh options that the user's `~/.ssh/config` doesn't cover, use the inline-table form:
+When a remote builder needs ssh options that the user's `~/.ssh/config` doesn't cover, use the explicit `type = "remote"` table:
 
 ```toml
 [builder]
-build = { remote = "user@build-host", ssh_opts = ["-i", "/path/to/key"] }
+build = { type = "remote", host = "user@build-host", ssh_opts = ["-i", "/path/to/key"] }
 image = "vm"
 ```
 
@@ -145,10 +149,37 @@ Or the equivalent expanded form with dotted keys:
 
 ```toml
 [builder]
-build.remote   = "user@build-host"
+build.type     = "remote"
+build.host     = "user@build-host"
 build.ssh_opts = ["-i", "/path/to/key"]
 image          = "vm"
 ```
+
+### `podman_opts`
+
+Extra flags spliced **verbatim** into this builder's `podman` invocation, available on every `type`. They're scoped by where the spec sits in the table — so the same underlying `podman` command can take different flags per role, per backend, and per arch:
+
+- on a `build` spec → the container build's `podman build`;
+- on an `image` spec → the privileged image-builder `podman run`.
+
+A `local` (or `vm`) builder carries `podman_opts` via its own typed table:
+
+```toml
+[builder]
+build = { type = "local", podman_opts = ["--network=host"] }      # local build on the host network
+image = { type = "remote", host = "user@build-host", podman_opts = ["--network=host"] }
+```
+
+This is an escape hatch for environments where podman's defaults don't fit — e.g. `--network=host` where per-container networking can't be set up (a runner with a broken iptables→nftables shim or missing kernel features). The flags are passed through unchecked: one that clashes with a flag bootcher already sets (`--arch`, `--privileged`, …) is your responsibility, and `podman build` and `podman run` accept different flag sets, so put each on the matching role.
+
+Because the spec is per-arch (see below), this is also how you give a **cross-arch** build flags its same-arch sibling doesn't need:
+
+```toml
+[builder.aarch64]
+build = { type = "local", podman_opts = ["--network=host"] }   # only the emulated aarch64 build
+```
+
+> **Note:** `bootcher.toml` is committed and shared across machines, so flags here apply everywhere the project builds (local dev included). Keep `podman_opts` to flags that are genuinely intrinsic to that builder/arch; for a flag that only one *environment* needs (e.g. one CI runner), prefer an environment-specific override outside the manifest.
 
 ### `[builder.<arch>]`
 

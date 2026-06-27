@@ -1,4 +1,5 @@
-//! Shared best-effort podman-store teardown primitives.
+//! Shared podman invocation helpers: teardown primitives plus [`opts_shell`], the
+//! shell-string form of a builder's configured `podman_opts`.
 //!
 //! Every RAII cleanup guard in the codebase — the build scratch guards, the
 //! interrupt-time working-container sweep, and the
@@ -8,9 +9,28 @@
 //! one place. They all run on a teardown/unwind path, so each defers to
 //! [`crate::exec::best_effort`] for the silent, never-raise contract those paths
 //! require — an ad-hoc podman command not covered here calls that directly.
+//!
+//! The *argv* form of `podman_opts` (for the in-process `podman build`) needs no
+//! helper: it's a plain `&[String]` → `OsString` splice, done inline at the call
+//! site exactly as [`crate::ssh::Ssh`] splices `ssh_opts`. Only the shell-string
+//! form below is non-trivial (re-quoting), and only the remote builder needs it.
 
-use crate::exec::best_effort;
+use crate::exec::{best_effort, sh_quote};
 use std::ffi::{OsStr, OsString};
+
+/// A builder's configured `podman_opts` re-quoted for an `sh -c` command string,
+/// each token space-prefixed — so the result is empty when there are none, and
+/// otherwise slots in right after the verb without a dangling space:
+/// `podman run{opts} …`. Each token is `sh`-quoted individually, so a value
+/// carrying a space stays one argument.
+pub(crate) fn opts_shell(opts: &[String]) -> String {
+	let mut out = String::new();
+	for tok in opts {
+		out.push(' ');
+		out.push_str(&sh_quote(tok));
+	}
+	out
+}
 
 /// Force-remove a container *and its anonymous volumes* (`rm -f -v`).
 ///
@@ -98,4 +118,20 @@ fn list_filter_remove(list_args: &[&str], keep: impl Fn(&str) -> bool, remove_ar
 	let mut argv: Vec<&str> = remove_args.to_vec();
 	argv.extend_from_slice(&matched);
 	best_effort(&duct::cmd("podman", argv));
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn opts_shell_requotes_each_token() {
+		// None -> empty (so `podman run{opts}` has no dangling space).
+		assert_eq!(opts_shell(&[]), "");
+		// A token with a space must come back as a single, re-quoted shell argument,
+		// leading-space-prefixed so it slots in after the verb. `sh_quote` is
+		// conservative (it also quotes the `=`), but each token stays one `sh` word.
+		let opts = ["--label".to_owned(), "a b".to_owned(), "--network=host".to_owned()];
+		assert_eq!(opts_shell(&opts), " --label 'a b' '--network=host'");
+	}
 }

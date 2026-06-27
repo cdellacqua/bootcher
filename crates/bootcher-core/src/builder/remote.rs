@@ -46,13 +46,18 @@ pub(crate) struct RemoteBuilder {
 	/// following `build_disk` tags `source_ref` onto the resident image rather than
 	/// re-transferring it. Interior-mutable: the trait methods take `&self`.
 	resident: RefCell<HashSet<String>>,
+	/// Extra `podman` flags from this builder's `[builder]` spec (`podman_opts`),
+	/// spliced into the remote `sudo podman build` (`build` role) and the
+	/// image-builder `sudo podman run` (`image` role). Empty unless configured.
+	podman_opts: Vec<String>,
 }
 
 impl RemoteBuilder {
-	/// Builder against a user-provided ssh host (default ssh config).
+	/// Builder against a user-provided ssh host (default ssh config), carrying the
+	/// spec's extra `podman` flags.
 	#[must_use]
-	pub(crate) fn new(ssh: Ssh) -> Self {
-		Self { ssh, resident: RefCell::new(HashSet::new()) }
+	pub(crate) fn new(ssh: Ssh, podman_opts: Vec<String>) -> Self {
+		Self { ssh, resident: RefCell::new(HashSet::new()), podman_opts }
 	}
 }
 
@@ -76,7 +81,8 @@ impl Builder for RemoteBuilder {
 		//    is a no-op rather than emulation — the whole point of relocating).
 		//    `FROM localhost/base:…` resolves because the caller built base first.
 		let build = format!(
-			"sudo podman build --os linux --arch {arch} -t {tag} -f {ctx_dir}/Containerfile {ctx_dir}",
+			"sudo podman build{opts} --os linux --arch {arch} -t {tag} -f {ctx_dir}/Containerfile {ctx_dir}",
+			opts = crate::podman::opts_shell(&self.podman_opts),
 			arch = image.arch.oci_arch(),
 		);
 		let argv = self.ssh.argv(&[], &build);
@@ -152,11 +158,12 @@ impl Builder for RemoteBuilder {
 		//    tagged `source_ref` in the remote's root storage).
 		let ib_args = image_builder_args(target, source_ref, cfg_flag);
 		let build = format!(
-			"sudo podman run --rm --privileged --pull=missing \
+			"sudo podman run{opts} --rm --privileged --pull=missing \
 			 --security-opt label=type:unconfined_t \
 			 -v {scratch_dir}:/output \
 			 -v /var/lib/containers/storage:/var/lib/containers/storage \
 			 {cfg_mount} {IMAGE_BUILDER_IMAGE} {ib_args}",
+			opts = crate::podman::opts_shell(&self.podman_opts),
 		);
 		let argv = self.ssh.argv(&[], &build);
 		exec::run_argv_labeled(job, &argv, "image builder")?;
@@ -468,7 +475,8 @@ mod tests {
 	fn ssh_opts_inject_extra_args_before_host() {
 		// VM builder seam: `-p <port> -i <key>` from `opts` must appear, and before
 		// the host.
-		let b = RemoteBuilder::new(Ssh::new("fedora@127.0.0.1", ["-p", "2222", "-i", "/k"]));
+		let b =
+			RemoteBuilder::new(Ssh::new("fedora@127.0.0.1", ["-p", "2222", "-i", "/k"]), vec![]);
 		let argv = strs(&b.ssh.argv(&[], "true"));
 		assert!(argv.windows(2).any(|w| w[0] == "-p" && w[1] == "2222"));
 		assert!(argv.windows(2).any(|w| w[0] == "-i" && w[1] == "/k"));

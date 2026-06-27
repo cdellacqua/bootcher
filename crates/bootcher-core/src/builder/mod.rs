@@ -199,7 +199,10 @@ pub(crate) fn select(
 	job: &Scope,
 ) -> Result<Box<dyn Builder>> {
 	Ok(match choose(spec.spec()) {
-		Choice::Remote(dest) => Box::new(RemoteBuilder::new(Ssh::new(dest, spec.ssh_opts()))),
+		Choice::Remote(dest) => Box::new(RemoteBuilder::new(
+			Ssh::new(dest, spec.ssh_opts()),
+			spec.podman_opts().to_vec(),
+		)),
 		Choice::Local => {
 			// Local is the default even cross-arch — it works under emulation, just
 			// slower than native. Note the overhead rather than silently routing away.
@@ -210,7 +213,7 @@ pub(crate) fn select(
 					 `[builder]` table of bootcher.toml to offload it"
 				));
 			}
-			Box::new(LocalBuilder)
+			Box::new(LocalBuilder::new(spec.podman_opts().to_vec()))
 		}
 		Choice::Vm => {
 			// A VM is just a remote we booted: drive it with a plain
@@ -218,7 +221,7 @@ pub(crate) fn select(
 			// is torn down when the builder drops. The remote stays unaware a VM is
 			// involved (see the tuple `Builder` impl below).
 			let vm = vm::VmInstance::boot(image.arch, job)?;
-			let remote = RemoteBuilder::new(vm.ssh().clone());
+			let remote = RemoteBuilder::new(vm.ssh().clone(), spec.podman_opts().to_vec());
 			Box::new((vm, remote))
 		}
 	})

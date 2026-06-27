@@ -12,6 +12,7 @@ use crate::exec::{self, sh_quote};
 use crate::progress::Scope;
 use anyhow::{Context, Result};
 use duct::cmd;
+use std::ffi::OsString;
 
 /// Absolute path of the `image-builder` binary inside [`IMAGE_BUILDER_IMAGE`] —
 /// i.e. that image's default entrypoint. We override the entrypoint to a shell
@@ -20,18 +21,38 @@ use duct::cmd;
 /// `podman image inspect --format '{{.Config.Entrypoint}}'`.
 const IMAGE_BUILDER_ENTRYPOINT: &str = "/usr/bin/image-builder";
 
-pub(crate) struct LocalBuilder;
+pub(crate) struct LocalBuilder {
+	/// Extra `podman` flags from this builder's `[builder]` spec (`podman_opts`),
+	/// spliced into the container `podman build` (`build` role) and the
+	/// image-builder `podman run` (`image` role). Empty unless configured.
+	podman_opts: Vec<String>,
+}
+
+impl LocalBuilder {
+	/// In-process builder carrying the spec's extra `podman` flags.
+	pub(crate) fn new(podman_opts: Vec<String>) -> Self {
+		Self { podman_opts }
+	}
+}
 
 impl Builder for LocalBuilder {
 	fn build_image(&self, image: &ImageRef, job: &mut Scope) -> Result<()> {
+		// `build`, then this builder's configured `podman_opts`, then the fixed flags
+		// with the positional context last — so the extra options land before the
+		// context arg, where podman expects options.
+		let mut args: Vec<OsString> = vec!["build".into()];
+		// Splice the configured `podman_opts` straight in, exactly as `Ssh::args`
+		// does with `ssh_opts` — a plain `&[String]` → argv map needs no helper. (The
+		// shell-string sites can't do this; they use `podman::opts_shell` to re-quote.)
+		args.extend(self.podman_opts.iter().map(OsString::from));
 		#[rustfmt::skip]
-		let build_cmd = cmd!(
-			"podman", "build",
-			"--os", "linux", "--arch", image.arch.oci_arch(),
-			"-t", image.tag(),
-			"-f", image.build_ctx.join("Containerfile"),
-			&image.build_ctx,
-		);
+		args.extend::<[OsString; 8]>([
+			"--os".into(), "linux".into(), "--arch".into(), image.arch.oci_arch().into(),
+			"-t".into(), image.tag().into(),
+			"-f".into(), image.build_ctx.join("Containerfile").into(),
+		]);
+		args.push(image.build_ctx.clone().into());
+		let build_cmd = cmd("podman", args);
 
 		// Drive a count bar from podman's `STEP N/M:` lines. Total starts unknown
 		// because we only learn it from the first matched line. If podman ever
@@ -173,8 +194,11 @@ impl Builder for LocalBuilder {
 		// shadow, and the whole inner command. The longer `db.sql` mount destination
 		// makes podman layer the shadow on top of the `:O` store mount.
 		let out = sh_quote(&format!("./{}", output.display()));
+		// This builder's configured `podman_opts` (e.g. `--network=host`), re-quoted
+		// and spliced in right after `run`.
+		let run_opts = crate::podman::opts_shell(&self.podman_opts);
 		let build_cmd = format!(
-			"podman run --rm --privileged --pull=missing \
+			"podman run{run_opts} --rm --privileged --pull=missing \
 			 --security-opt label=type:unconfined_t \
 			 --entrypoint /bin/sh \
 			 -v {out}:/output \
@@ -294,6 +318,8 @@ fn build_lock_layer(
 		),
 	)?;
 
+	// COPY-only and internal (no RUN step, no network), so it carries no
+	// user `podman_opts` — those target the user-facing build/image commands.
 	#[rustfmt::skip]
 	let build = cmd!(
 		"podman", "build",
