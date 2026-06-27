@@ -1,0 +1,55 @@
+name: Verify
+
+# Reusable verify job: format, lint, doc, and test via `just ci` on a single
+# Linux host (bootcher is Linux-only — Podman is native Linux — so there's no
+# cross-OS matrix). Called by ci.yml (on push/PR to main) and as the gate in
+# release.yml (before anything is built or published). Living here as a single
+# workflow_call workflow keeps the two callers from drifting: both the `just ci`
+# recipe *and* the surrounding scaffolding (checkout/cache/fetch) exist once.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          # Cache the registry index/cache and git db (not the regenerable
+          # extracted ~/.cargo/registry/src), plus the build artifacts. The
+          # .crates.toml/.crates2.json ledger lives at the root of ~/.cargo
+          # (not under bin/); without it `cargo install` can't tell a tool is
+          # already present and rebuilds it even on a cache hit.
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          # Exact match only: a partial restore could warm-start from artifacts
+          # built with a different toolchain/deps and flake the build. Bust the
+          # cache when the lockfile or the pinned toolchain changes.
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+      # Fetch with --locked (needs network, verifies the lockfile is current),
+      # then build/test with --frozen so the rest of the run is offline and
+      # can't mutate Cargo.lock or pull anything unexpected.
+      # Install the `just` task runner so CI runs the exact same recipe a
+      # developer runs locally (`just ci`), keeping the two from drifting; lands
+      # in the cached ~/.cargo/bin/.
+      - name: Install just
+        run: cargo install just --locked
+      - name: Fetch dependencies
+        run: cargo fetch --locked
+      # cargo_flags=--frozen keeps the run offline and pins Cargo.lock; locally
+      # the recipe defaults to no extra flags.
+      - name: Verify (just ci)
+        run: just cargo_flags=--frozen ci

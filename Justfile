@@ -44,7 +44,7 @@ test:
 
 # Cut a release: bump the workspace version (patch|minor|major, or an explicit
 # X.Y.Z), commit, tag vX.Y.Z, and push — which triggers the release/image jobs
-# in .github/workflows/ci-cd.yml (they're gated on `refs/tags/v*`). The version
+# in .github/workflows/release.yml (they're gated on `refs/tags/v*`). The version
 # bump itself is done by the dev-only `housekeeper` binary so we don't depend on
 # cargo-edit/cargo-release; everything else is plain git. Must be on a clean
 # `main`. Examples:

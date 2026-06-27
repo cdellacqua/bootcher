@@ -1,8 +1,10 @@
 name: Release
 
-# Tags only. A v* tag points at a commit that already passed CI (ci.yml) when it
-# landed on main, so this workflow only packages and publishes — it does not
-# re-run verify/audit. Tag commits that are green on main.
+# Tags only. The version-bump commit and its v* tag are pushed together by
+# `just release`, so the tagged commit is brand-new and was never verified on
+# main first (ci.yml even skips bump commits). The `verify` gate below therefore
+# runs the full `just ci` suite on the exact tagged commit, and every build/
+# publish job `needs` it — so nothing ships if the tagged commit is red.
 on:
   push:
     tags: ["v*"]
@@ -15,9 +17,17 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Publish gate: same job ci.yml runs, shared via verify.yml so the two can't
+  # drift. release/image both `needs` it, so a failing tagged commit is never
+  # packaged or pushed.
+  verify:
+    uses: ./.github/workflows/verify.yml
+
+
   # Build release binaries for the two arches bootcher targets, on native
   # runners (no cross-compilation needed).
   release:
+    needs: verify
     permissions:
       contents: write
     strategy:
@@ -49,6 +59,7 @@ jobs:
   # into one multi-arch manifest by the merge job below. Uses podman (preinstalled
   # on the runners), so no extra third-party actions to pin.
   image:
+    needs: verify
     permissions:
       contents: read
       packages: write

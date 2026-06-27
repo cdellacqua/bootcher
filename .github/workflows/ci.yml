@@ -14,52 +14,27 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Format, lint, and test on a single Linux host. bootcher is Linux-only
-  # (Podman is native Linux), so there's no cross-OS matrix to verify.
+  # Format, lint, doc, and test. The actual job lives in the reusable verify.yml
+  # so this and release.yml's gate can't drift; here we just call it.
   #
-  # This workflow deliberately does not trigger on tags: a release tag points at
-  # a commit that already landed on main and was verified by this workflow on the
-  # main push, so the release workflow (release.yml) only packages/publishes and
-  # never re-runs verify/audit. That keeps a release down to one CI run plus one
-  # release run, with no redundant or skipped pipelines.
+  # This workflow deliberately does not trigger on tags; release.yml handles the
+  # `v*` tag, and it gates publishing on its own call to verify.yml.
+  #
+  # `just release` pushes the version-bump commit to main and the tag in the same
+  # `git push`, so the main push would otherwise run a full verify/audit on a
+  # commit that only edits version strings in Cargo.toml/Cargo.lock — redundant
+  # work that always passes, racing the release run. We skip it: the `if` below
+  # short-circuits CI for those bump commits (matched by their "release v…"
+  # message). The tagged commit is still verified — release.yml runs verify.yml
+  # as its publish gate — so skipping here costs no safety. `[skip ci]` can't do
+  # this: it'd skip the tag's release run too, since the tag points at the same
+  # commit. audit `needs` verify, so it skips along with it; pages is disabled.
+  #
+  # The guard only matches push events (head_commit is null on pull_request), so
+  # PRs and manual dispatches always run the full suite.
   verify:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          # Cache the registry index/cache and git db (not the regenerable
-          # extracted ~/.cargo/registry/src), plus the build artifacts. The
-          # .crates.toml/.crates2.json ledger lives at the root of ~/.cargo
-          # (not under bin/); without it `cargo install` can't tell a tool is
-          # already present and rebuilds it even on a cache hit.
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/.crates.toml
-            ~/.cargo/.crates2.json
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          # Exact match only: a partial restore could warm-start from artifacts
-          # built with a different toolchain/deps and flake the build. Bust the
-          # cache when the lockfile or the pinned toolchain changes.
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
-      # Fetch with --locked (needs network, verifies the lockfile is current),
-      # then build/test with --frozen so the rest of the run is offline and
-      # can't mutate Cargo.lock or pull anything unexpected.
-      # Install the `just` task runner so CI runs the exact same recipe a
-      # developer runs locally (`just ci`), keeping the two from drifting. Same
-      # `cargo install --locked` pattern as cargo-audit below; lands in the
-      # cached ~/.cargo/bin/.
-      - name: Install just
-        run: cargo install just --locked
-      - name: Fetch dependencies
-        run: cargo fetch --locked
-      # cargo_flags=--frozen keeps the run offline and pins Cargo.lock; locally
-      # the recipe defaults to no extra flags.
-      - name: Verify (just ci)
-        run: just cargo_flags=--frozen ci
+    if: github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'release v')
+    uses: ./.github/workflows/verify.yml
 
   # Build and deploy the landing page + mdBook + rustdoc site to GitHub Pages on
   # every push to main. `just docs` assembles docs/site/: the landing page at the
