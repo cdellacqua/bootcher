@@ -25,13 +25,16 @@ jobs:
 
 
   # Build release binaries for the two arches bootcher targets, on native
-  # runners (no cross-compilation needed).
+  # runners (no cross-compilation needed). These legs only build and stash the
+  # tarball as a workflow artifact — they do NOT touch the GitHub release. A
+  # single downstream job (release-publish) owns the release write, so the two
+  # matrix legs can't race to create it and no partial release is ever published.
+  # fail-fast is on: if one arch fails the other is cancelled, the job goes red,
+  # and release-publish is skipped — we'd rather ship nothing than a half release.
   release:
     needs: verify
-    permissions:
-      contents: write
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
@@ -47,24 +50,45 @@ jobs:
         run: cargo build --release --frozen -p bootcher-cli
       - name: Package
         run: tar -C target/release -czf bootcher-${{ matrix.target }}.tar.gz bootcher
-      - name: Upload to release
+      - name: Stash artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bootcher-${{ matrix.target }}
+          path: bootcher-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  # Single writer to the GitHub release. `needs: release` plus fail-fast means
+  # this only runs once BOTH arch tarballs exist, so the release object is created
+  # exactly once, with every asset in hand — no create race, no empty release.
+  release-publish:
+    needs: release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Collect artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: bootcher-*
+          path: dist
+          merge-multiple: true
+      - name: Publish release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
-          files: bootcher-${{ matrix.target }}.tar.gz
+          files: dist/*.tar.gz
 
-  # Build and publish the container image to ghcr.io. The image wraps the
-  # Linux-only binary so bootcher can run on macOS/Windows via the Podman/Docker
-  # machine VM (see Containerfile + README). Built per-arch on native runners —
-  # emulated cross-arch builds are slow and historically flaky — then stitched
-  # into one multi-arch manifest by the merge job below. Uses podman (preinstalled
-  # on the runners), so no extra third-party actions to pin.
+  # Build the per-arch container images and stash each as a workflow artifact.
+  # The image wraps the Linux-only binary so bootcher can run on macOS/Windows via
+  # the Podman/Docker machine VM (see Containerfile + README). Built per-arch on
+  # native runners — emulated cross-arch builds are slow and historically flaky.
+  # Mirroring the release legs, these write NOTHING to ghcr: the single
+  # image-manifest writer below loads both and does all registry pushes, so a
+  # partial failure leaves no dangling arch tags and nothing is public until the
+  # whole matrix is green. fail-fast for the same reason as release.
   image:
     needs: verify
-    permissions:
-      contents: read
-      packages: write
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
           - arch: amd64
@@ -78,18 +102,25 @@ jobs:
       # owner's casing, so normalize it once into the job env.
       - name: Resolve image name
         run: echo "IMAGE=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
-      - name: Log in to ghcr.io
-        run: echo '${{ secrets.GITHUB_TOKEN }}' | podman login ghcr.io -u '${{ github.actor }}' --password-stdin
-      # Native build for this runner's arch; tag with the arch suffix so the
-      # merge job can assemble the manifest list from both.
+      # Native build for this runner's arch; the arch-suffixed tag keeps the two
+      # images distinct once both are loaded side-by-side in image-manifest.
       - name: Build
         run: podman build --platform linux/${{ matrix.arch }} -f Containerfile -t "$IMAGE:${{ github.ref_name }}-${{ matrix.arch }}" .
-      - name: Push
-        run: podman push "$IMAGE:${{ github.ref_name }}-${{ matrix.arch }}"
+      - name: Stash image
+        run: podman save -o bootcher-image-${{ matrix.arch }}.tar "$IMAGE:${{ github.ref_name }}-${{ matrix.arch }}"
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bootcher-image-${{ matrix.arch }}
+          path: bootcher-image-${{ matrix.arch }}.tar
+          if-no-files-found: error
 
-  # Combine the per-arch images into multi-arch manifest lists and tag them
-  # `vX.Y.Z` and `latest`, so `podman pull ghcr.io/<owner>/bootcher` resolves to
-  # the puller's architecture.
+  # Single writer to ghcr. `needs: image` plus fail-fast means this runs only once
+  # both arch images exist. It loads them from the artifacts and assembles the
+  # multi-arch manifest lists tagged `vX.Y.Z` and `latest`, so `podman pull
+  # ghcr.io/<owner>/bootcher` resolves to the puller's architecture. The per-arch
+  # images reach ghcr only as digest-addressed members of these manifests — no
+  # standalone arch tags are ever published.
   image-manifest:
     needs: image
     runs-on: ubuntu-24.04
@@ -101,13 +132,29 @@ jobs:
         run: echo "IMAGE=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
       - name: Log in to ghcr.io
         run: echo '${{ secrets.GITHUB_TOKEN }}' | podman login ghcr.io -u '${{ github.actor }}' --password-stdin
+      - name: Collect images
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: bootcher-image-*
+          path: dist
+          merge-multiple: true
+      - name: Load images
+        run: |
+          for tar in dist/*.tar; do
+            podman load -i "$tar"
+          done
+      # Members are added with an explicit containers-storage: transport so podman
+      # uses the images just brought in by `podman load`. A bare reference would
+      # default to the docker (registry) transport and try to PULL the arch tag —
+      # which we deliberately never push — failing with "manifest unknown".
+      # `push --all` then uploads the list and its per-arch members by digest.
       - name: Create and push manifests
         run: |
           version="${{ github.ref_name }}"
           for tag in "$version" latest; do
             podman manifest create "$IMAGE:$tag"
-            podman manifest add "$IMAGE:$tag" "docker://$IMAGE:$version-amd64"
-            podman manifest add "$IMAGE:$tag" "docker://$IMAGE:$version-arm64"
+            podman manifest add "$IMAGE:$tag" "containers-storage:$IMAGE:$version-amd64"
+            podman manifest add "$IMAGE:$tag" "containers-storage:$IMAGE:$version-arm64"
             podman manifest push --all "$IMAGE:$tag" "docker://$IMAGE:$tag"
             podman manifest rm "$IMAGE:$tag"
           done
