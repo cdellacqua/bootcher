@@ -89,7 +89,9 @@ jobs:
           else
             echo "container store already on a real fs; skipping loopback store"
           fi
-          podman info --format 'podman store: {{.Store.GraphDriverName}} @ {{.Store.GraphRoot}} (rootless={{.Host.Security.Rootless}})'
+          # Breadcrumb: expect `overlay` (kernel); a regression to fuse-overlayfs
+          # means the store slipped back onto overlay-on-overlay (rpmdb bug returns).
+          podman info --format 'podman store: {{.Store.GraphDriverName}} @ {{.Store.GraphRoot}}'
       - name: Log in to GHCR
         run: echo "$GITHUB_TOKEN" | podman login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
         env:
@@ -136,7 +138,9 @@ jobs:
           else
             echo "container store already on a real fs; skipping loopback store"
           fi
-          podman info --format 'podman store: {{.Store.GraphDriverName}} @ {{.Store.GraphRoot}} (rootless={{.Host.Security.Rootless}})'
+          # Breadcrumb: expect `overlay` (kernel); a regression to fuse-overlayfs
+          # means the store slipped back onto overlay-on-overlay (rpmdb bug returns).
+          podman info --format 'podman store: {{.Store.GraphDriverName}} @ {{.Store.GraphRoot}}'
       # The image-builder disk step shells out to `sudo`, which the base image
       # doesn't ship — install it (we're root, so no password is needed).
       - name: Install sudo

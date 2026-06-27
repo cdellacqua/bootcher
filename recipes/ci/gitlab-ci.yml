@@ -99,10 +99,10 @@ default:
       else
         echo "container store already on a real fs; skipping loopback store"
       fi
-      # Confirm the driver took: expect `overlay` (kernel), NOT `fuse-overlayfs`. If
-      # it still reads fuse-overlayfs, the store's storage.conf is forcing a
-      # mount_program — clear it before the build.
-      podman info --format 'podman store: {{.Store.GraphDriverName}} @ {{.Store.GraphRoot}} (rootless={{.Host.Security.Rootless}})'
+      # Breadcrumb: log the store driver. Expect `overlay` (kernel); a regression
+      # to `fuse-overlayfs` means the store slipped back onto overlay-on-overlay
+      # and the rpmdb coherence bug is back.
+      podman info --format 'podman store: {{.Store.GraphDriverName}} @ {{.Store.GraphRoot}}'
 
 stages: [deploy, provision]
 
