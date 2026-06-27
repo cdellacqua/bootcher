@@ -21,6 +21,11 @@
 #   [deploy]
 #   registry = "ghcr.io/<owner>"        # lowercase; image is ghcr.io/<owner>/<name>
 #
+# Both jobs run with `--manifest bootcher.ci.toml` — a committed override that
+# `extend`s bootcher.toml and forces podman onto the host network, sidestepping
+# nested-podman nftables failures in the privileged CI container. Copy
+# recipes/ci/bootcher.ci.toml to your project root beside bootcher.toml.
+#
 # Repository secrets & variables (Settings → Secrets and variables → Actions):
 #   ADMIN_SSH_PUBKEY (provision) the admin SSH PUBLIC key (the `.pub` line) baked into
 #                    the disk as the `admin` login. Not secret — provision reads only
@@ -69,7 +74,7 @@ jobs:
         # can reach the fleet — devices pick the update up on their auto-update
         # timer. Drop the flag (and add the key) to roll immediately, or run
         # `bootcher deploy` from a host on the devices' network.
-        run: bootcher deploy --skip-bootc-upgrade
+        run: bootcher --manifest bootcher.ci.toml deploy --skip-bootc-upgrade
         env:
           BOOTCHER_SIGN_PASSPHRASE: ${{ secrets.SIGN_PASSPHRASE }}
 
@@ -100,7 +105,7 @@ jobs:
         # The disk bakes the admin pubkey and, in registry mode, the pull token so
         # the device can fetch updates. For a public registry, drop the PULL_* env
         # and append `--anonymous` instead.
-        run: bootcher provision --ssh-key admin_key
+        run: bootcher --manifest bootcher.ci.toml provision --ssh-key admin_key
         env:
           BOOTCHER_PULL_USER: ${{ secrets.PULL_USER }}
           BOOTCHER_PULL_TOKEN: ${{ secrets.PULL_TOKEN }}

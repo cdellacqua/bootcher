@@ -16,6 +16,7 @@ project's lifecycle:
 |---|---|---|
 | GitHub Actions | [`github-actions.yml`](github-actions.yml) | `.github/workflows/bootcher.yml` |
 | GitLab CI | [`gitlab-ci.yml`](gitlab-ci.yml) | `.gitlab-ci.yml` (repo root) |
+| Both | [`bootcher.ci.toml`](bootcher.ci.toml) | `bootcher.ci.toml` (repo root, beside `bootcher.toml`) |
 
 Both pipelines run **inside the published bootcher image**,
 [`ghcr.io/cdellacqua/bootcher`](https://ghcr.io/cdellacqua/bootcher) — multi-arch
@@ -41,6 +42,34 @@ registry = "registry.gitlab.com/<group>/<project>"
 
 CI authenticates separately with `podman login` (GHCR via `GITHUB_TOKEN`, GitLab
 via the job's `CI_REGISTRY_*`), so the URL above carries no credential.
+
+## The `bootcher.ci.toml` override
+
+Both pipelines run with `--manifest bootcher.ci.toml`, a small committed override
+that [`extend`s](../../docs/src/reference/bootcher-toml.md#extend-top-level-optional)
+your `bootcher.toml` and changes one thing: it forces podman onto the host network
+(`--network=host`) for the build steps.
+
+```toml
+extend = "bootcher.toml"
+
+[builder]
+build = { type = "local", podman_opts = ["--network=host"] }
+image = { type = "local", podman_opts = ["--network=host"] }
+```
+
+Inside a privileged CI container, rootless/nested podman's per-container networking
+(netavark + nftables) is a common source of opaque build failures. `--network=host`
+makes podman reuse the runner's network namespace instead of programming its own,
+sidestepping the nftables path entirely. It's set on **both** roles so it covers
+`deploy` (the container build) and `provision` (the container build *and* the
+image-builder disk step). Everything else — name, registry, `disk_types`, deploy
+targets, hooks — is inherited from `bootcher.toml`, so this file never drifts: edit
+your real config there, not here.
+
+Local runs (`bootcher deploy` / `provision` with no `--manifest`) are unaffected —
+they still use the plain `bootcher.toml`, where podman's default networking works
+fine.
 
 ## Secrets & variables
 
@@ -104,3 +133,8 @@ native runners.
     ephemeral VM), so both jobs work as-is — no runner setup needed. A self-managed
     runner (`privileged = true`, or a shell-executor on a podman host) is only needed
     if you want to narrow the privilege grant or route a build step to a `vm`/`/dev/kvm`.
+- **`podman build` networking errors** (netavark/nftables, "failed to set up
+  network", iptables/chain errors) inside the privileged container are handled up
+  front by [the `bootcher.ci.toml` override](#the-bootcherci-toml-override), which
+  runs the build steps with `--network=host`. If you drop that override, expect to
+  hit these on runners where nested podman can't program its own network.

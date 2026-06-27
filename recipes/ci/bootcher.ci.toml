@@ -1,0 +1,23 @@
+#:schema ./schemas/bootcher.schema.json
+# CI-only manifest override. Copy it to your project root beside `bootcher.toml`
+# and drive bootcher with the global `--manifest` flag:
+#
+#   bootcher --manifest bootcher.ci.toml deploy
+#   bootcher --manifest bootcher.ci.toml provision --ssh-key admin_key
+#
+# It `extend`s the committed `bootcher.toml` and overrides only the builder, so
+# everything else — name, registry, disk_types, deploy targets, hooks — is
+# inherited unchanged. Edit those in `bootcher.toml`, not here.
+#
+# Why it exists: inside a privileged CI container, rootless/nested podman's
+# per-container networking (netavark + nftables) is the usual source of opaque
+# build failures. Forcing `--network=host` makes podman reuse the runner's
+# network namespace instead of programming its own, sidestepping the nftables
+# path entirely. It's set on BOTH roles so it covers `deploy` (the container
+# build) and `provision` (the container build *and* the image-builder disk step).
+
+extend = "bootcher.toml"
+
+[builder]
+build = { type = "local", podman_opts = ["--network=host"] }
+image = { type = "local", podman_opts = ["--network=host"] }

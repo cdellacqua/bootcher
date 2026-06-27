@@ -23,6 +23,11 @@
 #   [deploy]
 #   registry = "registry.gitlab.com/<group>/<project>"   # == $CI_REGISTRY_IMAGE
 #
+# Both jobs run with `--manifest bootcher.ci.toml` — a committed override that
+# `extend`s bootcher.toml and forces podman onto the host network, sidestepping
+# nested-podman nftables failures in the privileged job container. Copy
+# recipes/ci/bootcher.ci.toml to your repo root beside bootcher.toml.
+#
 # CI/CD variables (Settings → CI/CD → Variables; mask them):
 #   ADMIN_SSH_PUBKEY         (provision) the admin SSH PUBLIC key (the `.pub` line),
 #                            baked into the disk as the `admin` login. Not secret — a
@@ -86,7 +91,7 @@ deploy:
     # Skipping the per-device `bootc upgrade` keeps the admin SSH key out of CI and
     # doesn't assume the runner can reach the fleet — devices pick the update up on
     # their auto-update timer. Drop the flag (and add the key) to roll immediately.
-    - bootcher deploy --skip-bootc-upgrade
+    - bootcher --manifest bootcher.ci.toml deploy --skip-bootc-upgrade
 
 # Build a disk image to flash. The image-builder disk step shells out to `sudo`,
 # which the base image doesn't ship — install it (root needs no password).
@@ -109,7 +114,7 @@ provision:
     # The disk bakes the admin pubkey and, in registry mode, the pull token
     # ($BOOTCHER_PULL_USER/$BOOTCHER_PULL_TOKEN, read from the environment). For a
     # public registry, append `--anonymous` instead.
-    - bootcher provision --ssh-key admin_key
+    - bootcher --manifest bootcher.ci.toml provision --ssh-key admin_key
   artifacts:
     paths: [output/]
     expire_in: 1 week
