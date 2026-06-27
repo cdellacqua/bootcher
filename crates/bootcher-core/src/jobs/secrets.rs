@@ -404,13 +404,18 @@ pub(crate) fn verify_pull_login(ns: &str, user: &str, token: &str) -> Result<()>
 /// needs no image pushed — it works at first-provision time.
 fn probe_registry_login(ns: &str, user: &str, token: &str) -> Result<()> {
 	let authfile = tempfile::NamedTempFile::new().context("creating a temp authfile")?;
+	// Seed it with an empty-but-valid JSON object. `podman login` reads and parses
+	// the authfile before merging the new credential in; a 0-byte file (what
+	// `NamedTempFile` leaves) fails that parse on newer podman with "unexpected end
+	// of JSON input", so the probe would error before ever touching the registry.
+	fs::write(authfile.path(), "{}").context("seeding the temp authfile")?;
 	let mut child = Command::new("podman")
 		.args(["login", "--username", user, "--password-stdin", "--authfile"])
 		.arg(authfile.path())
 		.arg(ns)
 		.stdin(Stdio::piped())
 		.stdout(Stdio::null())
-		.stderr(Stdio::null())
+		.stderr(Stdio::piped())
 		.spawn()
 		.context("running `podman login`")?;
 	// Feed the token, then close stdin (EOF) so login proceeds.
@@ -420,8 +425,17 @@ fn probe_registry_login(ns: &str, user: &str, token: &str) -> Result<()> {
 		.expect("stdin piped")
 		.write_all(token.as_bytes())
 		.context("writing the token to `podman login`")?;
-	if !child.wait().context("waiting for `podman login`")?.success() {
-		bail!("`podman login {ns}` failed");
+	let out = child.wait_with_output().context("waiting for `podman login`")?;
+	if !out.status.success() {
+		// Surface podman's own diagnostic — the caller wraps this in a softer
+		// "may simply be unreachable" warning, but without the underlying line a
+		// CI failure (where the probe fails closed) is undebuggable.
+		let detail = String::from_utf8_lossy(&out.stderr);
+		let detail = detail.trim();
+		if detail.is_empty() {
+			bail!("`podman login {ns}` failed");
+		}
+		bail!("`podman login {ns}` failed: {detail}");
 	}
 	Ok(())
 }
