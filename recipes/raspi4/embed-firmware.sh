@@ -19,7 +19,8 @@
 # (JSON). We read the disks it just built straight from there — no need to know
 # bootcher's output layout.
 #
-# Requires: jq, curl, unzip, and sudo (loopback mount of the raw image's ESP).
+# Requires: jq, curl, unzip, sfdisk, awk, and sudo (loopback mount of the raw
+# image's ESP).
 
 set -euo pipefail
 
@@ -47,20 +48,35 @@ require() {
 # Locate the single EFI System Partition on a (loop-attached) disk by GPT
 # partition type. Prints the partition devnode; bails on 0 or >1 matches — more
 # robust than assuming the ESP is partition 1.
+#
+# We read the partition type straight from the GPT with `sfdisk -d` rather than
+# `lsblk`'s PARTTYPE column: lsblk sources PARTTYPE from the udev database, which
+# is empty in a privileged CI job container (no running udevd), so every
+# partition reports a blank type and the ESP is "found 0". sfdisk parses the
+# on-disk table itself, so it works with or without udev. Its dump lines look
+# like `/dev/loop1p1 : start=…, type=C12A7328-…, uuid=…`; GPT GUIDs are emitted
+# uppercase, so we case-fold both sides before comparing.
 find_esp() {
-	local disk="$1" name parttype
-	local matches=()
-	while read -r name parttype; do
-		[ "$parttype" = "$EFI_PART_GUID" ] && matches+=("/dev/$name")
-	done < <(sudo lsblk -rno NAME,PARTTYPE "$disk")
-	if [ "${#matches[@]}" -ne 1 ]; then
-		echo "raspi4: expected exactly one EFI System Partition on $disk, found ${#matches[@]}" >&2
+	local disk="$1"
+	local matches
+	matches="$(sudo sfdisk -d "$disk" | awk -v guid="$EFI_PART_GUID" '
+		BEGIN { guid = toupper(guid) }
+		/^\/dev\// {
+			for (i = 1; i <= NF; i++) {
+				t = $i
+				sub(/,$/, "", t)
+				if (t ~ /^type=/ && toupper(substr(t, 6)) == guid)
+					print $1
+			}
+		}')"
+	if [ "$(printf '%s' "$matches" | grep -c .)" -ne 1 ]; then
+		echo "raspi4: expected exactly one EFI System Partition on $disk, found $(printf '%s' "$matches" | grep -c .)" >&2
 		return 1
 	fi
-	printf '%s\n' "${matches[0]}"
+	printf '%s\n' "$matches"
 }
 
-require jq curl unzip sudo losetup lsblk mount umount
+require jq curl unzip sudo losetup sfdisk awk mount umount
 
 # The aarch64 raw disk bootcher just built. `.file` is the resolved disk.<ext>
 # path (present at disk.post). `[general.disk_types]` maps each arch to a single
