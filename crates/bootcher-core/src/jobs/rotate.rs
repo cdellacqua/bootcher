@@ -94,7 +94,7 @@ fn deploy_remotes_or_bail(manifest: &Manifest, cmd: &str) -> Result<Vec<Ssh>> {
 ///
 /// # Panics
 ///
-/// Panics if `[general.disk_types]` is empty (validated non-empty by manifest loading).
+/// Panics if `[targets]` is empty (validated non-empty by manifest loading).
 ///
 /// # Errors
 ///

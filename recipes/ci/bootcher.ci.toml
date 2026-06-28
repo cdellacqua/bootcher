@@ -6,7 +6,7 @@
 #   bootcher --manifest bootcher.ci.toml provision --ssh-key admin_key
 #
 # It `extend`s the committed `bootcher.toml` and overrides only the builder, so
-# everything else — name, registry, disk_types, deploy targets, hooks — is
+# everything else — name, registry, [targets], deploy targets, hooks — is
 # inherited unchanged. Edit those in `bootcher.toml`, not here.
 #
 # Why it exists: inside a privileged CI container, rootless/nested podman's

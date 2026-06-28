@@ -23,8 +23,8 @@
 use crate::builder;
 use crate::context::{
 	Arch, ArchBuilder, BuilderConfig, BuilderSpec, ConcurrencyConfig, DeployConfig, DiskType,
-	DiskTypes, General, Hooks, MANIFEST, Manifest, RegistryConfig, RemoteConfig, Rootfs, SCHEMA,
-	SCHEMA_DIRECTIVE, manifest_schema_json,
+	General, Hooks, MANIFEST, Manifest, RegistryConfig, RemoteConfig, Rootfs, SCHEMA,
+	SCHEMA_DIRECTIVE, Targets, manifest_schema_json,
 };
 use crate::hooks::{METADATA_SCHEMA, metadata_schema_json};
 use anyhow::{Context, Result, bail};
@@ -42,7 +42,7 @@ static SCAFFOLD: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/scaffold");
 
 /// Commented per-arch builder note appended to the scaffolded manifest, after the
 /// live `[builder]` table. The flat `build`/`image` apply to every target arch in
-/// `[general.disk_types]`; a `[builder.<arch>]` subtable overrides either role for
+/// `[targets]`; a `[builder.<arch>]` subtable overrides either role for
 /// one arch. The questionnaire writes these when the answers differ per arch; this
 /// comment documents the syntax for any manual additions the user might want later.
 const BUILDER_OVERRIDE_EXAMPLE: &str = "\
@@ -140,10 +140,10 @@ pub fn run(name: Option<String>, yes: bool, force: bool) -> Result<()> {
 /// The manifest settings gathered per interaction mode, beyond the project name
 /// (which the destination path supplies). Mirrors the `bootcher.toml` shape.
 struct Settings {
-	/// The build matrix (`[general.disk_types]`): each target arch mapped to its
-	/// image-builder output format(s). `-y` seeds the host arch with a single qcow2;
-	/// the questionnaire picks the arches, then a format list per arch.
-	disk_types: DiskTypes,
+	/// The build matrix (`[targets]`): each target arch mapped to its image-builder
+	/// output format(s). `-y` seeds the host arch with a single qcow2; the
+	/// questionnaire picks the arches, then a format list per arch.
+	targets: Targets,
 	/// Root filesystem to format (`[general] rootfs`).
 	rootfs: Rootfs,
 	registry: Option<String>,
@@ -223,11 +223,8 @@ impl Target {
 		let manifest = Manifest {
 			// A scaffold is a standalone base, never an `extend` override.
 			extend: None,
-			general: General {
-				name: self.name.clone(),
-				rootfs: settings.rootfs,
-				disk_types: settings.disk_types.clone(),
-			},
+			general: General { name: self.name.clone(), rootfs: settings.rootfs },
+			targets: settings.targets.clone(),
 			builder: settings.builder.clone(),
 			deploy: DeployConfig {
 				registry: registry_config,
@@ -302,7 +299,7 @@ impl Target {
 		};
 		eprintln!(
 			"init: scaffolded {where_} as '{}'\n\nNext:\n{cd}{sign}  \
-			 # edit Containerfile / bootcher.toml ([general.disk_types] sets target arches + formats), then:\n  \
+			 # edit Containerfile / bootcher.toml ([targets] sets target arches + formats), then:\n  \
 			 bootcher provision   # build the disk image (prompts for your admin SSH key)\n  \
 			 # the artifacts land under output/<arch>/ (the image grows its root FS on first boot)",
 			self.name,
@@ -316,10 +313,10 @@ fn collect(yes: bool) -> Result<Settings> {
 	if yes {
 		// Defaults: host arch (so never cross-arch) building a single qcow2, ext4
 		// rootfs, LAN deploys, all-`local` builders.
-		let mut disk_types = DiskTypes::default();
-		disk_types.set(default_platform(), vec![DiskType::Qcow2]);
+		let mut targets = Targets::default();
+		targets.set(default_platform(), vec![DiskType::Qcow2]);
 		Ok(Settings {
-			disk_types,
+			targets,
 			rootfs: Rootfs::Ext4,
 			registry: None,
 			// No registry under `-y`, so signing (registry-only) is off.
@@ -353,12 +350,12 @@ fn questionnaire() -> Result<Settings> {
 		bail!("pick at least one target platform");
 	}
 
-	// Image format(s) per arch — matching the per-arch `[general.disk_types]` table.
+	// Image format(s) per arch — matching the per-arch `[targets]` table.
 	// Each arch gets its own list, so one arch can build (say) a qcow2 to test in a VM
 	// while another builds a raw for a device. Proxied straight to image-builder; offer
 	// every value the enums know, with qcow2 pre-checked.
 	let qcow2_at = DiskType::VARIANTS.iter().position(|t| *t == DiskType::Qcow2).unwrap_or(0);
-	let mut disk_types = DiskTypes::default();
+	let mut targets = Targets::default();
 	for &arch in &platform {
 		let chosen = inquire::MultiSelect::new(
 			&format!("Image format(s) for {arch}:"),
@@ -372,7 +369,7 @@ fn questionnaire() -> Result<Settings> {
 		if chosen.is_empty() {
 			bail!("pick at least one image format for {arch}");
 		}
-		disk_types.set(arch, chosen);
+		targets.set(arch, chosen);
 	}
 
 	let rootfses = Rootfs::VARIANTS.to_vec();
@@ -470,10 +467,10 @@ fn questionnaire() -> Result<Settings> {
 		}
 	};
 
-	Ok(Settings { disk_types, rootfs, registry, signing, remotes, builder: builder_config })
+	Ok(Settings { targets, rootfs, registry, signing, remotes, builder: builder_config })
 }
 
-/// The `platform` default: the host arch, or `x86_64` on an arch bootcher doesn't
+/// The default target arch: the host arch, or `x86_64` on an arch bootcher doesn't
 /// build for (a deliberate, overridable fallback).
 fn default_platform() -> Arch {
 	Arch::host().unwrap_or(Arch::X86_64)
@@ -542,9 +539,7 @@ fn annotate_values(rendered: &str) -> String {
 			// Each key in this table is a target arch; its value is the disk type(s) to
 			// build for it. Hint the accepted types on the arch keys only — not the
 			// table header or blank lines, which also stream through here.
-			"general.disk_types" => {
-				matches!(key, "x86_64" | "aarch64").then_some(disk_types.as_str())
-			}
+			"targets" => matches!(key, "x86_64" | "aarch64").then_some(disk_types.as_str()),
 			// Only the flat [builder] table — the [builder.<arch>] override tables sit
 			// right below it, so re-stating the values there would just be noise.
 			"builder" => matches!(key, "build" | "image").then_some(BUILDER_SPEC),

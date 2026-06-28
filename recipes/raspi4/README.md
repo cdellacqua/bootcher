@@ -32,7 +32,7 @@ doesn't build such a target.
 Add to your project's `bootcher.toml`:
 
 ```toml
-[general.disk_types]
+[targets]
 aarch64 = "raw"
 
 [hooks.disk]

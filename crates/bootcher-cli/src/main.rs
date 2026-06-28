@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use bootcher_core::context::{MANIFEST, Manifest, ToSsh};
+use bootcher_core::context::{Arch, DiskType, MANIFEST, Manifest, ToSsh};
 use bootcher_core::progress::Scope;
 use bootcher_core::{cache, jobs, pipelines};
 use clap::{Parser, Subcommand};
@@ -22,7 +22,7 @@ struct Cli {
 
 /// A bootcher project is one image, described by `bootcher.toml` in the working
 /// directory. Everything the image-building subcommands need — the name, the
-/// target arch(es) (`platform`, one or several for a multi-arch image), the build
+/// target arch(es) (`[targets]`, one or several for a multi-arch image), the build
 /// location, the layout — comes from the manifest; edit it to change the target.
 #[derive(Subcommand)]
 enum Cmd {
@@ -67,6 +67,18 @@ enum Cmd {
 		/// credential. No effect in LAN mode.
 		#[arg(long = "anonymous")]
 		anonymous: bool,
+		/// Restrict the build to a single target architecture from `[targets]`
+		/// (`aarch64` or `x86_64`), instead of every arch the project lists. Lets a
+		/// multi-arch project drive one provision job per arch — e.g. on a per-arch CI
+		/// runner. Must name an arch the manifest builds.
+		#[arg(long = "target")]
+		target: Option<Arch>,
+		/// Restrict the disks built for `--target` to these `image-builder` type(s)
+		/// from its `[targets]` list, instead of all of them. Repeatable (`--disk
+		/// qcow2 --disk raw`). Requires `--target`, and each must be a type that arch
+		/// lists.
+		#[arg(long = "disk", requires = "target")]
+		disk: Vec<DiskType>,
 		/// Build the disk from the already-built container, skipping the container
 		/// build — for iterating on the disk step alone, or when an earlier `build`
 		/// already produced the container. The container is taken from local storage
@@ -269,8 +281,10 @@ fn run() -> Result<()> {
 	let manifest_path = cli.manifest.as_str();
 	match cli.cmd {
 		Cmd::Init { name, yes, force } => jobs::init::run(name, yes, force),
-		Cmd::Provision { ssh_key, skip_pull_check, anonymous, skip_build } => {
-			let manifest = Manifest::load(manifest_path)?;
+		Cmd::Provision { ssh_key, skip_pull_check, anonymous, target, disk, skip_build } => {
+			// Narrow `[targets]` to the requested arch/disk(s) up front, so every phase
+			// (preflight included) sees only the subset this run builds.
+			let manifest = Manifest::load(manifest_path)?.select_targets(target, &disk)?;
 			pipelines::provision::preflight(&manifest, skip_build)?;
 			let config = jobs::secrets::Provisioning::collect(
 				&manifest,

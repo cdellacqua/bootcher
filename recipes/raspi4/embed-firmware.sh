@@ -9,7 +9,7 @@
 #
 # Wire it into bootcher.toml (see this directory's README.md):
 #
-#   [general.disk_types]
+#   [targets]
 #   aarch64 = "raw"
 #
 #   [hooks.disk]
@@ -92,7 +92,7 @@ find_esp_extent() {
 require jq curl unzip python3 sudo sfdisk mount umount
 
 # The aarch64 raw disk bootcher just built. `.file` is the resolved disk.<ext>
-# path (present at disk.post). `[general.disk_types]` maps each arch to a single
+# path (present at disk.post). `[targets]` maps each arch to a single
 # disk type, so this selects 0 or 1 target — the recipe is inert (empty `img`)
 # for a project that doesn't build such a target.
 img="$(printf '%s' "$BOOTCHER_METADATA" \

@@ -10,7 +10,7 @@ The project manifest. Its presence marks a directory as a bootcher project. All 
 #:schema ./schemas/bootcher.schema.json
 ```
 
-This is the [Taplo](https://taplo.tamasfe.dev/) `#:schema` directive, honoured by the **Even Better TOML** VS Code extension (and the Taplo CLI/LSP). With it, your editor validates keys and values, completes table/property names, completes the closed-value fields (the `[general.disk_types]` arch keys and type values, `rootfs`), and shows the field docs on hover. The relative path resolves against the manifest's own directory, so the schema needs no hosting — commit the `schemas/` directory alongside `bootcher.toml` so collaborators get the same support without installing bootcher.
+This is the [Taplo](https://taplo.tamasfe.dev/) `#:schema` directive, honoured by the **Even Better TOML** VS Code extension (and the Taplo CLI/LSP). With it, your editor validates keys and values, completes table/property names, completes the closed-value fields (the `[targets]` arch keys and type values, `rootfs`), and shows the field docs on hover. The relative path resolves against the manifest's own directory, so the schema needs no hosting — commit the `schemas/` directory alongside `bootcher.toml` so collaborators get the same support without installing bootcher.
 
 `init` also writes `schemas/metadata.schema.json` — the schema for the [`BOOTCHER_METADATA`](#bootcher_metadata) object hooks receive. It binds to nothing (it's reference docs for hook/recipe authors), but a recipe written in a typed language can validate against it.
 
@@ -24,7 +24,7 @@ Both schemas are generated from the same types bootcher uses at runtime, so they
 name = "my-os"             # image name; used as the container tag
 rootfs = "ext4"            # root filesystem (default: ext4)
 
-[general.disk_types]        # the build matrix: each target arch → disk type(s)
+[targets]                   # the build matrix: each target arch → disk type(s)
 x86_64 = "qcow2"           # one type, or a list: ["qcow2", "bootc-installer"]
 
 [builder]
@@ -95,19 +95,27 @@ The image name. Used as:
 - The per-device signing key path: `/etc/pki/containers/<name>.pub`
 - The registry reference: `<registry>/<name>:latest` (registry mode)
 
-### `[general.disk_types]`
+### `rootfs`
+
+Root filesystem format (`--bootc-default-fs`). Default: `ext4`. Also accepts `xfs` and `btrfs`.
+
+---
+
+## `[targets]`
 
 The build matrix: each target architecture mapped to the image-builder disk type(s) to build for it. The present keys *are* the architectures the project builds — there is no separate `platform` key. Each value is a bare type or an array of them, and the artifacts land under `output/<arch>/<disk_type>/disk.<ext>`.
 
 ```toml
-[general.disk_types]
+[targets]
 x86_64  = ["qcow2", "bootc-installer"]   # a VM image and an installer ISO
 aarch64 = "raw"                          # a raw image for an edge device
 ```
 
 The two axes are independent. **Architecture** is the container/registry axis: `build`, `deploy` and `upgrade` fan out over the distinct arches, and a multi-arch project (more than one key) publishes one multi-arch manifest list. **Disk type** is a per-arch artifact axis only the `disk`/`provision` step fans out over — an arch listing several types reuses its single container build to render each, and disk types never enter the manifest list (an installer ISO isn't something a device `bootc upgrade`s to).
 
-If `[general.disk_types]` is omitted, it defaults to the host architecture mapped to a single `qcow2` (falling back to `x86_64` on unrecognised hosts).
+If `[targets]` is omitted, it defaults to the host architecture mapped to a single `qcow2` (falling back to `x86_64` on unrecognised hosts).
+
+`provision` can build a subset of this matrix without editing the manifest: `--target <arch>` restricts the run to one architecture, and `--disk <type>` (repeatable, requires `--target`) further restricts it to specific disk types of that arch — e.g. one provision job per arch on a per-arch CI runner. Each must name an arch / type the manifest actually lists.
 
 Accepted type values:
 
@@ -129,10 +137,6 @@ Accepted type values:
 > `FROM fedora-bootc` image will *not* produce a working installer without those
 > additions. (It replaces the predecessor's `anaconda-iso`, which `image-builder`
 > no longer accepts for bootc inputs.)
-
-### `rootfs`
-
-Root filesystem format (`--bootc-default-fs`). Default: `ext4`. Also accepts `xfs` and `btrfs`.
 
 ---
 
@@ -322,7 +326,7 @@ Every hook is run with a single environment variable, `BOOTCHER_METADATA`, holdi
 |---|---|---|
 | `phase`, `stage` | all | branch a shared script on `"\(.phase).\(.stage)"` |
 | `image_name` | all | `[general] name` |
-| `arches` | all | the `[general.disk_types]` keys |
+| `arches` | all | the `[targets]` keys |
 | `image_ref` | all | suffix-free ref: local list ref at `build`, bootc-origin source ref at `disk`, pushed/served list ref at `upgrade` |
 | `output_dir` | disk | base output dir, relative to the project root |
 | `targets[]` | disk | the `(arch × disk_type)` build matrix; `file` is the resolved `disk.<ext>`, present only at `disk.post` (and omitted if a dir doesn't hold exactly one `disk.*` — fall back to `dir`) |

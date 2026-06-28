@@ -75,7 +75,7 @@ pub(crate) fn run(manifest: &Manifest, skip_bootc_upgrade: bool, job: &mut Scope
 	let remotes = manifest.deploy_remotes().to_ssh();
 	let hooks = manifest.hooks();
 	if images.is_empty() {
-		bail!("no target arches to deploy — set `[general.disk_types]` in bootcher.toml");
+		bail!("no target arches to deploy — set `[targets]` in bootcher.toml");
 	}
 	let remote_hosts: Vec<String> = remotes.iter().map(|s| s.host().to_owned()).collect();
 	let mut meta = HookMetadata {
@@ -310,7 +310,7 @@ fn apply_lan(
 	let Some(image) = images.iter().find(|i| i.arch == arch) else {
 		let built: Vec<_> = images.iter().map(|i| i.arch.to_string()).collect();
 		bail!(
-			"{} is {arch}, but `[general.disk_types]` only builds {} — \
+			"{} is {arch}, but `[targets]` only builds {} — \
 			 add \"{arch}\" to deploy to this device",
 			remote.host(),
 			built.join(", ")

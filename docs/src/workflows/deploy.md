@@ -65,7 +65,7 @@ against the registry associated with your repo.
 
 ## Multi-arch builds
 
-If `[general.disk_types]` lists more than one architecture, `build` fans out per-arch builds in parallel (up to `[concurrency] build` workers), then assembles them into a single multi-arch manifest list. `upgrade` does the same for the per-device SSH rollout (up to `[concurrency] upgrade` workers).
+If `[targets]` lists more than one architecture, `build` fans out per-arch builds in parallel (up to `[concurrency] build` workers), then assembles them into a single multi-arch manifest list. `upgrade` does the same for the per-device SSH rollout (up to `[concurrency] upgrade` workers).
 
 ## Signing
 

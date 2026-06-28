@@ -12,8 +12,8 @@ bootcher deploy       # build → push an update to the configured targets
 upload to your target. It grows its root filesystem to fill the disk on first
 boot.
 
-The target arch and build location live in `bootcher.toml` (`platform` and the
-`[builder]` table) — edit them to cross-build or to offload the build.
+The target arch and build location live in `bootcher.toml` (the `[targets]` and
+`[builder]` tables) — edit them to cross-build or to offload the build.
 
 ## What's here
 
@@ -23,11 +23,11 @@ The target arch and build location live in `bootcher.toml` (`platform` and the
 - `sysroot/` — files COPYed into the image (`COPY sysroot/ /`): sshd/sudoers drop-ins,
   the firewalld zone, the fail2ban jail, the `admin` userdb record, and
   `derive-userdb.sh`.
-- `bootcher.toml` — project manifest. The `[general]` table holds `name`,
-  `platform`, the disk-image `disk_type` (image-builder image type, default
-  `qcow2`) and `rootfs` (default `ext4`), and an optional `registry` (set it for
-  registry-mode deploys); the `[builder]` table sets where the container build
-  and the disk-image step run
+- `bootcher.toml` — project manifest. The `[general]` table holds `name` and
+  `rootfs` (default `ext4`); the `[targets]` table maps each target arch to its
+  disk type(s) (image-builder image type, default `qcow2`), and `[deploy]` carries
+  an optional `registry` (set it for registry-mode deploys); the `[builder]` table
+  sets where the container build and the disk-image step run
   (`local`, `vm`, or an ssh destination — `[user@]host`, or
   `ssh://[user@]host[:port]` for a non-default port). Cross-arch, `local` builds
   in-process under qemu-user emulation (slower than native); a native-arch

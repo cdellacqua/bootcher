@@ -79,13 +79,13 @@ pub const DEVICE_REGISTRIES_D: &str = "/etc/containers/registries.d";
 /// signatures against (the `keyPath`/`keyPaths` in [`DEVICE_POLICY_JSON`]).
 pub const DEVICE_COSIGN_PUBKEY_DIR: &str = "/etc/pki/containers";
 
-/// Target CPU architecture. Read from the `[general.disk_types]` keys (defaulted
+/// Target CPU architecture. Read from the `[targets]` keys (defaulted
 /// to the host), and used to derive the podman `--platform` flag, the
 /// `image-builder` `--arch`, and the per-arch tag/output suffix.
 ///
 /// Variants use the **uname-style** spellings (`aarch64` / `x86_64`) — the
-/// lowercase rename feeds both `strum` (`Display`) and `serde` (manifest
-/// `platform`). Both podman (`--platform linux/<arch>`, which it normalises) and
+/// lowercase rename feeds both `strum` (`Display`) and `serde` (the manifest
+/// `[targets]` keys). Both podman (`--platform linux/<arch>`, which it normalises) and
 /// `image-builder` (`--arch`) accept these verbatim, so a single spelling flows
 /// everywhere — manifest, container tags, output dirs, and both tools' flags —
 /// with no per-tool translation.
@@ -96,6 +96,7 @@ pub const DEVICE_COSIGN_PUBKEY_DIR: &str = "/etc/pki/containers";
 	PartialEq,
 	Eq,
 	strum::Display,
+	strum::EnumString,
 	strum::VariantArray,
 	serde::Deserialize,
 	serde::Serialize,
@@ -160,7 +161,7 @@ impl Arch {
 }
 
 /// `image-builder` output format, passed verbatim as the positional image type.
-/// Read from `[general.disk_types]` (each arch maps to one or more; defaulted to
+/// Read from `[targets]` (each arch maps to one or more; defaulted to
 /// `qcow2`, a ready-to-boot VM disk), it's a near-pure proxy: bootcher doesn't
 /// interpret the artifact, so every disk type `image-builder` accepts for a bootc
 /// input is offered here — pick whatever suits the target (`qcow2` for VMs, `raw`
@@ -178,6 +179,7 @@ impl Arch {
 	PartialEq,
 	Eq,
 	strum::Display,
+	strum::EnumString,
 	strum::VariantArray,
 	serde::Deserialize,
 	serde::Serialize,
@@ -249,6 +251,12 @@ pub struct Manifest {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub extend: Option<String>,
 	pub general: General,
+	/// The build matrix (`[targets]`): each target arch mapped to the
+	/// `image-builder` disk type(s) to render it as. See [`Targets`]. The present
+	/// fields are the arches the project builds; defaults to the host arch as a
+	/// single `qcow2` when the table is absent.
+	#[serde(default = "default_targets")]
+	pub targets: Targets,
 	/// Where the build and image steps run; see [`BuilderConfig`]. Defaults to
 	/// all-`local` when the table is absent.
 	#[serde(default)]
@@ -310,9 +318,9 @@ impl SigningConfig {
 	}
 }
 
-/// Schema-only mirror of a [`DiskTypes`] entry's accepted shapes: a bare
+/// Schema-only mirror of a [`Targets`] entry's accepted shapes: a bare
 /// `image-builder` type *or* an array of them. The runtime parse goes through
-/// [`de_opt_disk_types`], whose `deserialize_with` schemars can't introspect, so
+/// [`de_target_disks`], whose `deserialize_with` schemars can't introspect, so
 /// this names both shapes for the generated JSON Schema (each arch field points at
 /// it via `#[schemars(with)]`). Never constructed — it exists purely for its
 /// derived [`schemars::JsonSchema`].
@@ -337,15 +345,9 @@ pub struct General {
 	/// `--bootc-default-fs`). Defaults to `ext4`. See [`Rootfs`].
 	#[serde(default = "default_rootfs")]
 	pub rootfs: Rootfs,
-	/// The build matrix: each target arch mapped to the `image-builder` disk
-	/// type(s) to render it as. See [`DiskTypes`]. Serialized last because it's a
-	/// sub-table (`[general.disk_types]`) and TOML requires a table's scalar keys
-	/// (`name`, `rootfs`) to precede it.
-	#[serde(default = "default_disk_types")]
-	pub disk_types: DiskTypes,
 }
 
-/// `[general.disk_types]` — the project's build matrix. Each target arch is mapped
+/// `[targets]` — the project's build matrix. Each target arch is mapped
 /// to the `image-builder` disk type(s) to render it as; the present (`Some`)
 /// fields *are* the arches the project builds. The two axes are independent: arch
 /// is the **container/registry** axis the `build`, `deploy` and `upgrade` fan-outs
@@ -355,12 +357,12 @@ pub struct General {
 /// render each. A field is a bare type (`x86_64 = "qcow2"`) or an array
 /// (`x86_64 = ["qcow2", "bootc-installer"]`).
 #[derive(Clone, Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
-pub struct DiskTypes {
+pub struct Targets {
 	/// Disk types to build for an `x86_64` target; absent ⇒ not an `x86_64` project.
 	#[serde(
 		default,
 		skip_serializing_if = "Option::is_none",
-		deserialize_with = "de_opt_disk_types"
+		deserialize_with = "de_target_disks"
 	)]
 	#[schemars(with = "Option<DiskTypeList>")]
 	pub x86_64: Option<Vec<DiskType>>,
@@ -368,15 +370,15 @@ pub struct DiskTypes {
 	#[serde(
 		default,
 		skip_serializing_if = "Option::is_none",
-		deserialize_with = "de_opt_disk_types"
+		deserialize_with = "de_target_disks"
 	)]
 	#[schemars(with = "Option<DiskTypeList>")]
 	pub aarch64: Option<Vec<DiskType>>,
 }
 
-impl DiskTypes {
+impl Targets {
 	/// The target arches (the present fields), `x86_64` before `aarch64`. Empty only
-	/// for an explicitly-empty `[general.disk_types]` table, which [`Manifest::load`]
+	/// for an explicitly-empty `[targets]` table, which [`Manifest::load`]
 	/// rejects.
 	#[must_use]
 	pub fn arches(&self) -> Vec<Arch> {
@@ -526,7 +528,7 @@ impl BuilderSpec {
 ///
 /// Both keys are *optional in the file* — a missing key (or a missing
 /// `[builder]` table) is filled with the safe `local` default during
-/// deserialization, exactly like `[general.disk_types]`, so the in-memory value is
+/// deserialization, exactly like `[targets]`, so the in-memory value is
 /// always a concrete spec. `bootcher init` writes both keys regardless, purely
 /// so the scaffolded manifest documents what's configurable.
 ///
@@ -1029,11 +1031,11 @@ impl Manifest {
 		} else {
 			toml::from_str(&raw).with_context(|| format!("parsing {display}"))?
 		};
-		// A present-but-empty `[general.disk_types]` table leaves nothing to build —
-		// the per-entry deserializer can't catch it (it never sees an arch), so reject
-		// it here where the whole table is in hand.
-		if manifest.general.disk_types.is_empty() {
-			bail!("`[general.disk_types]` must list at least one architecture to build");
+		// A present-but-empty `[targets]` table leaves nothing to build — the per-entry
+		// deserializer can't catch it (it never sees an arch), so reject it here where
+		// the whole table is in hand.
+		if manifest.targets.is_empty() {
+			bail!("`[targets]` must list at least one architecture to build");
 		}
 		Ok(manifest)
 	}
@@ -1053,11 +1055,11 @@ impl Manifest {
 	}
 
 	/// The `image-builder` disk types to build for `arch` (`&[]` if `arch` isn't a
-	/// target), from `[general.disk_types]`. The `disk` step renders one artifact per
-	/// entry from this arch's single container build.
+	/// target), from `[targets]`. The `disk` step renders one artifact per entry from
+	/// this arch's single container build.
 	#[must_use]
 	pub fn disk_types_for(&self, arch: Arch) -> &[DiskType] {
-		self.general.disk_types.types(arch)
+		self.targets.types(arch)
 	}
 
 	/// The registry namespace URL, if configured. `None` selects the LAN backend.
@@ -1101,13 +1103,68 @@ impl Manifest {
 		self.registry().map(|ns| format!("{ns}/{}:{version}", self.general.name))
 	}
 
-	/// One [`ImageRef`] per target arch in `[general.disk_types]`. The
-	/// container/registry fan-out the `build`, `deploy` and `upgrade` subcommands
-	/// iterate (disk types don't factor in here — see [`Self::disk_types_for`]); a
-	/// single-arch project yields a one-element vec.
+	/// One [`ImageRef`] per target arch in `[targets]`. The container/registry
+	/// fan-out the `build`, `deploy` and `upgrade` subcommands iterate (disk types
+	/// don't factor in here — see [`Self::disk_types_for`]); a single-arch project
+	/// yields a one-element vec.
 	#[must_use]
 	pub fn images(&self) -> Vec<ImageRef> {
-		self.general.disk_types.arches().into_iter().map(|arch| self.image(arch)).collect()
+		self.targets.arches().into_iter().map(|arch| self.image(arch)).collect()
+	}
+
+	/// Narrow `[targets]` to the arch and/or disk types named by `provision
+	/// --target`/`--disk`, returning a clone restricted to that subset (the original
+	/// is untouched). `target` `None` (no `--target`) keeps every arch and every type
+	/// — the full matrix; a `target` keeps only that arch, and a non-empty `disks`
+	/// further keeps only those of its types (in manifest order). The container is
+	/// still one build per surviving arch; `--disk` only trims the disk-artifact
+	/// fan-out.
+	///
+	/// # Errors
+	///
+	/// Returns an error if `disks` is given without a `target`, if `target` isn't one
+	/// of the project's arches, or if a requested disk type isn't built for it — each
+	/// naming the valid choices.
+	pub fn select_targets(&self, target: Option<Arch>, disks: &[DiskType]) -> Result<Self> {
+		if !disks.is_empty() && target.is_none() {
+			bail!(
+				"`--disk` needs `--target`: name the architecture whose disk(s) to build, \
+				 e.g. `--target {} --disk {}`",
+				self.targets
+					.arches()
+					.first()
+					.map_or_else(|| "aarch64".to_string(), Arch::to_string),
+				disks[0],
+			);
+		}
+		let Some(arch) = target else {
+			return Ok(self.clone());
+		};
+		let available = self.targets.types(arch);
+		if available.is_empty() {
+			bail!(
+				"`--target {arch}` isn't a target of this project; `[targets]` builds: {}",
+				join_display(self.targets.arches()),
+			);
+		}
+		let chosen: Vec<DiskType> = if disks.is_empty() {
+			available.to_vec()
+		} else {
+			for d in disks {
+				if !available.contains(d) {
+					bail!(
+						"`--disk {d}` isn't built for {arch}; `[targets] {arch}` lists: {}",
+						join_display(available.iter().copied()),
+					);
+				}
+			}
+			// Keep manifest order (and drop a type repeated on the command line).
+			available.iter().copied().filter(|d| disks.contains(d)).collect()
+		};
+		let mut narrowed = self.clone();
+		narrowed.targets = Targets::default();
+		narrowed.targets.set(arch, chosen);
+		Ok(narrowed)
 	}
 
 	/// Builder spec for `arch`'s container build / `deploy` / `upgrade` (its
@@ -1156,11 +1213,11 @@ impl Manifest {
 	}
 }
 
-/// The `platform` default when the manifest omits it: a single-element list with
+/// The `[targets]` default when the manifest omits the table: a single entry for
 /// the host arch (or `x86_64` on an arch bootcher doesn't build for — a deliberate,
-/// overridable fallback).
-fn default_disk_types() -> DiskTypes {
-	let mut dt = DiskTypes::default();
+/// overridable fallback) mapped to a lone `qcow2`.
+fn default_targets() -> Targets {
+	let mut dt = Targets::default();
 	// A ready-to-boot qcow2 for the host arch — the most broadly useful default
 	// artifact (runs as-is under qemu/libvirt and most clouds). Edit the table for a
 	// cross-arch target, more arches, or more types per arch.
@@ -1171,11 +1228,11 @@ fn default_disk_types() -> DiskTypes {
 	dt
 }
 
-/// Deserialize one `[general.disk_types]` entry from either a bare type or an
-/// array of them, yielding `Some(Vec<DiskType>)`. An empty array is rejected
-/// (nothing to build for that arch), and duplicates are dropped keeping
-/// first-listed order so a type is never built twice.
-fn de_opt_disk_types<'de, D>(d: D) -> Result<Option<Vec<DiskType>>, D::Error>
+/// Deserialize one `[targets]` entry from either a bare type or an array of them,
+/// yielding `Some(Vec<DiskType>)`. An empty array is rejected (nothing to build for
+/// that arch), and duplicates are dropped keeping first-listed order so a type is
+/// never built twice.
+fn de_target_disks<'de, D>(d: D) -> Result<Option<Vec<DiskType>>, D::Error>
 where
 	D: serde::Deserializer<'de>,
 {
@@ -1191,7 +1248,7 @@ where
 		OneOrMany::Many(v) => v,
 	};
 	if types.is_empty() {
-		return Err(D::Error::custom("a `disk_types` entry must list at least one type"));
+		return Err(D::Error::custom("a `[targets]` entry must list at least one type"));
 	}
 	let mut seen = Vec::new();
 	types.retain(|t| {
@@ -1208,6 +1265,12 @@ where
 /// compatible rootfs `image-builder` supports.
 fn default_rootfs() -> Rootfs {
 	Rootfs::Ext4
+}
+
+/// Comma-join a sequence of `Display` values — for the "valid choices were …"
+/// tail of a [`Manifest::select_targets`] error.
+fn join_display<T: std::fmt::Display>(items: impl IntoIterator<Item = T>) -> String {
+	items.into_iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")
 }
 
 /// The `[builder]` default for either role when the manifest omits it: in-process
@@ -1309,7 +1372,7 @@ mod tests {
 
 	#[test]
 	fn absent_disk_types_and_rootfs_default_to_host_qcow2_ext4() {
-		// Omitting `[general.disk_types]` builds a qcow2 for the host arch, and `rootfs`
+		// Omitting `[targets]` builds a qcow2 for the host arch, and `rootfs`
 		// defaults to ext4 — the general-purpose defaults.
 		let m = parse("[general]\nname = \"x\"\n");
 		let host = Arch::host().unwrap_or(Arch::X86_64);
@@ -1322,7 +1385,7 @@ mod tests {
 	fn absent_concurrency_table_is_all_unbounded() {
 		// No `[concurrency]` → every activity unset (None = unbounded), and the empty
 		// table is skipped on re-serialization so it never leaks into the manifest.
-		let m = parse("[general]\nname = \"x\"\nplatform = \"x86_64\"\n");
+		let m = parse("[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n");
 		let c = m.concurrency();
 		assert!(c.build.is_none() && c.disk.is_none() && c.upgrade.is_none() && c.rotate.is_none());
 		assert!(c.is_empty());
@@ -1332,7 +1395,7 @@ mod tests {
 	#[test]
 	fn concurrency_caps_parse_per_activity() {
 		let m = parse(
-			"[general]\nname = \"x\"\nplatform = \"x86_64\"\n\
+			"[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n\
 			 [concurrency]\nbuild = 2\ndisk = 1\n",
 		);
 		let c = m.concurrency();
@@ -1347,7 +1410,7 @@ mod tests {
 		// A `0` worker cap is nonsensical; `NonZeroUsize` rejects it at parse time
 		// rather than silently meaning "serial" or "unbounded".
 		let err = toml::from_str::<Manifest>(
-			"[general]\nname = \"x\"\nplatform = \"x86_64\"\n[concurrency]\nbuild = 0\n",
+			"[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n[concurrency]\nbuild = 0\n",
 		)
 		.unwrap_err();
 		assert!(err.to_string().contains("nonzero"), "unexpected error: {err}");
@@ -1357,7 +1420,7 @@ mod tests {
 	fn disk_types_and_rootfs_parse_from_the_manifest() {
 		let m = parse(
 			"[general]\nname = \"x\"\nrootfs = \"btrfs\"\n\
-			 [general.disk_types]\nx86_64 = \"qcow2\"\n",
+			 [targets]\nx86_64 = \"qcow2\"\n",
 		);
 		assert_eq!(m.disk_types_for(Arch::X86_64), [DiskType::Qcow2]);
 		assert_eq!(m.general.rootfs, Rootfs::Btrfs);
@@ -1367,8 +1430,41 @@ mod tests {
 	}
 
 	#[test]
+	fn select_targets_narrows_arch_and_disk_types() {
+		let m = parse(
+			"[general]\nname = \"x\"\n\
+			 [targets]\nx86_64 = [\"qcow2\", \"raw\"]\naarch64 = \"qcow2\"\n",
+		);
+		// No `--target` keeps the whole matrix.
+		let all = m.select_targets(None, &[]).unwrap();
+		assert_eq!(
+			all.images().iter().map(|i| i.arch).collect::<Vec<_>>(),
+			[Arch::X86_64, Arch::Aarch64]
+		);
+		// `--target x86_64` drops aarch64, keeps x86_64's full type list.
+		let one = m.select_targets(Some(Arch::X86_64), &[]).unwrap();
+		assert_eq!(one.images().iter().map(|i| i.arch).collect::<Vec<_>>(), [Arch::X86_64]);
+		assert_eq!(one.disk_types_for(Arch::X86_64), [DiskType::Qcow2, DiskType::Raw]);
+		assert!(one.disk_types_for(Arch::Aarch64).is_empty());
+		// `--target x86_64 --disk raw` narrows to that one type (manifest order kept).
+		let raw = m.select_targets(Some(Arch::X86_64), &[DiskType::Raw]).unwrap();
+		assert_eq!(raw.disk_types_for(Arch::X86_64), [DiskType::Raw]);
+	}
+
+	#[test]
+	fn select_targets_rejects_bad_requests() {
+		let m = parse("[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n");
+		// `--disk` without `--target`.
+		assert!(m.select_targets(None, &[DiskType::Qcow2]).is_err());
+		// An arch the project doesn't build.
+		assert!(m.select_targets(Some(Arch::Aarch64), &[]).is_err());
+		// A disk type not listed for the requested arch.
+		assert!(m.select_targets(Some(Arch::X86_64), &[DiskType::Raw]).is_err());
+	}
+
+	#[test]
 	fn absent_builder_table_is_all_local() {
-		let m = parse("[general]\nname = \"x\"\nplatform = \"x86_64\"\n");
+		let m = parse("[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n");
 		assert_eq!(m.build_builder(Arch::X86_64).spec(), "local");
 		assert_eq!(m.image_builder(Arch::X86_64).spec(), "local");
 	}
@@ -1376,7 +1472,7 @@ mod tests {
 	#[test]
 	fn split_roles_are_independent() {
 		let m = parse(
-			"[general]\nname = \"x\"\nplatform = \"x86_64\"\n\
+			"[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n\
 			 [builder]\nbuild = \"local\"\nimage = \"vm\"\n",
 		);
 		assert_eq!(m.build_builder(Arch::X86_64).spec(), "local");
@@ -1387,8 +1483,9 @@ mod tests {
 	fn partial_builder_table_fills_the_other_with_local() {
 		// Keys are optional in the file: a missing one defaults to `local` at the
 		// accessor rather than failing to parse.
-		let m =
-			parse("[general]\nname = \"x\"\nplatform = \"x86_64\"\n[builder]\nbuild = \"vm\"\n");
+		let m = parse(
+			"[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n[builder]\nbuild = \"vm\"\n",
+		);
 		assert_eq!(m.build_builder(Arch::X86_64).spec(), "vm");
 		assert_eq!(m.image_builder(Arch::X86_64).spec(), "local");
 	}
@@ -1396,18 +1493,16 @@ mod tests {
 	#[test]
 	fn disk_types_entry_parses_scalar_or_array_and_dedups() {
 		// A bare type is shorthand for a single-element list…
-		let m = parse("[general]\nname = \"x\"\n[general.disk_types]\nx86_64 = \"qcow2\"\n");
+		let m = parse("[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n");
 		assert_eq!(m.disk_types_for(Arch::X86_64), [DiskType::Qcow2]);
 		// …and an array yields each listed type, in order, with duplicates dropped.
-		let m = parse(
-			"[general]\nname = \"x\"\n[general.disk_types]\nx86_64 = [\"raw\", \"qcow2\", \"raw\"]\n",
-		);
+		let m =
+			parse("[general]\nname = \"x\"\n[targets]\nx86_64 = [\"raw\", \"qcow2\", \"raw\"]\n");
 		assert_eq!(m.disk_types_for(Arch::X86_64), [DiskType::Raw, DiskType::Qcow2]);
 		// The present arch fields drive `images()`, x86_64 before aarch64 regardless of
 		// the order they're written.
-		let m = parse(
-			"[general]\nname = \"x\"\n[general.disk_types]\naarch64 = \"raw\"\nx86_64 = \"qcow2\"\n",
-		);
+		let m =
+			parse("[general]\nname = \"x\"\n[targets]\naarch64 = \"raw\"\nx86_64 = \"qcow2\"\n");
 		assert_eq!(
 			m.images().iter().map(|i| i.arch).collect::<Vec<_>>(),
 			[Arch::X86_64, Arch::Aarch64]
@@ -1419,10 +1514,8 @@ mod tests {
 		// An empty type list for an arch — nothing to build for it — is a manifest
 		// error, not a silent no-op. (An arch-less table is rejected by `Manifest::load`.)
 		assert!(
-			toml::from_str::<Manifest>(
-				"[general]\nname = \"x\"\n[general.disk_types]\nx86_64 = []\n"
-			)
-			.is_err()
+			toml::from_str::<Manifest>("[general]\nname = \"x\"\n[targets]\nx86_64 = []\n")
+				.is_err()
 		);
 	}
 
@@ -1431,7 +1524,7 @@ mod tests {
 		// `[builder.aarch64]` overrides only the aarch64 image role; everything else —
 		// aarch64 build, and both x86_64 roles — inherits the flat default.
 		let m = parse(
-			"[general]\nname = \"x\"\nplatform = [\"x86_64\", \"aarch64\"]\n\
+			"[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\naarch64 = \"qcow2\"\n\
 			 [builder]\nbuild = \"local\"\nimage = \"local\"\n\
 			 [builder.aarch64]\nimage = \"vm\"\n",
 		);
@@ -1445,7 +1538,7 @@ mod tests {
 	fn builder_spec_with_ssh_opts_parses_and_threads_opts() {
 		// Explicit `type = "remote"` table: host and ssh_opts reach the resolved spec.
 		let m = parse(
-			"[general]\nname = \"x\"\nplatform = \"x86_64\"\n\
+			"[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n\
 			 [builder]\nbuild = { type = \"remote\", host = \"user@build-host\", ssh_opts = [\"-i\", \"/key\"] }\n",
 		);
 		let spec = m.build_builder(Arch::X86_64);
@@ -1456,7 +1549,7 @@ mod tests {
 	#[test]
 	fn builder_spec_bare_string_has_empty_ssh_opts() {
 		let m = parse(
-			"[general]\nname = \"x\"\nplatform = \"x86_64\"\n\
+			"[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n\
 			 [builder]\nbuild = \"user@build-host\"\n",
 		);
 		let spec = m.build_builder(Arch::X86_64);
@@ -1470,7 +1563,7 @@ mod tests {
 		// Explicit `type = "local"` resolves to the in-process builder yet still
 		// carries its podman_opts — the cross-arch-local case.
 		let m = parse(
-			"[general]\nname = \"x\"\nplatform = \"x86_64\"\n\
+			"[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n\
 			 [builder]\nbuild = { type = \"local\", podman_opts = [\"--network=host\"] }\n",
 		);
 		let spec = m.build_builder(Arch::X86_64);
@@ -1484,7 +1577,7 @@ mod tests {
 	fn builder_spec_remote_table_threads_podman_opts() {
 		// `type = "remote"` host + podman_opts coexist and both reach the resolved spec.
 		let m = parse(
-			"[general]\nname = \"x\"\nplatform = \"x86_64\"\n\
+			"[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n\
 			 [builder]\nimage = { type = \"remote\", host = \"user@h\", podman_opts = [\"--network=host\"] }\n",
 		);
 		let spec = m.image_builder(Arch::X86_64);
@@ -1497,7 +1590,7 @@ mod tests {
 		// The member tag is per-arch (coexistence), but the list tag and registry
 		// ref the device sees carry no arch suffix.
 		let m = parse(
-			"[general]\nname = \"kiosk\"\nplatform = \"aarch64\"\n\
+			"[general]\nname = \"kiosk\"\n[targets]\naarch64 = \"qcow2\"\n\
 			 [deploy]\nregistry = \"reg.example.com/org\"\n",
 		);
 		let img = m.image(Arch::Aarch64);
@@ -1514,7 +1607,7 @@ mod tests {
 
 	#[test]
 	fn registry_version_ref_is_none_without_registry() {
-		let m = parse("[general]\nname = \"x\"\nplatform = \"x86_64\"\n");
+		let m = parse("[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n");
 		assert!(m.registry_list_ref().is_none());
 		assert!(m.registry_version_ref("20260113.12.33").is_none());
 	}
@@ -1533,14 +1626,14 @@ mod tests {
 
 	#[test]
 	fn absent_deploy_table_has_no_remotes() {
-		let m = parse("[general]\nname = \"x\"\nplatform = \"x86_64\"\n");
+		let m = parse("[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n");
 		assert!(m.deploy_remotes().is_empty());
 	}
 
 	#[test]
 	fn deploy_remotes_parse_in_order() {
 		let m = parse(
-			"[general]\nname = \"x\"\nplatform = \"x86_64\"\n\
+			"[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n\
 			 [deploy]\nremotes = [\"a@h1\", \"b@h2:2222\"]\n",
 		);
 		assert_eq!(
@@ -1554,7 +1647,7 @@ mod tests {
 		// A bare string and an object with per-remote `ssh_opts` may be mixed in one
 		// array (the untagged `RemoteConfig`).
 		let m = parse(
-			"[general]\nname = \"x\"\nplatform = \"x86_64\"\n\
+			"[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n\
 			 [deploy]\nremotes = [\
 			 \"plain@h1\", \
 			 { remote = \"ssh://o@h2:2222\", ssh_opts = [\"-o\", \"UserKnownHostsFile=/dev/null\"] }]\n",
@@ -1582,7 +1675,7 @@ mod tests {
 
 	#[test]
 	fn absent_hooks_table_is_empty() {
-		let m = parse("[general]\nname = \"x\"\nplatform = \"x86_64\"\n");
+		let m = parse("[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n");
 		assert!(m.hooks().is_empty());
 		assert!(m.hooks().build.is_empty() && m.hooks().upgrade.is_empty());
 	}
@@ -1592,7 +1685,7 @@ mod tests {
 		// Only the keys present are set; the rest stay `None`, and an untouched phase
 		// stays empty (a partial section is fine, like `[builder]`).
 		let m = parse(
-			"[general]\nname = \"x\"\nplatform = \"x86_64\"\n\
+			"[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n\
 			 [hooks.build]\npre = \"a.sh\"\n\
 			 [hooks.disk]\npost = \"b.sh\"\n",
 		);
@@ -1608,7 +1701,7 @@ mod tests {
 	fn empty_hooks_are_omitted_from_a_serialized_manifest() {
 		// A hookless project round-trips with no `[hooks]` table at all, so
 		// `bootcher init` can document the section as comments instead.
-		let m = parse("[general]\nname = \"x\"\nplatform = \"x86_64\"\n");
+		let m = parse("[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n");
 		let rendered = toml::to_string(&m).unwrap();
 		assert!(!rendered.contains("[hooks"), "empty hooks must not serialize: {rendered}");
 	}
@@ -1616,7 +1709,7 @@ mod tests {
 	#[test]
 	fn plain_registry_url_has_no_signing() {
 		let m = parse(
-			"[general]\nname = \"x\"\nplatform = \"x86_64\"\n\
+			"[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n\
 			 [deploy]\nregistry = \"reg.example.com/org\"\n",
 		);
 		assert_eq!(m.registry(), Some("reg.example.com/org"));
@@ -1629,7 +1722,7 @@ mod tests {
 	#[test]
 	fn signing_registry_parses_and_defaults_pub_key_to_the_sibling() {
 		let m = parse(
-			"[general]\nname = \"kiosk\"\nplatform = \"x86_64\"\n\
+			"[general]\nname = \"kiosk\"\n[targets]\nx86_64 = \"qcow2\"\n\
 			 [deploy]\nregistry = { url = \"reg.example.com/org\", key = \"cosign.key\" }\n",
 		);
 		assert_eq!(m.registry(), Some("reg.example.com/org"));
@@ -1642,7 +1735,7 @@ mod tests {
 	#[test]
 	fn manifest_schema_advertises_draft_and_the_disk_types_shorthand() {
 		// The emitted schema is draft 2020-12 and, crucially, accepts each
-		// `[general.disk_types]` entry as either a bare type or an array — the
+		// `[targets]` entry as either a bare type or an array — the
 		// shorthand the custom deserializer allows but schemars can't read off
 		// `deserialize_with`.
 		let schema: serde_json::Value =
@@ -1706,7 +1799,7 @@ mod tests {
 	#[test]
 	fn takeover_login_parses_in_the_object_form() {
 		let m = parse(
-			"[general]\nname = \"x\"\nplatform = \"x86_64\"\n\
+			"[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n\
 			 [deploy]\nremotes = [{ remote = \"admin@h\", takeover_login = \"debian\" }]\n",
 		);
 		assert_eq!(
@@ -1721,7 +1814,7 @@ mod tests {
 
 	#[test]
 	fn absent_registry_has_no_signing() {
-		let m = parse("[general]\nname = \"x\"\nplatform = \"x86_64\"\n");
+		let m = parse("[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n");
 		assert!(m.registry().is_none());
 		assert!(m.signing().is_none());
 	}
@@ -1749,7 +1842,7 @@ mod tests {
 		// An array isn't concatenated — the override's list replaces the base's entirely.
 		let base = table("x86_64 = [\"raw\", \"qcow2\"]\n");
 		let over = table("x86_64 = [\"qcow2\"]\n");
-		let dt: DiskTypes = toml::Value::Table(deep_merge(base, over)).try_into().unwrap();
+		let dt: Targets = toml::Value::Table(deep_merge(base, over)).try_into().unwrap();
 		assert_eq!(dt.types(Arch::X86_64), [DiskType::Qcow2]);
 	}
 }

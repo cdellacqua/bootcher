@@ -19,7 +19,7 @@ ssh debian@vps 'sudo apt-get install -y podman'   # or dnf/zypper install -y pod
 The pre-flight (run before the build) checks each host over SSH and fails fast on:
 
 - missing `podman` or `sudo`;
-- a CPU architecture the project doesn't build (`[general.disk_types]`);
+- a CPU architecture the project doesn't build (`[targets]`);
 - a root filesystem the installer can't adopt (must be `ext4` / `xfs` / `btrfs`);
 - an empty/missing `/boot`, or a host booted in **legacy BIOS** mode (UEFI is required — `/sys/firmware/efi` must exist).
 

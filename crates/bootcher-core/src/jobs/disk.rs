@@ -122,7 +122,7 @@ pub(crate) fn run(manifest: &Manifest, config: Option<&str>, job: &mut Scope) ->
 			// its concurrent scope, so cross-arch VMs come up in parallel.
 			let builder = crate::builder::select(image, manifest.image_builder(image.arch), work)?;
 			// One container build per arch, but one image-builder run per disk type listed
-			// for it ([general.disk_types]): each type reuses this arch's container and the
+			// for it ([targets]): each type reuses this arch's container and the
 			// builder selected above, so a `vm`/remote builder boots or connects just once
 			// for the whole list. `build_disk` renders its phases as leaf bars/spinners on
 			// `work` (never header steps), so the worker's arch header stays put above them.

@@ -430,7 +430,7 @@ fn manifest(name: &str, arch: Arch, ns: &str, ssh_port: u16, signing_key: &str) 
 		"[general]\n\
 		 name = \"{name}\"\n\
 		 \n\
-		 [general.disk_types]\n\
+		 [targets]\n\
 		 {arch} = \"qcow2\"\n\
 		 \n\
 		 [builder]\n\

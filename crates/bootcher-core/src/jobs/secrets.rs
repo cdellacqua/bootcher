@@ -635,7 +635,7 @@ mod tests {
 		let key = dir.path().join("id");
 		fs::write(dir.path().join("id.pub"), "ssh-ed25519 AAAA test@host\n").unwrap();
 		let manifest: Manifest = toml::from_str(
-			"[general]\nname = \"x\"\nplatform = \"x86_64\"\n\
+			"[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n\
 			 [deploy]\nregistry = \"reg.example.com/org\"\n",
 		)
 		.unwrap();

@@ -236,7 +236,7 @@ pub(crate) fn run(
 ) -> Result<()> {
 	let images = manifest.images();
 	if images.is_empty() {
-		bail!("no target arches to take over — set `[general.disk_types]` in bootcher.toml");
+		bail!("no target arches to take over — set `[targets]` in bootcher.toml");
 	}
 	let remotes = manifest.deploy_remotes();
 	if remotes.is_empty() {
@@ -397,7 +397,7 @@ fn stage_lan_image(
 	let Some(image) = images.iter().find(|i| i.arch == arch) else {
 		let built: Vec<_> = images.iter().map(|i| i.arch.to_string()).collect();
 		bail!(
-			"{} is {arch}, but `[general.disk_types]` only builds {} — add \"{arch}\" to take over \
+			"{} is {arch}, but `[targets]` only builds {} — add \"{arch}\" to take over \
 			 this host",
 			initial.host(),
 			built.join(", ")

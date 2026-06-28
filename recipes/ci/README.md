@@ -78,7 +78,7 @@ Inside a privileged CI container, rootless/nested podman's per-container network
 makes podman reuse the runner's network namespace instead of programming its own,
 sidestepping the nftables path entirely. It's set on **both** roles so it covers
 `deploy` (the container build) and `provision` (the container build *and* the
-image-builder disk step). Everything else — name, registry, `disk_types`, deploy
+image-builder disk step). Everything else — name, registry, `[targets]`, deploy
 targets, hooks — is inherited from `bootcher.toml`, so this file never drifts: edit
 your real config there, not here.
 
@@ -129,11 +129,13 @@ GitHub, `runs-on: ubuntu-24.04` (x86_64) or `ubuntu-24.04-arm` (aarch64); on Git
 tag the job for a hosted arm64 runner — `tags: [saas-linux-small-arm64]` (the small
 size is available on all tiers; medium/large are Premium/Ultimate only) — or leave
 it untagged for the default x86_64 runner. If
-`[general.disk_types]` lists one arch, run the job on a runner of that arch. For a
+`[targets]` lists one arch, run the job on a runner of that arch. For a
 **multi-arch** image, either run the build on a runner whose `[builder]` routes the
 foreign arch to a `vm`/remote, or split into a per-arch job matrix on native
-runners. Emulated cross-arch image-builder runs are slow and fragile — prefer
-native runners.
+runners: keep every arch in one `[targets]` table and pass `provision --target
+<arch>` (optionally `--disk <type>`) so each job builds only its runner's arch from
+the shared manifest, instead of maintaining one manifest per arch. Emulated
+cross-arch image-builder runs are slow and fragile — prefer native runners.
 
 ## Requirements & troubleshooting
 

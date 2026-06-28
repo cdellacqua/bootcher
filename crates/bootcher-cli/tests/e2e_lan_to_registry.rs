@@ -383,7 +383,7 @@ fn lan_manifest(name: &str, arch: Arch, ssh_port: u16) -> String {
 		"[general]\n\
 		 name = \"{name}\"\n\
 		 \n\
-		 [general.disk_types]\n\
+		 [targets]\n\
 		 {arch} = \"qcow2\"\n\
 		 \n\
 		 [builder]\n\
@@ -403,7 +403,7 @@ fn registry_manifest(name: &str, arch: Arch, ns: &str, ssh_port: u16) -> String 
 		"[general]\n\
 		 name = \"{name}\"\n\
 		 \n\
-		 [general.disk_types]\n\
+		 [targets]\n\
 		 {arch} = \"qcow2\"\n\
 		 \n\
 		 [builder]\n\

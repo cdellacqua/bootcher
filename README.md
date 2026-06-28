@@ -117,8 +117,9 @@ Per-stage shortcuts exist too: `bootcher build`, `bootcher disk`,
 `bootcher init` scaffolds:
 
 - `bootcher.toml` — the manifest: `[general]` holds `name` (the image name,
-  used for the container tag and output dir) and `platform` (one target arch, or
-  an array for a multi-arch image); `[deploy]` holds `remotes` (SSH targets) and
+  used for the container tag and output dir) and `rootfs`; `[targets]` maps each
+  target arch to its disk type(s) (one arch, or several for a multi-arch image);
+  `[deploy]` holds `remotes` (SSH targets) and
   an optional `registry` for registry-mode deploys (see
   [Deploy backends](#deploy-backends-lan-vs-registry)). Its presence marks the
   directory as a bootcher project.

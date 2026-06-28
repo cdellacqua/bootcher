@@ -53,8 +53,8 @@ fn init_scaffolds_a_named_project() {
 	assert!(manifest.contains("[general]"), "manifest keys live under [general]: {manifest}");
 	assert!(manifest.contains(r#"name = "demo""#), "manifest: {manifest}");
 	// init seeds the build matrix with the host arch so `--platform` is optional; the
-	// arch shows up as a key under [general.disk_types] mapped to a default qcow2.
-	assert!(manifest.contains("[general.disk_types]"), "manifest: {manifest}");
+	// arch shows up as a key under [targets] mapped to a default qcow2.
+	assert!(manifest.contains("[targets]"), "manifest: {manifest}");
 	assert!(
 		manifest.contains("x86_64 = [\"qcow2\"]") || manifest.contains("aarch64 = [\"qcow2\"]"),
 		"manifest: {manifest}"
@@ -263,7 +263,7 @@ fn extending_manifest(proj: &Path, body: &str) -> &'static str {
 #[test]
 fn extend_inherits_the_base_and_layers_overrides() {
 	// A child manifest that only declares `extend` + a `[hooks]` table inherits the
-	// base's `[general]` (name, disk_types) wholesale — the merged metadata still
+	// base's `[general]` and `[targets]` wholesale — the merged metadata still
 	// carries the base project's name and local image ref, proving the parent was
 	// loaded underneath.
 	let (tmp, proj) = project("demo");
@@ -278,7 +278,7 @@ fn extend_inherits_the_base_and_layers_overrides() {
 fn extend_child_overrides_a_base_scalar() {
 	// The child overrides one `[general]` scalar (the image name) while inheriting the
 	// rest: the merge is a deep one, not a wholesale section replacement that would
-	// drop the base's disk_types and fail to build.
+	// drop the base's `[targets]` and fail to build.
 	let (tmp, proj) = project("demo");
 	let ci = extending_manifest(&proj, "[general]\nname = \"demo-ci\"");
 	bootcher_in(tmp.path(), &proj).args(["--manifest", ci, "build"]).assert().failure();
@@ -402,7 +402,7 @@ fn provision_without_key_on_non_tty_errors() {
 	// the build — rather than producing a keyless device. `--skip-build` exercises
 	// the disk-only path (no container build) while still requiring the key.
 	let (tmp, proj) = project("demo");
-	// No --platform: the arch defaults to the manifest's `[general.disk_types]` keys
+	// No --platform: the arch defaults to the manifest's `[targets]` keys
 	// (seeded by init).
 	bootcher_in(tmp.path(), &proj)
 		.args(["provision", "--skip-build"])

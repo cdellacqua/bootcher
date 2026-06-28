@@ -274,7 +274,7 @@ fn manifest(cross: Arch, ssh_port: u16) -> String {
 		"[general]\n\
 		 name = \"e2ecross\"\n\
 		 \n\
-		 [general.disk_types]\n\
+		 [targets]\n\
 		 {cross} = \"qcow2\"\n\
 		 \n\
 		 [builder]\n\

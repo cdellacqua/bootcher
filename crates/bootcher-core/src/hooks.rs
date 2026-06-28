@@ -90,7 +90,7 @@ pub(crate) struct HookMetadata {
 	pub stage: Stage,
 	/// The project image name (`[general] name`).
 	pub image_name: String,
-	/// The target arches being built/deployed (`[general.disk_types]` keys).
+	/// The target arches being built/deployed (`[targets]` keys).
 	pub arches: Vec<Arch>,
 	/// The suffix-free image ref this phase concerns: the local manifest-list ref
 	/// at `build`, the bootc-origin source ref at `disk`, the pushed/served list ref
