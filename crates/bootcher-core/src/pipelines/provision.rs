@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::context::Manifest;
+use crate::context::{Arch, DiskType, Manifest};
 use crate::{jobs, progress};
 
 /// Full first-time provisioning: build every target arch's container, then build
@@ -28,17 +28,29 @@ use crate::{jobs, progress};
 /// `provision --skip-build` in a fresh CI runner reuses the exact image the
 /// automatically-run `deploy` already built and pushed, rather than rebuilding it.
 ///
+/// `target`/`disks` are the run's [`Manifest`] selection (`provision
+/// --target`/`--disk`), threaded straight through to the build and disk jobs rather
+/// than narrowing the manifest: `None`/`&[]` is the whole matrix; a `target` scopes
+/// every phase to that arch, and `disks` further restricts the disk fan-out to those
+/// types. Validate it with [`Manifest::check_selection`] before calling.
+///
 /// # Errors
 ///
 /// Returns an error if the build/fetch or disk phase fails.
-pub fn run(manifest: &Manifest, config: Option<&str>, skip_build: bool) -> Result<()> {
+pub fn run(
+	manifest: &Manifest,
+	target: Option<Arch>,
+	disks: &[DiskType],
+	config: Option<&str>,
+	skip_build: bool,
+) -> Result<()> {
 	let mut b = progress::Scope::root("provision", Some(2));
 	if skip_build {
-		jobs::build::ensure_local(manifest, &mut b.child("fetch image"))?;
+		jobs::build::ensure_local(manifest, target, &mut b.child("fetch image"))?;
 	} else {
-		jobs::build::run(manifest, true, &mut b.child("build"))?;
+		jobs::build::run(manifest, target, &mut b.child("build"))?;
 	}
-	jobs::disk::run(manifest, config, &mut b.child("disk"))
+	jobs::disk::run(manifest, target, disks, config, &mut b.child("disk"))
 }
 
 /// Check the external tools `provision` needs — its two phases in order (`build`
@@ -50,9 +62,9 @@ pub fn run(manifest: &Manifest, config: Option<&str>, skip_build: bool) -> Resul
 /// # Errors
 ///
 /// Returns an error listing every missing prerequisite.
-pub fn preflight(manifest: &Manifest, skip_build: bool) -> Result<()> {
+pub fn preflight(manifest: &Manifest, target: Option<Arch>, skip_build: bool) -> Result<()> {
 	if !skip_build {
-		jobs::build::preflight(manifest)?;
+		jobs::build::preflight(manifest, target)?;
 	}
-	jobs::disk::preflight(manifest)
+	jobs::disk::preflight(manifest, target)
 }

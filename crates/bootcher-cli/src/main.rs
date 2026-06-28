@@ -292,10 +292,12 @@ fn run() -> Result<()> {
 	match cli.cmd {
 		Cmd::Init { name, yes, force } => jobs::init::run(name, yes, force),
 		Cmd::Provision { ssh_key, skip_pull_check, anonymous, target, disk, skip_build } => {
-			// Narrow `[targets]` to the requested arch/disk(s) up front, so every phase
-			// (preflight included) sees only the subset this run builds.
-			let manifest = Manifest::load(manifest_path)?.select_targets(target, &disk)?;
-			pipelines::provision::preflight(&manifest, skip_build)?;
+			let manifest = Manifest::load(manifest_path)?;
+			// Validate the `--target`/`--disk` selection once up front (no manifest
+			// narrowing); the selection is then threaded to each phase, which projects
+			// the manifest through it.
+			manifest.check_selection(target, &disk)?;
+			pipelines::provision::preflight(&manifest, target, skip_build)?;
 			let config = jobs::secrets::Provisioning::collect(
 				&manifest,
 				ssh_key.as_deref(),
@@ -303,7 +305,7 @@ fn run() -> Result<()> {
 				anonymous,
 			)?
 			.blueprint()?;
-			pipelines::provision::run(&manifest, Some(&config), skip_build)
+			pipelines::provision::run(&manifest, target, &disk, Some(&config), skip_build)
 		}
 		Cmd::Deploy { skip_bootc_upgrade, skip_build } => {
 			let manifest = Manifest::load(manifest_path)?;
@@ -311,13 +313,14 @@ fn run() -> Result<()> {
 			pipelines::deploy::run(&manifest, skip_bootc_upgrade, skip_build)
 		}
 		Cmd::Build { target } => {
-			// `--target` narrows `[targets]` to one arch; with it set, the build stops at
-			// the per-arch member and skips the manifest list (the producer half of a
-			// split CI pipeline). A bare `build` keeps assembling `localhost/<name>:latest`
-			// like the pipelines do.
-			let manifest = Manifest::load(manifest_path)?.select_targets(target, &[])?;
-			jobs::build::preflight(&manifest)?;
-			jobs::build::run(&manifest, target.is_none(), &mut Scope::standalone())
+			let manifest = Manifest::load(manifest_path)?;
+			// `--target <arch>` scopes the build to one arch and, being `Some`, makes
+			// `build::run` stop at the per-arch member instead of assembling
+			// `localhost/<name>:latest` (the producer half of a split CI pipeline). A
+			// bare `build` (`None`) builds every arch and assembles the list.
+			manifest.check_selection(target, &[])?;
+			jobs::build::preflight(&manifest, target)?;
+			jobs::build::run(&manifest, target, &mut Scope::standalone())
 		}
 		Cmd::Takeover { ssh_key, login, skip_pull_check, anonymous, yes, skip_build } => {
 			let manifest = Manifest::load(manifest_path)?;

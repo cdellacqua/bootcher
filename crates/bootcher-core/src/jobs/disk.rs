@@ -1,5 +1,5 @@
 use crate::builder::Builder;
-use crate::context::{Arch, DiskTarget, Manifest};
+use crate::context::{Arch, DiskTarget, DiskType, Manifest};
 use crate::hooks::{DiskTargetMeta, HookMetadata, Phase, Stage};
 use crate::preflight::{self, Checks};
 use crate::progress::Scope;
@@ -16,10 +16,10 @@ use std::path::{Path, PathBuf};
 /// # Errors
 ///
 /// Returns an error listing every missing prerequisite.
-pub(crate) fn preflight(manifest: &Manifest) -> Result<()> {
+pub(crate) fn preflight(manifest: &Manifest, target: Option<Arch>) -> Result<()> {
 	let mut checks = Checks::default();
 	checks.bin("podman", preflight::PODMAN_HINT);
-	for image in manifest.images() {
+	for image in manifest.images_for(target) {
 		let arch = image.arch;
 		let spec = manifest.image_builder(arch);
 		if crate::builder::is_local(spec) {
@@ -35,9 +35,13 @@ pub(crate) fn preflight(manifest: &Manifest) -> Result<()> {
 	checks.finish()
 }
 
-/// Build every target arch's disk image with `image-builder`, in
-/// parallel. The front door for the standalone `disk` and for `provision` (build
-/// then disk).
+/// Build the run's disk image(s) with `image-builder`, in parallel — for
+/// `provision` (build then disk). `target`/`disks` are the run's [`Manifest`]
+/// selection (threaded from the CLI, the manifest itself untouched): `target` `None`
+/// fans out over every arch in `[targets]`, `Some(arch)` over just that one
+/// ([`Manifest::images_for`]); an empty `disks` builds each arch's full type list,
+/// else only the listed types ([`Manifest::disks_for`]). So `provision --target
+/// aarch64 --disk qcow2` builds exactly one disk.
 ///
 /// Each arch runs on its own worker (see [`crate::fleet::for_each`]): it selects
 /// (and, for a `vm` spec, boots) *its* image builder — the `[builder.<arch>]
@@ -62,8 +66,14 @@ pub(crate) fn preflight(manifest: &Manifest) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if any arch's disk build fails, a hook fails, or a signal interrupts.
-pub(crate) fn run(manifest: &Manifest, config: Option<&str>, job: &mut Scope) -> Result<()> {
-	let images = manifest.images();
+pub(crate) fn run(
+	manifest: &Manifest,
+	target: Option<Arch>,
+	disks: &[DiskType],
+	config: Option<&str>,
+	job: &mut Scope,
+) -> Result<()> {
+	let images = manifest.images_for(target);
 	let hooks = manifest.hooks();
 	// Project-level (arch-independent) refs the image-builder source ref each arch
 	// records as its bootc origin derives from (see `run_one`): the registry list ref
@@ -80,9 +90,9 @@ pub(crate) fn run(manifest: &Manifest, config: Option<&str>, job: &mut Scope) ->
 		.iter()
 		.flat_map(|image| {
 			manifest
-				.disk_types_for(image.arch)
-				.iter()
-				.map(|&disk_type| DiskTarget { image: image.clone(), disk_type })
+				.disks_for(image.arch, disks)
+				.into_iter()
+				.map(|disk_type| DiskTarget { image: image.clone(), disk_type })
 		})
 		.collect();
 	let mut meta = HookMetadata {
@@ -126,7 +136,7 @@ pub(crate) fn run(manifest: &Manifest, config: Option<&str>, job: &mut Scope) ->
 			// builder selected above, so a `vm`/remote builder boots or connects just once
 			// for the whole list. `build_disk` renders its phases as leaf bars/spinners on
 			// `work` (never header steps), so the worker's arch header stays put above them.
-			for &disk_type in manifest.disk_types_for(image.arch) {
+			for disk_type in manifest.disks_for(image.arch, disks) {
 				let target = DiskTarget { image: image.clone(), disk_type };
 				run_one(
 					&target,

@@ -9,16 +9,17 @@ use duct::cmd;
 /// loads its result into local rootless storage, even from a remote/VM builder),
 /// plus, per arch's `[builder] build`, its transport (ssh for a remote, qemu +
 /// firmware for a `vm`) and a qemu-user binfmt handler for a cross-arch in-process
-/// build. Co-located with [`run()`] so the two stay in sync; the CLI / pipeline calls
-/// it before any build starts.
+/// build. `target` scopes the checks to the run's arch(es) — the same selection
+/// [`run()`] builds (`None` ⇒ every arch). Co-located with [`run()`] so the two stay
+/// in sync; the CLI / pipeline calls it before any build starts.
 ///
 /// # Errors
 ///
 /// Returns an error listing every missing prerequisite.
-pub fn preflight(manifest: &Manifest) -> Result<()> {
+pub fn preflight(manifest: &Manifest, target: Option<Arch>) -> Result<()> {
 	let mut checks = Checks::default();
 	checks.bin("podman", preflight::PODMAN_HINT);
-	for image in manifest.images() {
+	for image in manifest.images_for(target) {
 		let arch = image.arch;
 		let spec = manifest.build_builder(arch);
 		preflight::builder_transport(spec, arch, &mut checks);
@@ -30,21 +31,23 @@ pub fn preflight(manifest: &Manifest) -> Result<()> {
 	checks.finish()
 }
 
-/// Build every target arch's bootc container, in parallel, into local rootless
-/// storage — the postcondition `image`/`deploy`/`upgrade` rely on (each member
-/// resident under [`ImageRef::tag`]) — then, when `assemble_list`, assemble them
+/// Build the run's target arch(es)' bootc container, in parallel, into local
+/// rootless storage — the postcondition `image`/`deploy`/`upgrade` rely on (each
+/// member resident under [`ImageRef::tag`]) — then, for a *full* run, assemble them
 /// into the local suffix-free manifest list (`localhost/<name>:latest`) as the final
 /// step, so the build leaves one usable multi-arch ref. The shared front door for the
 /// standalone `build`, for `provision` (build then disk), and for `deploy` (build
 /// then push).
 ///
-/// `assemble_list` is `false` only for a *targeted* standalone build (`build
-/// --target <arch>`): it stops at the per-arch `localhost/<name>:latest-<arch>`
-/// member and skips the list, since a single-arch list would masquerade as the whole
-/// image. That's the producer half of a split CI pipeline — each arch built (and
-/// transferred) on its own runner, then a later `deploy --skip-build` assembles the
-/// list from every arch's member. The pipelines (`provision`/`deploy`/`takeover`)
-/// always pass `true`, so their behaviour is unchanged.
+/// `target` is the run's [`Manifest`] selection (threaded from the CLI, not baked
+/// into the manifest): `None` builds every arch in `[targets]` and assembles the
+/// list; `Some(arch)` builds just that arch and stops at its
+/// `localhost/<name>:latest-<arch>` member — **no list**, since a single-arch list
+/// would masquerade as the whole image. The latter is the producer half of a split
+/// CI pipeline: each arch built (and transferred) on its own runner, then a later
+/// `deploy --skip-build` assembles the list from every arch's member. The pipelines
+/// (`provision`/`deploy`/`takeover`) pass their own `target` (`None` for the
+/// whole-image `deploy`/`takeover`).
 ///
 /// Each arch runs on its own worker (the crate's fleet fan-out): it selects
 /// *its* builder (the `[builder.<arch>] build` spec — `local`, a `vm`, or a
@@ -70,16 +73,17 @@ pub fn preflight(manifest: &Manifest) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if any arch's build fails, a hook fails, or a signal interrupts.
-pub fn run(manifest: &Manifest, assemble_list: bool, job: &mut Scope) -> Result<()> {
-	let images = manifest.images();
+pub fn run(manifest: &Manifest, target: Option<Arch>, job: &mut Scope) -> Result<()> {
+	let images = manifest.images_for(target);
 	let hooks = manifest.hooks();
 	// The hook's `image_ref` names what the build leaves behind: the assembled list
-	// normally, or the lone member tag for a targeted (list-less) build, so a
-	// `build.post` hook always points at a ref that exists.
-	let image_ref = if assemble_list {
-		manifest.local_list_ref()
-	} else {
-		images.first().map_or_else(|| manifest.local_list_ref(), ImageRef::tag)
+	// for a full run, or the lone member tag for a targeted (list-less) build, so a
+	// `build.post` hook always points at a ref that exists. Derived straight from the
+	// matched `arch` — not `images.first()` — so there's no "can't happen" fallback to
+	// silently mask a future bug.
+	let image_ref = match target {
+		None => manifest.local_list_ref(),
+		Some(arch) => manifest.image(arch).tag(),
 	};
 	let mut meta = crate::hooks::HookMetadata {
 		phase: crate::hooks::Phase::Build,
@@ -116,8 +120,8 @@ pub fn run(manifest: &Manifest, assemble_list: bool, job: &mut Scope) -> Result<
 	// push or serve and a device resolves its own arch from. Local podman metadata
 	// only (no layer copy), so it's negligible beside the container build; the push
 	// paths still reassemble it at push time to stay self-contained. A targeted
-	// `build --target` skips it (see `assemble_list`), stopping at the member tag.
-	if assemble_list {
+	// `build --target <arch>` skips it (see `target`), stopping at the member tag.
+	if target.is_none() {
 		manifest_list(&images, &manifest.local_list_ref(), &mut job.child("manifest list"))?;
 	}
 	// `build.post` runs as the build's very last step — after the manifest list is
@@ -128,11 +132,13 @@ pub fn run(manifest: &Manifest, assemble_list: bool, job: &mut Scope) -> Result<
 	Ok(())
 }
 
-/// For `--skip-build`: make sure every target arch's container member is in local
-/// rootless storage for the consuming phase to read, **pulling it from the
-/// configured registry** when the store doesn't already have it. The seeding
+/// For `--skip-build`: make sure the run's target arch(es)' container member(s) are
+/// in local rootless storage for the consuming phase to read, **pulling from the
+/// configured registry** when the store doesn't already have one. The seeding
 /// counterpart to [`run()`] — same postcondition (each member resident under its
-/// [`ImageRef::tag`]), reached by a pull instead of a build.
+/// [`ImageRef::tag`]), reached by a pull instead of a build. `target` is the run's
+/// selection ([`Manifest::images_for`]), so a `provision --skip-build --target
+/// <arch>` only fetches that arch.
 ///
 /// A member already present is reused untouched (no network), e.g. one a prior
 /// `bootcher build` left behind. A missing member is pulled out of
@@ -150,12 +156,16 @@ pub fn run(manifest: &Manifest, assemble_list: bool, job: &mut Scope) -> Result<
 ///
 /// Returns an error if a member is missing with no registry to pull it from, or a
 /// registry pull/tag fails.
-pub(crate) fn ensure_local(manifest: &Manifest, job: &mut Scope) -> Result<()> {
+pub(crate) fn ensure_local(
+	manifest: &Manifest,
+	target: Option<Arch>,
+	job: &mut Scope,
+) -> Result<()> {
 	// Only the absent members need fetching; the present ones (e.g. from a prior
 	// `bootcher build`) are reused untouched. Filtering first also keeps the whole
 	// step a silent no-op when nothing is missing.
 	let missing: Vec<ImageRef> =
-		manifest.images().into_iter().filter(|i| !image_present(&i.tag())).collect();
+		manifest.images_for(target).into_iter().filter(|i| !image_present(&i.tag())).collect();
 	if missing.is_empty() {
 		return Ok(());
 	}

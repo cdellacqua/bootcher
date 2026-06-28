@@ -43,7 +43,10 @@ pub fn run(manifest: &Manifest, skip_bootc_upgrade: bool, skip_build: bool) -> R
 		return jobs::upgrade::run(manifest, skip_bootc_upgrade, &mut job);
 	}
 	let mut b = progress::Scope::root("deploy", Some(2));
-	jobs::build::run(manifest, true, &mut b.child("build"))?;
+	// `deploy` publishes the whole multi-arch image, never a single-arch subset, so the
+	// build is unscoped (`None`) — every arch, list assembled. Splitting the build per
+	// arch is a separate-job concern (`build --target` + `deploy --skip-build`).
+	jobs::build::run(manifest, None, &mut b.child("build"))?;
 	jobs::upgrade::run(manifest, skip_bootc_upgrade, &mut b.child("upgrade"))
 }
 
@@ -57,7 +60,7 @@ pub fn run(manifest: &Manifest, skip_bootc_upgrade: bool, skip_build: bool) -> R
 /// Returns an error listing every missing prerequisite.
 pub fn preflight(manifest: &Manifest, skip_bootc_upgrade: bool, skip_build: bool) -> Result<()> {
 	if !skip_build {
-		jobs::build::preflight(manifest)?;
+		jobs::build::preflight(manifest, None)?;
 	}
 	jobs::upgrade::preflight(manifest, skip_bootc_upgrade)
 }

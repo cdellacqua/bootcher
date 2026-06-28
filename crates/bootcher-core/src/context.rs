@@ -1112,20 +1112,23 @@ impl Manifest {
 		self.targets.arches().into_iter().map(|arch| self.image(arch)).collect()
 	}
 
-	/// Narrow `[targets]` to the arch and/or disk types named by `provision
-	/// --target`/`--disk`, returning a clone restricted to that subset (the original
-	/// is untouched). `target` `None` (no `--target`) keeps every arch and every type
-	/// — the full matrix; a `target` keeps only that arch, and a non-empty `disks`
-	/// further keeps only those of its types (in manifest order). The container is
-	/// still one build per surviving arch; `--disk` only trims the disk-artifact
-	/// fan-out.
+	/// Validate a `--target`/`--disk` run selection against `[targets]` *without*
+	/// touching the manifest — the manifest stays the whole, authoritative project
+	/// config; the selection is a separate input threaded alongside it (see
+	/// [`Self::images_for`] / [`Self::disks_for`]). Called once up front so a bad
+	/// selection fails before any build work, with the same message the filters would
+	/// otherwise hit lazily.
+	///
+	/// `target` `None` (no `--target`) is the whole matrix; a `target` must be one of
+	/// the project's arches; `disks` (only meaningful with a `target`) must each be one
+	/// of that arch's types.
 	///
 	/// # Errors
 	///
 	/// Returns an error if `disks` is given without a `target`, if `target` isn't one
 	/// of the project's arches, or if a requested disk type isn't built for it — each
 	/// naming the valid choices.
-	pub fn select_targets(&self, target: Option<Arch>, disks: &[DiskType]) -> Result<Self> {
+	pub fn check_selection(&self, target: Option<Arch>, disks: &[DiskType]) -> Result<()> {
 		if !disks.is_empty() && target.is_none() {
 			bail!(
 				"`--disk` needs `--target`: name the architecture whose disk(s) to build, \
@@ -1137,9 +1140,7 @@ impl Manifest {
 				disks[0],
 			);
 		}
-		let Some(arch) = target else {
-			return Ok(self.clone());
-		};
+		let Some(arch) = target else { return Ok(()) };
 		let available = self.targets.types(arch);
 		if available.is_empty() {
 			bail!(
@@ -1147,24 +1148,46 @@ impl Manifest {
 				join_display(self.targets.arches()),
 			);
 		}
-		let chosen: Vec<DiskType> = if disks.is_empty() {
+		for d in disks {
+			if !available.contains(d) {
+				bail!(
+					"`--disk {d}` isn't built for {arch}; `[targets] {arch}` lists: {}",
+					join_display(available.iter().copied()),
+				);
+			}
+		}
+		Ok(())
+	}
+
+	/// The [`ImageRef`]s a run acts on: every arch in `[targets]` for an unfiltered
+	/// run (`target` `None`), or just `target`'s when one is named. The `--target`
+	/// projection of [`Self::images`] — same vec, optionally restricted to one arch —
+	/// so the build/disk fan-outs iterate the run's arches without the manifest itself
+	/// being narrowed. Validate `target` with [`Self::check_selection`] first (a
+	/// `target` not in `[targets]` yields an [`ImageRef`] for an arch the project
+	/// doesn't build).
+	#[must_use]
+	pub fn images_for(&self, target: Option<Arch>) -> Vec<ImageRef> {
+		match target {
+			Some(arch) => vec![self.image(arch)],
+			None => self.images(),
+		}
+	}
+
+	/// The disk types to build for `arch` this run: its full `[targets]` list, or —
+	/// when `filter` (`provision --disk`) is non-empty — only the listed types, in
+	/// manifest order (a type repeated on the command line is built once). The
+	/// `--disk` projection of [`Self::disk_types_for`]. `filter` is only ever
+	/// non-empty alongside a `--target` (enforced by [`Self::check_selection`]), so it
+	/// only narrows that one arch.
+	#[must_use]
+	pub fn disks_for(&self, arch: Arch, filter: &[DiskType]) -> Vec<DiskType> {
+		let available = self.disk_types_for(arch);
+		if filter.is_empty() {
 			available.to_vec()
 		} else {
-			for d in disks {
-				if !available.contains(d) {
-					bail!(
-						"`--disk {d}` isn't built for {arch}; `[targets] {arch}` lists: {}",
-						join_display(available.iter().copied()),
-					);
-				}
-			}
-			// Keep manifest order (and drop a type repeated on the command line).
-			available.iter().copied().filter(|d| disks.contains(d)).collect()
-		};
-		let mut narrowed = self.clone();
-		narrowed.targets = Targets::default();
-		narrowed.targets.set(arch, chosen);
-		Ok(narrowed)
+			available.iter().copied().filter(|d| filter.contains(d)).collect()
+		}
 	}
 
 	/// Builder spec for `arch`'s container build / `deploy` / `upgrade` (its
@@ -1268,7 +1291,7 @@ fn default_rootfs() -> Rootfs {
 }
 
 /// Comma-join a sequence of `Display` values — for the "valid choices were …"
-/// tail of a [`Manifest::select_targets`] error.
+/// tail of a [`Manifest::check_selection`] error.
 fn join_display<T: std::fmt::Display>(items: impl IntoIterator<Item = T>) -> String {
 	items.into_iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")
 }
@@ -1430,36 +1453,45 @@ mod tests {
 	}
 
 	#[test]
-	fn select_targets_narrows_arch_and_disk_types() {
+	fn images_for_and_disks_for_project_the_run_selection() {
 		let m = parse(
 			"[general]\nname = \"x\"\n\
 			 [targets]\nx86_64 = [\"qcow2\", \"raw\"]\naarch64 = \"qcow2\"\n",
 		);
-		// No `--target` keeps the whole matrix.
-		let all = m.select_targets(None, &[]).unwrap();
+		// No `--target`: the whole matrix, untouched.
 		assert_eq!(
-			all.images().iter().map(|i| i.arch).collect::<Vec<_>>(),
+			m.images_for(None).iter().map(|i| i.arch).collect::<Vec<_>>(),
 			[Arch::X86_64, Arch::Aarch64]
 		);
-		// `--target x86_64` drops aarch64, keeps x86_64's full type list.
-		let one = m.select_targets(Some(Arch::X86_64), &[]).unwrap();
-		assert_eq!(one.images().iter().map(|i| i.arch).collect::<Vec<_>>(), [Arch::X86_64]);
-		assert_eq!(one.disk_types_for(Arch::X86_64), [DiskType::Qcow2, DiskType::Raw]);
-		assert!(one.disk_types_for(Arch::Aarch64).is_empty());
-		// `--target x86_64 --disk raw` narrows to that one type (manifest order kept).
-		let raw = m.select_targets(Some(Arch::X86_64), &[DiskType::Raw]).unwrap();
-		assert_eq!(raw.disk_types_for(Arch::X86_64), [DiskType::Raw]);
+		// `--target x86_64`: only that arch's image — but the manifest is unchanged, so
+		// its other arch still resolves through the unfiltered accessors.
+		assert_eq!(
+			m.images_for(Some(Arch::X86_64)).iter().map(|i| i.arch).collect::<Vec<_>>(),
+			[Arch::X86_64]
+		);
+		assert_eq!(m.disk_types_for(Arch::Aarch64), [DiskType::Qcow2]);
+		// No `--disk`: the arch's full type list. With a filter: only those, in manifest
+		// order (not the order requested).
+		assert_eq!(m.disks_for(Arch::X86_64, &[]), [DiskType::Qcow2, DiskType::Raw]);
+		assert_eq!(
+			m.disks_for(Arch::X86_64, &[DiskType::Raw, DiskType::Qcow2]),
+			[DiskType::Qcow2, DiskType::Raw]
+		);
+		assert_eq!(m.disks_for(Arch::X86_64, &[DiskType::Raw]), [DiskType::Raw]);
 	}
 
 	#[test]
-	fn select_targets_rejects_bad_requests() {
+	fn check_selection_rejects_bad_requests() {
 		let m = parse("[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n");
+		// Valid selections pass.
+		assert!(m.check_selection(Some(Arch::X86_64), &[DiskType::Qcow2]).is_ok());
+		assert!(m.check_selection(None, &[]).is_ok());
 		// `--disk` without `--target`.
-		assert!(m.select_targets(None, &[DiskType::Qcow2]).is_err());
+		assert!(m.check_selection(None, &[DiskType::Qcow2]).is_err());
 		// An arch the project doesn't build.
-		assert!(m.select_targets(Some(Arch::Aarch64), &[]).is_err());
+		assert!(m.check_selection(Some(Arch::Aarch64), &[]).is_err());
 		// A disk type not listed for the requested arch.
-		assert!(m.select_targets(Some(Arch::X86_64), &[DiskType::Raw]).is_err());
+		assert!(m.check_selection(Some(Arch::X86_64), &[DiskType::Raw]).is_err());
 	}
 
 	#[test]
