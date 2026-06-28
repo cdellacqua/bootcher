@@ -24,6 +24,10 @@
 #                download and flash. No second container build; the disk is
 #                byte-for-byte what devices auto-update to.
 #
+# The pipeline is path-gated (see `.image-rules`): build/deploy run only when an image
+# input changed (Containerfile, sysroot/, the manifests), so a docs-only push is a
+# no-op; a `v*` tag always builds. Tune the allowlist there to your project.
+#
 # Why split the build per arch? A multi-arch `bootcher deploy` on a single runner would
 # build the foreign arch under qemu-user emulation — slow and occasionally fragile.
 # Building each arch on its own native runner is faster and more reliable. The members
@@ -131,6 +135,36 @@ default:
 
 stages: [build, deploy, provision]
 
+# --- when to run: only when something that affects the image changed --------------
+# The build context is the whole project root, so this is an ALLOWLIST of the inputs
+# that actually change the built image: the Containerfile, the sysroot/ overlay baked
+# into it, and the manifests (a registry/target/hook change there re-images too). A
+# docs/README-only push no longer spins up the whole multi-arch build → deploy.
+#
+# Shared by `.build` and `deploy` via `!reference` so they gate identically — if they
+# diverged, deploy could be scheduled with no build artifacts to assemble. provision
+# inherits the gate transitively: it `needs: [deploy]`, so when deploy is filtered out
+# provision drops with it (a manual disk build has nothing to pull anyway).
+#
+# Tags are deliberate releases: the tag rule has no `changes:`, so a `v*` tag always
+# builds even if its commit touched none of these paths.
+#
+# Adjust the list to YOUR project: if the Containerfile `COPY`s other paths, or a
+# [hooks] script lives outside sysroot/, add them — anything in the build context that
+# ends up in the image belongs here. `.gitlab-ci.yml` is included so a pipeline edit
+# re-runs itself.
+.image-rules:
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes:
+        paths:
+          - Containerfile
+          - sysroot/**/*
+          - bootcher.toml
+          - bootcher.ci.toml
+          - .gitlab-ci.yml
+
 # --- build: one container per arch, on a native-arch runner -----------------------
 # `build --target <arch>` builds only that arch and stops at the per-arch member tag
 # localhost/<name>:latest-<arch> (no multi-arch list — `deploy` assembles that). The
@@ -138,9 +172,8 @@ stages: [build, deploy, provision]
 # needed here — only `deploy` pushes.
 .build:
   stage: build
-  rules:
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-    - if: $CI_COMMIT_TAG
+  # Gate on image-affecting changes (see `.image-rules` above); tags always build.
+  rules: !reference [.image-rules, rules]
   script:
     - bootcher --manifest bootcher.ci.toml build --target "$ARCH"
     # The build just produced exactly one image tagged `:latest-<arch>`. Save it; the
@@ -180,9 +213,9 @@ deploy:
   stage: deploy
   # Pull in both build jobs' artifacts (the per-arch member tarballs) and gate on them.
   needs: ["build:x86_64", "build:aarch64"]
-  rules:
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-    - if: $CI_COMMIT_TAG
+  # Same gate as the build jobs (see `.image-rules`) so deploy is scheduled exactly
+  # when its members were built — never with nothing to assemble. Tags always deploy.
+  rules: !reference [.image-rules, rules]
   # Signing? Uncomment to set the cosign key's passphrase (use "" if it has none);
   # the env var wins over cosign's TTY prompt even when empty, so the non-interactive
   # runner doesn't hang/fail.
@@ -216,8 +249,10 @@ deploy:
   # Chain behind deploy so the disk is built from *this* pipeline's freshly pushed
   # image, never a stale one: `--skip-build` pulls <registry>/<name>:latest, which must
   # exist first. `needs: ["deploy"]` makes the manual job playable only once deploy
-  # succeeds; on a default-branch pipeline deploy always runs (same rule), so this
-  # never blocks a legitimate provision, and a disk build has nothing to pull without it.
+  # succeeds. This also carries the image-change gate transitively: a push that didn't
+  # touch an image input filters deploy out (see `.image-rules`), so provision drops
+  # with it — there'd be no new image to pull anyway. Want a disk for an
+  # already-published image? Replay this manual job from the pipeline that built it.
   needs: ["deploy"]
   rules:
     # Manual must live INSIDE the rule: a job-level `when: manual` is ignored once

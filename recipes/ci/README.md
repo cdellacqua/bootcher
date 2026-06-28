@@ -171,6 +171,37 @@ on GitHub remove it from the `build`/`provision` `matrix.include`; on GitLab del
 the second `build:`/`provision:` job. `--target` then names your one arch (a build for
 an arch not in `[targets]` is a hard error).
 
+## Only rebuild when the image actually changes
+
+Both templates path-gate the pipeline so a push that can't change the image — docs, a
+README tweak, an unrelated script — doesn't spin up the whole multi-arch build →
+deploy. The build context is the **entire project root**, so the gate is an
+**allowlist** of the inputs that genuinely re-image:
+
+- `Containerfile`
+- `sysroot/**` — the overlay baked into the image
+- `bootcher.toml` and `bootcher.ci.toml` — a registry/`[targets]`/`[hooks]` change re-images too
+- the CI file itself, so editing the pipeline re-runs it
+
+**A `v*` tag always builds**, path filter or not — a tag is a deliberate release.
+
+The gate is applied consistently across stages so the `needs` chain never breaks:
+`build` and `deploy` share it, and `provision` inherits it transitively (it `needs`
+deploy, so when deploy is filtered out provision drops too — a disk build has nothing
+new to pull anyway; replay provision from the pipeline that built the image if you need
+a disk for an already-published one).
+
+**Tune the allowlist to your project.** If your `Containerfile` `COPY`s other paths, or
+a `[hooks]` script lives outside `sysroot/`, add those paths — anything in the build
+context that ends up in the image belongs in the list.
+
+- **GitLab** — a hidden `.image-rules` job holds the `rules:` (`changes:` on the
+  default-branch rule, no `changes:` on the tag rule), `!reference`d from both `.build`
+  and `deploy`.
+- **GitHub** — a cheap `changes` pre-job (`dorny/paths-filter`, on a plain runner)
+  outputs a boolean that `build` gates on with
+  `if: needs.changes.outputs.image == 'true' || startsWith(github.ref, 'refs/tags/')`.
+
 ## Requirements & troubleshooting
 
 - Both pipelines run bootcher **inside its container image**, which needs a

@@ -22,6 +22,10 @@
 #                per-commit GitHub Release to download and flash. No second container
 #                build; the disk is byte-for-byte what devices auto-update to.
 #
+# A `changes` pre-job path-filters the run: build/deploy fire only when an image input
+# changed (Containerfile, sysroot/, the manifests), so a docs-only push is a no-op. A
+# `v*` tag always builds. See that job for the allowlist to tune to your project.
+#
 # Why split the build per arch? A multi-arch `bootcher deploy` on a single runner would
 # build the foreign arch under qemu-user emulation — slow and occasionally fragile.
 # Building each arch on its own native runner is faster and more reliable. The members
@@ -82,12 +86,52 @@ on:
     tags: ["v*"]
 
 jobs:
+  # --- changes: did anything that affects the image actually change? --------------
+  # The build context is the whole project root, so this is an ALLOWLIST of the inputs
+  # that actually change the built image: the Containerfile, the sysroot/ overlay baked
+  # into it, and the manifests (a registry/target/hook change there re-images too). The
+  # `build` job gates on this output; deploy + provision inherit the gate via `needs`
+  # (a skipped dependency skips the dependent). So a docs/README-only push no longer
+  # spins up the whole multi-arch build → deploy.
+  #
+  # A cheap pre-job on a plain runner (no container): checkout + a path filter that
+  # diffs the push. dorny/paths-filter handles the awkward cases (first commit on a
+  # branch, force-push) that a hand-rolled `git diff` gets wrong. Tags bypass it
+  # entirely in `build.if` below — a `v*` tag is a deliberate release and always builds.
+  #
+  # Adjust the `image:` list to YOUR project: if the Containerfile `COPY`s other paths,
+  # or a hook script lives outside sysroot/, add them — anything in the build context
+  # that ends up in the image belongs here. The workflow file itself is included so a
+  # pipeline edit re-runs it.
+  changes:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      image: ${{ steps.filter.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            image:
+              - Containerfile
+              - sysroot/**
+              - bootcher.toml
+              - bootcher.ci.toml
+              - .github/workflows/bootcher.yml
+
   # --- build: one container per arch, on a native-arch runner ---------------------
   # `build --target <arch>` builds only that arch and stops at the per-arch member tag
   # localhost/<name>:latest-<arch> (no multi-arch list — `deploy` assembles that). The
   # member is uploaded as a run artifact `deploy` downloads. No registry credentials
   # needed here — only `deploy` pushes.
   build:
+    # Gate on the change filter (see the `changes` job); a `v*` tag always builds.
+    # deploy/provision need this job, so a skip here cascades and skips them too.
+    needs: [changes]
+    if: needs.changes.outputs.image == 'true' || startsWith(github.ref, 'refs/tags/')
     strategy:
       fail-fast: false
       matrix:
