@@ -19,16 +19,19 @@
 # mount). Tune the ceiling with the BOOTCHER_STORE_SIZE env var (`df -h` on the
 # runner). GitHub workflow YAML has no anchors, so the step is duplicated per job.
 #
-# Two jobs, two triggers:
+# Two jobs, one trigger (push):
 #   deploy    — on push to the default branch and on `v*` tags: `bootcher deploy`
 #               builds the container and pushes `<registry>/<name>:latest` to GHCR
 #               (the registry associated with this repo). Devices self-update.
-#   provision — on a manual "Run workflow": `bootcher provision --skip-build`
-#               reuses the image the deploy job already built and pushed (pulled
-#               back from GHCR), builds the disk image from it, and uploads `output/`
-#               as a downloadable artifact for you to flash/upload. No second
-#               container build, and the disk is byte-for-byte what devices
-#               auto-update to.
+#   provision — chained behind deploy (`needs: [deploy]`) on default-branch pushes:
+#               `bootcher provision --skip-build` reuses the image deploy just pushed
+#               (pulled back from GHCR), builds the disk image from it, and uploads
+#               `output/` as a downloadable artifact for you to flash/upload. No
+#               second container build, and — because it's in the same run as deploy —
+#               the disk is byte-for-byte *this push's* image, never a stale `:latest`.
+#               It's on-demand via a manual approval gate (a GitHub Environment with a
+#               required reviewer), not a separate "Run workflow", so it can depend on
+#               deploy. See the `provision:` job for the one-time Environment setup.
 #
 # bootcher.toml must point its registry at this repo's GHCR namespace:
 #
@@ -60,12 +63,10 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
-  workflow_dispatch: # manual "Run workflow" → builds a disk image artifact
 
 jobs:
   # Push an update to the registry. Container build + `podman push`.
   deploy:
-    if: github.event_name == 'push'
     runs-on: ubuntu-24.04 # build aarch64? use ubuntu-24.04-arm — same image tag
     permissions:
       contents: read
@@ -112,12 +113,26 @@ jobs:
         env:
           BOOTCHER_SIGN_PASSPHRASE: ${{ secrets.SIGN_PASSPHRASE }}
 
-  # Build a disk image to flash, reusing the image `deploy` already pushed rather
-  # than rebuilding it: `--skip-build` pulls `<registry>/<name>:latest` back from
-  # GHCR and the image-builder disk step (a nested privileged container) builds the
-  # disk from it.
+  # Build a disk image to flash, reusing the image `deploy` just pushed rather than
+  # rebuilding it: `--skip-build` pulls `<registry>/<name>:latest` back from GHCR and
+  # the image-builder disk step (a nested privileged container) builds the disk from
+  # it.
+  #
+  # `needs: [deploy]` chains it behind deploy *in the same run*, so it always builds
+  # from this push's fresh image, never a stale `:latest`. It's still on-demand: the
+  # `environment:` below is the manual gate — GitHub holds the job "Waiting" until you
+  # approve it in the run (no `workflow_dispatch`/"Run workflow" button needed). One
+  # consequence: every default-branch push leaves a pending provision approval; just
+  # approve it when you actually need a disk, or let it expire. Restricted to the
+  # default branch (not `v*` tags), mirroring the GitLab recipe.
+  #
+  # SETUP (once): Settings → Environments → New environment `provision` → enable
+  # "Required reviewers" and add yourself. Without a protection rule the job wouldn't
+  # pause — it would provision on every push.
   provision:
-    if: github.event_name == 'workflow_dispatch'
+    needs: [deploy]
+    if: github.ref == 'refs/heads/main'
+    environment: provision # required-reviewer protection = the manual approval gate
     runs-on: ubuntu-24.04
     permissions:
       contents: read

@@ -142,12 +142,15 @@ deploy:
 # `sudo`, which the base image doesn't ship — install it (root needs no password).
 provision:
   stage: provision
-  # Empty `needs` detaches this job from stage ordering: without it, `provision`
-  # (a later stage) couldn't start until the `deploy` stage finished, even though
-  # the two are independent — so you could never run a disk build without first
-  # running (and passing) deploy. With `needs: []` the manual job is available
-  # from the start of the pipeline.
-  needs: []
+  # Chain provision behind deploy so the disk is built from *this* pipeline's freshly
+  # pushed image, never a stale one. provision stays manual, but because
+  # `--skip-build` pulls `<registry>/<name>:latest` back from the registry, it must
+  # run *after* deploy has pushed it — otherwise a provision triggered while deploy is
+  # still building would grab the previous revision and bake an out-of-date device.
+  # `needs: ["deploy"]` makes the manual job playable only once deploy succeeds; on a
+  # default-branch pipeline deploy always runs (same rule), so this never blocks a
+  # legitimate provision, and a disk build has nothing to build from without it anyway.
+  needs: ["deploy"]
   rules:
     # Manual must live INSIDE the rule: a job-level `when: manual` is ignored once
     # `rules` is present (a matched rule with no `when` defaults to on_success), so

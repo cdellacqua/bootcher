@@ -8,16 +8,20 @@ project's lifecycle:
   for GitHub, the project Container Registry for GitLab). Runs automatically on the
   default branch and on tags; devices self-update from there.
 - **provision** — `bootcher provision --skip-build` builds the disk image and
-  publishes `output/` as a downloadable CI artifact for you to flash or upload.
-  Runs on demand (manual trigger), since you only need a fresh disk when enrolling
-  a new device. `--skip-build` **reuses the image `deploy` already pushed** — it
-  pulls `<registry>/<name>:latest` back from the registry instead of rebuilding the
-  container — so the manual job skips the multi-minute container build and the
-  flashed disk is byte-for-byte what devices auto-update to (a rebuild from source
-  could drift). The job therefore logs in to the registry to pull it (read access is
-  enough). For a **public** registry, drop that login — the pull is anonymous — and
-  separately pass `--anonymous` to `bootcher provision` so it bakes no pull
-  credential into the disk either (the device pulls updates anonymously too).
+  publishes `output/` as a downloadable CI artifact for you to flash or upload. Runs
+  on demand, since you only need a fresh disk when enrolling a new device.
+  `--skip-build` **reuses the image `deploy` pushed** — it pulls
+  `<registry>/<name>:latest` back from the registry instead of rebuilding the
+  container — so the job skips the multi-minute container build and the flashed disk
+  is byte-for-byte what devices auto-update to (a rebuild from source could drift).
+  To guarantee it reuses *this commit's* image rather than a stale `:latest`,
+  provision is **chained behind deploy in the same run** (`needs`), gated manually so
+  it only fires when you want a disk: on GitLab a `when: manual` play button, on
+  GitHub a job `environment` with a required reviewer (a one-time Environment setup —
+  see the `provision:` job in the workflow file). The job logs in to the registry to pull
+  (read access is enough); for a **public** registry, drop that login — the pull is
+  anonymous — and separately pass `--anonymous` to `bootcher provision` so it bakes
+  no pull credential into the disk either (the device pulls updates anonymously too).
 
 | Platform | File | Copy it to |
 |---|---|---|
