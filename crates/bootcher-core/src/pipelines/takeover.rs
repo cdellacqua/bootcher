@@ -37,7 +37,7 @@ pub fn run(
 		);
 	}
 	let mut b = progress::Scope::root("takeover", Some(2));
-	jobs::build::run(manifest, &mut b.child("build"))?;
+	jobs::build::run(manifest, true, &mut b.child("build"))?;
 	jobs::takeover::run(manifest, login, provisioning, ssh_key, &mut b.child("takeover"))
 }
 

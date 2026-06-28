@@ -15,21 +15,35 @@ use anyhow::Result;
 ///
 /// `skip_build` (`--skip-build`) pushes the already-built container, skipping the
 /// container build — the push/upgrade phase alone — for shipping an image an
-/// earlier `build` produced or iterating on the rollout step.
+/// earlier `build` produced or iterating on the rollout step. It (re)assembles the
+/// local manifest list from the per-arch members in local storage first, so it works
+/// both same-runner (after `bootcher build`) and in a split CI pipeline where each
+/// arch was built on its own runner by `build --target <arch>` and `podman load`ed
+/// here from a job artifact — the deploy job being the only one that needs registry
+/// push credentials and the signing key.
 ///
 /// # Errors
 ///
 /// Returns an error if the build or upgrade phase fails.
 pub fn run(manifest: &Manifest, skip_bootc_upgrade: bool, skip_build: bool) -> Result<()> {
 	if skip_build {
-		return jobs::upgrade::run(
-			manifest,
-			skip_bootc_upgrade,
-			&mut progress::Scope::standalone(),
-		);
+		let mut job = progress::Scope::standalone();
+		// `upgrade` pushes the local manifest list but doesn't assemble it (the build
+		// phase normally does). With `--skip-build` there was no build phase, so
+		// (re)assemble it here from the per-arch members already in local storage —
+		// whether a prior same-runner `bootcher build` left them, or the CI
+		// `podman load`ed them from parallel `build --target <arch>` jobs. Idempotent
+		// (rm + recreate), so the same-runner case is unaffected; this is what lets a
+		// split build/deploy CI pipeline publish without this job building anything.
+		jobs::build::manifest_list(
+			&manifest.images(),
+			&manifest.local_list_ref(),
+			&mut job.child("manifest list"),
+		)?;
+		return jobs::upgrade::run(manifest, skip_bootc_upgrade, &mut job);
 	}
 	let mut b = progress::Scope::root("deploy", Some(2));
-	jobs::build::run(manifest, &mut b.child("build"))?;
+	jobs::build::run(manifest, true, &mut b.child("build"))?;
 	jobs::upgrade::run(manifest, skip_bootc_upgrade, &mut b.child("upgrade"))
 }
 

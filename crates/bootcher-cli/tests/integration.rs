@@ -213,6 +213,21 @@ fn build_outside_a_project_points_at_init() {
 }
 
 #[test]
+fn build_target_not_in_manifest_errors() {
+	// `build --target <arch>` is validated against `[targets]` before any podman work:
+	// an arch the project doesn't build fails fast with a clear pointer at the arches
+	// it does. Host-agnostic — pin the manifest to x86_64-only and ask for aarch64.
+	let (tmp, proj) = project("demo");
+	let manifest = read(&proj, "bootcher.toml").replace("aarch64", "x86_64");
+	fs::write(proj.join("bootcher.toml"), manifest).unwrap();
+	bootcher_in(tmp.path(), &proj)
+		.args(["build", "--target", "aarch64"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("isn't a target of this project"));
+}
+
+#[test]
 fn manifest_flag_loads_an_alternate_file() {
 	// `--manifest <path>` redirects which file is parsed, leaving the default
 	// `bootcher.toml` untouched. Prove it by writing a sibling manifest with a

@@ -115,7 +115,12 @@ The two axes are independent. **Architecture** is the container/registry axis: `
 
 If `[targets]` is omitted, it defaults to the host architecture mapped to a single `qcow2` (falling back to `x86_64` on unrecognised hosts).
 
-`provision` can build a subset of this matrix without editing the manifest: `--target <arch>` restricts the run to one architecture, and `--disk <type>` (repeatable, requires `--target`) further restricts it to specific disk types of that arch — e.g. one provision job per arch on a per-arch CI runner. Each must name an arch / type the manifest actually lists.
+`build` and `provision` can build a subset of this matrix without editing the manifest, so a CI pipeline can fan the arches out across native runners instead of cross-building under emulation:
+
+- `provision --target <arch>` restricts the run to one architecture, and `--disk <type>` (repeatable, requires `--target`) further restricts it to specific disk types of that arch — e.g. one provision job per arch on a per-arch CI runner.
+- `build --target <arch>` builds just that arch's container and stops at the per-arch `localhost/<name>:latest-<arch>` member, **without** assembling the multi-arch `:latest` list. That's the producer half of a split deploy: build each arch on its own runner in parallel, transfer the members (`podman save`/`load`), then one `deploy --skip-build` (re)assembles the list from every arch's member and pushes it — the only job that needs registry push credentials and the signing key.
+
+Either way the value must name an arch / type the manifest actually lists.
 
 Accepted type values:
 

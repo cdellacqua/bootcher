@@ -36,7 +36,7 @@ pub fn run(manifest: &Manifest, config: Option<&str>, skip_build: bool) -> Resul
 	if skip_build {
 		jobs::build::ensure_local(manifest, &mut b.child("fetch image"))?;
 	} else {
-		jobs::build::run(manifest, &mut b.child("build"))?;
+		jobs::build::run(manifest, true, &mut b.child("build"))?;
 	}
 	jobs::disk::run(manifest, config, &mut b.child("disk"))
 }

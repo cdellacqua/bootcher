@@ -110,7 +110,17 @@ enum Cmd {
 		skip_build: bool,
 	},
 	/// Build the bootc container image.
-	Build,
+	Build {
+		/// Restrict the build to a single target architecture from `[targets]`
+		/// (`aarch64` or `x86_64`), instead of every arch the project lists. The build
+		/// stops at the per-arch `localhost/<name>:latest-<arch>` member and does *not*
+		/// assemble the multi-arch `:latest` list — so a CI pipeline can build each arch
+		/// on its own native runner (in parallel), transfer the members (`podman
+		/// save`/`load`), and have one `deploy --skip-build` assemble + push the list
+		/// from them. Must name an arch the manifest builds.
+		#[arg(long = "target")]
+		target: Option<Arch>,
+	},
 	/// Convert live, SSH-reachable hosts (stock Ubuntu/Debian/Rocky on a VPS) into
 	/// bootc systems **in place** with `bootc install to-existing-root`: build + a
 	/// destructive per-host rollout over the `[deploy] remotes` SSH channel. The
@@ -300,12 +310,14 @@ fn run() -> Result<()> {
 			pipelines::deploy::preflight(&manifest, skip_bootc_upgrade, skip_build)?;
 			pipelines::deploy::run(&manifest, skip_bootc_upgrade, skip_build)
 		}
-		Cmd::Build => {
-			let manifest = Manifest::load(manifest_path)?;
+		Cmd::Build { target } => {
+			// `--target` narrows `[targets]` to one arch; with it set, the build stops at
+			// the per-arch member and skips the manifest list (the producer half of a
+			// split CI pipeline). A bare `build` keeps assembling `localhost/<name>:latest`
+			// like the pipelines do.
+			let manifest = Manifest::load(manifest_path)?.select_targets(target, &[])?;
 			jobs::build::preflight(&manifest)?;
-			// `build::run` assembles the multi-arch manifest list as its final step, so a
-			// bare `build` leaves a usable `localhost/<name>:latest` like the pipelines do.
-			jobs::build::run(&manifest, &mut Scope::standalone())
+			jobs::build::run(&manifest, target.is_none(), &mut Scope::standalone())
 		}
 		Cmd::Takeover { ssh_key, login, skip_pull_check, anonymous, yes, skip_build } => {
 			let manifest = Manifest::load(manifest_path)?;

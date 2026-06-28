@@ -32,10 +32,19 @@ pub fn preflight(manifest: &Manifest) -> Result<()> {
 
 /// Build every target arch's bootc container, in parallel, into local rootless
 /// storage — the postcondition `image`/`deploy`/`upgrade` rely on (each member
-/// resident under [`ImageRef::tag`]) — then assemble them into the local suffix-free
-/// manifest list (`localhost/<name>:latest`) as the final step, so every build
-/// leaves one usable multi-arch ref. The shared front door for the standalone
-/// `build`, for `provision` (build then disk), and for `deploy` (build then push).
+/// resident under [`ImageRef::tag`]) — then, when `assemble_list`, assemble them
+/// into the local suffix-free manifest list (`localhost/<name>:latest`) as the final
+/// step, so the build leaves one usable multi-arch ref. The shared front door for the
+/// standalone `build`, for `provision` (build then disk), and for `deploy` (build
+/// then push).
+///
+/// `assemble_list` is `false` only for a *targeted* standalone build (`build
+/// --target <arch>`): it stops at the per-arch `localhost/<name>:latest-<arch>`
+/// member and skips the list, since a single-arch list would masquerade as the whole
+/// image. That's the producer half of a split CI pipeline — each arch built (and
+/// transferred) on its own runner, then a later `deploy --skip-build` assembles the
+/// list from every arch's member. The pipelines (`provision`/`deploy`/`takeover`)
+/// always pass `true`, so their behaviour is unchanged.
 ///
 /// Each arch runs on its own worker (the crate's fleet fan-out): it selects
 /// *its* builder (the `[builder.<arch>] build` spec — `local`, a `vm`, or a
@@ -61,15 +70,23 @@ pub fn preflight(manifest: &Manifest) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if any arch's build fails, a hook fails, or a signal interrupts.
-pub fn run(manifest: &Manifest, job: &mut Scope) -> Result<()> {
+pub fn run(manifest: &Manifest, assemble_list: bool, job: &mut Scope) -> Result<()> {
 	let images = manifest.images();
 	let hooks = manifest.hooks();
+	// The hook's `image_ref` names what the build leaves behind: the assembled list
+	// normally, or the lone member tag for a targeted (list-less) build, so a
+	// `build.post` hook always points at a ref that exists.
+	let image_ref = if assemble_list {
+		manifest.local_list_ref()
+	} else {
+		images.first().map_or_else(|| manifest.local_list_ref(), ImageRef::tag)
+	};
 	let mut meta = crate::hooks::HookMetadata {
 		phase: crate::hooks::Phase::Build,
 		stage: crate::hooks::Stage::Pre,
 		image_name: manifest.general.name.clone(),
 		arches: images.iter().map(|i| i.arch).collect(),
-		image_ref: manifest.local_list_ref(),
+		image_ref,
 		output_dir: None,
 		targets: None,
 		remotes: None,
@@ -98,8 +115,11 @@ pub fn run(manifest: &Manifest, job: &mut Scope) -> Result<()> {
 	// phase) leaves one usable `localhost/<name>:latest` — what `deploy`/`takeover`
 	// push or serve and a device resolves its own arch from. Local podman metadata
 	// only (no layer copy), so it's negligible beside the container build; the push
-	// paths still reassemble it at push time to stay self-contained.
-	manifest_list(&images, &manifest.local_list_ref(), &mut job.child("manifest list"))?;
+	// paths still reassemble it at push time to stay self-contained. A targeted
+	// `build --target` skips it (see `assemble_list`), stopping at the member tag.
+	if assemble_list {
+		manifest_list(&images, &manifest.local_list_ref(), &mut job.child("manifest list"))?;
+	}
 	// `build.post` runs as the build's very last step — after the manifest list is
 	// assembled — so `image_ref` (the local list ref) names a ref that actually exists
 	// by the time the hook can act on it.
