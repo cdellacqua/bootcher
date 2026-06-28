@@ -43,15 +43,5 @@ RUN dnf install -y --setopt=install_weak_deps=False \
       systemd-libs \
  && dnf clean all
 
-# containers-common (pulled in by podman) ships /usr/share/containers/storage.conf
-# with `mountopt = "nodev,metacopy=on"`. metacopy=on is hostile to the nested
-# image-store builds bootcher drives inside this container (the `:O` overlay-on-
-# overlay mount in builder/local.rs). Strip it in place: this preserves every other shipped
-# default (additionalimagestores, imagestore, …) — which a minimal /etc override
-# would silently drop, since storage.conf replaces rather than merges. A drop-in
-# under storage.conf.d is *not* honoured for overlay.mountopt, so sed is the fix.
-# No-op if upstream ever drops metacopy on its own.
-RUN sed -i 's/,metacopy=on//' /usr/share/containers/storage.conf
-
 COPY --from=builder /src/target/release/bootcher /usr/bin/bootcher
 ENTRYPOINT ["/usr/bin/bootcher"]
