@@ -43,7 +43,7 @@ Then `bootcher disk` (or `bootcher provision`) builds the image and runs the hoo
 
 ## Requirements
 
-- `jq`, `curl`, `unzip`
+- `jq`, `curl`, `unzip`, `python3`, `sfdisk`
 - `sudo` (the hook loop-mounts the raw image's ESP; bootcher hands the hook the
   terminal, so a `sudo` prompt works)
 
