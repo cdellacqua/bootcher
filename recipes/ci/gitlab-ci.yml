@@ -1,35 +1,56 @@
-# bootcher CI for GitLab.
+# bootcher CI for GitLab — multi-arch (x86_64 + aarch64).
 #
-# Copy this to your bootcher project as `.gitlab-ci.yml` at the repo root.
+# Copy this to your bootcher project as `.gitlab-ci.yml` at the repo root. It builds
+# both architectures on native runners (no cross-arch emulation), assembles them into
+# one multi-arch image, and can produce a flashable disk per arch — in three stages:
 #
-# Two jobs:
-#   deploy    — on the default branch and on tags: `bootcher deploy` builds the
-#               container and pushes `<registry>/<name>:latest` to this project's
-#               Container Registry. Devices self-update.
-#   provision — a manual job: `bootcher deploy`'s sibling for first install —
-#               `bootcher provision --skip-build` reuses the image the deploy job
-#               already built and pushed (pulled back from the registry), builds the
-#               disk image from it, and saves `output/` as a job artifact for you to
-#               download and flash. No second container build, and the disk is
-#               byte-for-byte what devices auto-update to.
+#   build      — one job per arch (build:x86_64, build:aarch64), in parallel, each on a
+#                native-arch runner. `bootcher build --target <arch>` builds just that
+#                arch's container and stops at the per-arch member tag
+#                localhost/<name>:latest-<arch> (NO multi-arch list — `deploy` makes
+#                that). The job `podman save`s the member as a compressed job artifact.
+#                These jobs need NO registry credentials.
+#   deploy     — one job. It `podman load`s both per-arch members the build jobs
+#                produced, then `bootcher deploy --skip-build` (re)assembles the
+#                multi-arch manifest list from them and pushes <registry>/<name>:latest
+#                (+ an immutable CalVer tag) to this project's Container Registry. The
+#                ONLY job that needs registry push credentials (and the signing key, if
+#                enabled). Devices self-update.
+#   provision  — manual, one job per arch (provision:x86_64 → qcow2,
+#                provision:aarch64 → raw), each on a native-arch runner. `bootcher
+#                provision --target <arch> --disk <type> --skip-build` pulls that arch's
+#                member back from the registry `deploy` just pushed and builds the disk
+#                natively, then streams output/ to the generic Package Registry to
+#                download and flash. No second container build; the disk is
+#                byte-for-byte what devices auto-update to.
 #
-# Runs inside the official bootcher image (it bundles podman + qemu). Both jobs
-# need a PRIVILEGED job container: podman builds containers, and the image-builder
-# disk step launches a privileged container. GitLab.com's hosted `saas-linux-*`
-# runners already run in privileged mode (each job gets an isolated, ephemeral VM),
-# so both jobs work as-is — no runner setup needed. A self-managed runner
-# (`privileged = true`, or a shell runner on a podman host) is only needed if you
-# want to narrow the privilege grant or route a build step to a `vm`/`/dev/kvm`.
+# Why split the build per arch? A multi-arch `bootcher deploy` on a single runner would
+# build the foreign arch under qemu-user emulation — slow and occasionally fragile.
+# Building each arch on its own native runner is faster and more reliable. The members
+# are handed between jobs as artifacts: the CI owns the `podman save`/`load`, so
+# bootcher's own `build`/`deploy` on a dev box are untouched.
 #
-# bootcher.toml must point its registry at this project's registry:
+# bootcher.toml must (1) point its registry at this project's registry and (2) list
+# BOTH arches in [targets], mapped to the disk type each should produce:
 #
 #   [deploy]
 #   registry = "registry.gitlab.com/<group>/<project>"   # == $CI_REGISTRY_IMAGE
 #
-# Both jobs run with `--manifest bootcher.ci.toml` — a committed override that
+#   [targets]
+#   x86_64  = "qcow2"   # a VM image
+#   aarch64 = "raw"     # a raw image for an edge device
+#
+# Every job runs with `--manifest bootcher.ci.toml` — a committed override that
 # `extend`s bootcher.toml and forces podman onto the host network, sidestepping
 # nested-podman nftables failures in the privileged job container. Copy
 # recipes/ci/bootcher.ci.toml to your repo root beside bootcher.toml.
+#
+# Runners: the aarch64 jobs need an arm64 runner — on GitLab.com a hosted
+# `saas-linux-*-arm64` (tagged below; the small size is on all tiers). All these jobs
+# need a PRIVILEGED job container (podman builds containers and loop-mounts the store,
+# and the image-builder disk step launches a privileged container); GitLab.com's hosted
+# `saas-linux-*` runners already are, so this works as-is. A self-managed runner needs
+# `privileged = true` (or a shell runner on a podman host).
 #
 # CI/CD variables (Settings → CI/CD → Variables; mask them):
 #   ADMIN_SSH_PUBKEY         (provision) the admin SSH PUBLIC key (the `.pub` line),
@@ -82,7 +103,8 @@ default:
     # STORAGE_DRIVER=vfs (a full copy per layer → ENOSPC on a chromium build),
     # ext4+overlay stores only deltas, so it fits the same disk. Needs the
     # privileged job container (loop mount); the runner VM is ephemeral, so there's
-    # nothing to tear down.
+    # nothing to tear down. It also gives the deploy/provision jobs headroom to hold
+    # the loaded/pulled per-arch members.
     #
     # Self-managed shell/host runner whose store is already on a real fs? The guard
     # detects the non-overlay case and skips itself, so this is safe to leave in.
@@ -107,12 +129,57 @@ default:
       # and the rpmdb coherence bug is back.
       podman info --format 'podman store: {{.Store.GraphDriverName}} @ {{.Store.GraphRoot}}'
 
-stages: [deploy, provision]
+stages: [build, deploy, provision]
 
-# Push an update to the registry. Container build + `podman push`; no disk step,
-# so no sudo needed here.
+# --- build: one container per arch, on a native-arch runner -----------------------
+# `build --target <arch>` builds only that arch and stops at the per-arch member tag
+# localhost/<name>:latest-<arch> (no multi-arch list — `deploy` assembles that). The
+# member is saved as a compressed job artifact `deploy` loads. No registry credentials
+# needed here — only `deploy` pushes.
+.build:
+  stage: build
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG
+  script:
+    - bootcher --manifest bootcher.ci.toml build --target "$ARCH"
+    # The build just produced exactly one image tagged `:latest-<arch>`. Save it; the
+    # repo:tag is restored on `podman load`, so `deploy` finds the member by name. zstd
+    # keeps the artifact small.
+    - |
+      img="$(podman images --format '{{.Repository}}:{{.Tag}}' | grep ":latest-${ARCH}\$" | head -n1)"
+      test -n "$img" || { echo "no built image tagged :latest-${ARCH}"; exit 1; }
+      podman save "$img" | zstd -T0 -10 -q -o "image-${ARCH}.tar.zst"
+  artifacts:
+    # `deploy` pulls these via `needs:`. NOTE: GitLab.com caps job artifacts at 1 GB —
+    # a heavy image (chromium-scale) may exceed that even zstd'd. If so, stream it to
+    # the generic Package Registry instead (the same pattern the provision job uses for
+    # disks, allowing 5 GB/file) and download it in `deploy`.
+    paths: ["image-${ARCH}.tar.zst"]
+    expire_in: 1 day
+
+build:x86_64:
+  extends: .build
+  variables:
+    ARCH: x86_64
+
+build:aarch64:
+  extends: .build
+  variables:
+    ARCH: aarch64
+  # aarch64 builds on a native arm64 runner (this recipe avoids cross-arch emulation).
+  # GitLab.com hosted arm64 runner; the small size is available on all tiers.
+  tags: [saas-linux-small-arm64]
+
+# --- deploy: assemble the multi-arch image from the members and push --------------
+# Loads both per-arch members the build jobs saved, then `deploy --skip-build`
+# (re)assembles the multi-arch manifest list from them and pushes
+# <registry>/<name>:latest (+ a CalVer tag). No container build, no disk step — the
+# only job that needs registry push credentials (and the signing key, if enabled).
 deploy:
   stage: deploy
+  # Pull in both build jobs' artifacts (the per-arch member tarballs) and gate on them.
+  needs: ["build:x86_64", "build:aarch64"]
   rules:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
     - if: $CI_COMMIT_TAG
@@ -123,6 +190,9 @@ deploy:
   #   BOOTCHER_SIGN_PASSPHRASE: ""
   script:
     - echo "$CI_REGISTRY_PASSWORD" | podman login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
+    # Load every per-arch member the build jobs produced (artifacts downloaded via
+    # `needs:`), restoring each localhost/<name>:latest-<arch> tag into local storage.
+    - for f in image-*.tar.zst; do zstd -dc "$f" | podman load; done
     # Signing? The cosign key `[deploy] registry.key` points at is git-ignored, so fetch
     # it from GitLab Secure Files (uploaded as cosign.key) before deploy signs the push.
     # The installer downloads every secure file into ./.secure_files/; copy the key to
@@ -131,70 +201,63 @@ deploy:
     # curl with `which curl`), so no dependency install is needed here.
     # - curl --silent "https://gitlab.com/gitlab-org/incubation-engineering/mobile-devops/download-secure-files/-/raw/main/installer" | bash
     # - install -m 600 .secure_files/cosign.key cosign.key
-    # Skipping the per-device `bootc upgrade` keeps the admin SSH key out of CI and
-    # doesn't assume the runner can reach the fleet — devices pick the update up on
-    # their auto-update timer. Drop the flag (and add the key) to roll immediately.
-    - bootcher --manifest bootcher.ci.toml deploy --skip-bootc-upgrade
+    # `--skip-build` (re)assembles the multi-arch list from the loaded members and pushes
+    # it — no container build. `--skip-bootc-upgrade` leaves the rollout to each device's
+    # auto-update timer (keeps the admin SSH key out of CI and doesn't assume the runner
+    # can reach the fleet). Drop the flag (and wire an SSH key) to roll immediately.
+    - bootcher --manifest bootcher.ci.toml deploy --skip-build --skip-bootc-upgrade
 
-# Build a disk image to flash, reusing the image `deploy` already pushed rather than
-# rebuilding it: `--skip-build` pulls `<registry>/<name>:latest` back into local
-# storage and builds the disk from it. The image-builder disk step shells out to
-# `sudo`, which the base image doesn't ship — install it (root needs no password).
-provision:
+# --- provision: build a flashable disk per arch, natively -------------------------
+# Manual. `provision --target <arch> --disk <type> --skip-build` pulls that arch's
+# member back from the registry `deploy` just pushed and builds the disk natively (no
+# emulation), then streams output/ to the generic Package Registry to download + flash.
+.provision:
   stage: provision
-  # Chain provision behind deploy so the disk is built from *this* pipeline's freshly
-  # pushed image, never a stale one. provision stays manual, but because
-  # `--skip-build` pulls `<registry>/<name>:latest` back from the registry, it must
-  # run *after* deploy has pushed it — otherwise a provision triggered while deploy is
-  # still building would grab the previous revision and bake an out-of-date device.
-  # `needs: ["deploy"]` makes the manual job playable only once deploy succeeds; on a
-  # default-branch pipeline deploy always runs (same rule), so this never blocks a
-  # legitimate provision, and a disk build has nothing to build from without it anyway.
+  # Chain behind deploy so the disk is built from *this* pipeline's freshly pushed
+  # image, never a stale one: `--skip-build` pulls <registry>/<name>:latest, which must
+  # exist first. `needs: ["deploy"]` makes the manual job playable only once deploy
+  # succeeds; on a default-branch pipeline deploy always runs (same rule), so this
+  # never blocks a legitimate provision, and a disk build has nothing to pull without it.
   needs: ["deploy"]
   rules:
     # Manual must live INSIDE the rule: a job-level `when: manual` is ignored once
-    # `rules` is present (a matched rule with no `when` defaults to on_success), so
-    # it would otherwise run automatically. `allow_failure: true` keeps this optional
-    # job from blocking the pipeline — start it from the UI when you need a disk.
+    # `rules` is present (a matched rule with no `when` defaults to on_success), so it
+    # would otherwise run automatically. `allow_failure: true` keeps this optional job
+    # from blocking the pipeline — start it from the UI when you need a disk.
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: manual
       allow_failure: true
   variables:
-    # Where the finished disk lands in the generic Package Registry, versioned by
-    # commit so every provision is an immutable, retrievable build. A bootc raw disk
-    # is a large sparse file that won't fit a job artifact (GitLab.com caps those at
-    # 1 GB); tar+zstd crushes its unallocated zeros to a fraction of that, and the
-    # Package Registry allows 5 GB/file.
+    # Generic Package Registry coordinates: versioned by commit so every provision is an
+    # immutable, retrievable build. A bootc disk is a large sparse file that won't fit a
+    # job artifact (GitLab.com caps those at 1 GB); tar+zstd crushes its unallocated
+    # zeros, and the Package Registry allows 5 GB/file.
     PKG_NAME: disk
-    PKG_FILE: bootcher-output.tar.zst
   script:
     # No dependency install: the bootcher image bundles everything these steps need —
     # sudo (image-builder disk step), tar + zstd (pack/compress the disk), curl (upload).
-    # `--skip-build` pulls the deploy-built image back from the registry, so this job
-    # needs read access to it. The job token is read+write on this project's registry
-    # and lives only for the pipeline — fine for a pull. Public registry? Drop this
-    # login (the pull is anonymous) and add `--anonymous` below.
+    # `--skip-build` pulls the deploy-pushed image back, so this job needs read access.
+    # The job token is read+write on this project's registry and lives only for the
+    # pipeline — fine for a pull. Public registry? Drop this login (the pull is
+    # anonymous) and add `--anonymous` below.
     - echo "$CI_REGISTRY_PASSWORD" | podman login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
-    # provision reads only the `.pub` sibling of `--ssh-key`, so the public key is all
-    # CI needs (`admin_key` itself never has to exist). Keeping the private key out of
-    # CI is safe: these jobs never SSH to a device.
+    # provision reads only the `.pub` sibling of `--ssh-key`, so the public key is all CI
+    # needs (`admin_key` itself never has to exist). Keeping the private key out of CI is
+    # safe: these jobs never SSH to a device.
     - printf '%s\n' "$ADMIN_SSH_PUBKEY" > admin_key.pub
+    # Build just this runner's arch + disk type. `--skip-build` pulls that arch's member
+    # out of <registry>/<name>:latest (deploy pushed it) and builds the disk natively.
     # The disk bakes the admin pubkey and, in registry mode, the pull token
-    # ($BOOTCHER_PULL_USER/$BOOTCHER_PULL_TOKEN, read from the environment). For a
-    # public registry, append `--anonymous` instead. `--skip-build` reuses the image
-    # `deploy` pushed (pulled back above) instead of rebuilding the container.
-    - bootcher --manifest bootcher.ci.toml provision --ssh-key admin_key --skip-build
-    # Pack the whole output/ tree (it may hold several arch/format disks) into one
-    # zstd tarball. --sparse keeps the raw disk's unallocated zeros from being read
-    # out; -T0 uses every core; -10 is a good size/speed balance on a small runner.
-    - tar --sparse -cf - output | zstd -10 -T0 -q -o "$PKG_FILE"
-    # Stream the whole output/ tree (it may hold several arch/format disks) straight to
-    # the generic Package Registry: tar+zstd into curl's stdin so the compressed tarball
-    # never lands on the runner's disk — it was the extra space-occupying file the disk
-    # couldn't spare. --sparse keeps the raw disk's unallocated zeros from being read out;
-    # -T0 uses every core; -10 is a good size/speed balance on a small runner. JOB-TOKEN
-    # authenticates as this pipeline; the (chunked) PUT both creates the package version
-    # and stores the streamed body, versioned by commit.
+    # ($BOOTCHER_PULL_USER/$BOOTCHER_PULL_TOKEN, read from the environment). For a public
+    # registry, append `--anonymous` instead.
+    - bootcher --manifest bootcher.ci.toml provision --ssh-key admin_key --target "$ARCH" --disk "$DISK" --skip-build
+    # Stream output/ straight to the generic Package Registry: tar+zstd into curl's stdin
+    # so the compressed tarball never lands on the runner's disk — it was the extra
+    # space-occupying file the disk couldn't spare. --sparse keeps the raw disk's
+    # unallocated zeros from being read out; -T0 uses every core; -10 is a good
+    # size/speed balance. JOB-TOKEN authenticates as this pipeline; the (chunked) PUT
+    # both creates the package version and stores the streamed body, versioned by commit
+    # and arch.
     #
     # Trade-offs of streaming vs. writing the file first:
     #   - No `--retry`: curl can't rewind a pipe, so a flaky upload fails the job — just
@@ -204,11 +267,12 @@ provision:
     #     "successful" upload. On a strict-POSIX sh without pipefail we fall through
     #     without it; --fail-with-body still catches a server-side rejection.
     #   - Needs the registry to accept a chunked PUT (no Content-Length); GitLab's
-    #     generic registry does. If a future GitLab rejects it, fall back to writing
-    #     "$PKG_FILE" and uploading with --upload-file "$PKG_FILE" --retry 3.
+    #     generic registry does. If a future GitLab rejects it, fall back to writing the
+    #     file and uploading with --upload-file "$file" --retry 3.
     - |
       if (set -o pipefail) 2>/dev/null; then set -o pipefail; fi
-      url="$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/$PKG_NAME/$CI_COMMIT_SHORT_SHA/$PKG_FILE"
+      file="bootcher-output-${ARCH}.tar.zst"
+      url="$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/$PKG_NAME/$CI_COMMIT_SHORT_SHA/$file"
       tar --sparse -cf - output | zstd -10 -T0 -q | \
         curl --fail-with-body \
           --header "JOB-TOKEN: $CI_JOB_TOKEN" \
@@ -216,3 +280,17 @@ provision:
       echo
       echo "disk published: $url"
       echo "download + unpack with: curl --header \"PRIVATE-TOKEN: <token>\" \"$url\" | zstd -d | tar -xf -"
+
+provision:x86_64:
+  extends: .provision
+  variables:
+    ARCH: x86_64
+    DISK: qcow2
+
+provision:aarch64:
+  extends: .provision
+  variables:
+    ARCH: aarch64
+    DISK: raw
+  # Build the aarch64 raw disk on a native arm64 runner — no emulation.
+  tags: [saas-linux-small-arm64]

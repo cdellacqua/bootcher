@@ -1,31 +1,47 @@
 # Recipe: CI/CD for a bootcher project
 
-Pipeline templates that run bootcher in CI for the two outward-facing steps of a
-project's lifecycle:
+Multi-arch pipeline templates that run bootcher in CI — building **x86_64 and
+aarch64 on native runners** (no cross-arch emulation), in three stages:
 
-- **deploy** — `bootcher deploy` builds the container and pushes
-  `<registry>/<name>:latest` to the **registry associated with your repo** (GHCR
-  for GitHub, the project Container Registry for GitLab). Runs automatically on the
-  default branch and on tags; devices self-update from there.
-- **provision** — `bootcher provision --skip-build` builds the disk image and
-  publishes `output/` (packed as a single `tar`+`zstd` file) for you to download and
-  flash — to a **per-commit GitHub Release asset** on GitHub, or the project's
-  **generic Package Registry** on GitLab. Both sidestep the run-artifact size limits
-  (GitLab.com caps job artifacts at 1 GB; a sparse bootc disk easily exceeds that),
-  give a stable versioned download, and don't expire the way an artifact does. Runs
-  on demand, since you only need a fresh disk when enrolling a new device.
-  `--skip-build` **reuses the image `deploy` pushed** — it pulls
-  `<registry>/<name>:latest` back from the registry instead of rebuilding the
-  container — so the job skips the multi-minute container build and the flashed disk
-  is byte-for-byte what devices auto-update to (a rebuild from source could drift).
-  To guarantee it reuses *this commit's* image rather than a stale `:latest`,
-  provision is **chained behind deploy in the same run** (`needs`), gated manually so
-  it only fires when you want a disk: on GitLab a `when: manual` play button, on
-  GitHub a job `environment` with a required reviewer (a one-time Environment setup —
-  see the `provision:` job in the workflow file). The job logs in to the registry to pull
-  (read access is enough); for a **public** registry, drop that login — the pull is
-  anonymous — and separately pass `--anonymous` to `bootcher provision` so it bakes
-  no pull credential into the disk either (the device pulls updates anonymously too).
+- **build** — one job per arch, in parallel on a native-arch runner each. `bootcher
+  build --target <arch>` builds just that arch's container and stops at the per-arch
+  member tag `<name>:latest-<arch>` (no multi-arch list yet), which the job `podman
+  save`s and hands to **deploy** as an artifact (a run artifact on GitHub, a job
+  artifact on GitLab). These jobs need **no registry credentials**. Why split per
+  arch? A single-runner multi-arch build would emulate the foreign arch under
+  qemu-user — slow and occasionally fragile; native runners are faster and sounder.
+- **deploy** — `podman load`s both per-arch members and `bootcher deploy
+  --skip-build` **assembles the multi-arch manifest list from them** and pushes
+  `<registry>/<name>:latest` (+ an immutable CalVer tag) to the **registry associated
+  with your repo** (GHCR for GitHub, the project Container Registry for GitLab). The
+  **only** job that needs registry push credentials (and the signing key, if
+  enabled). Runs automatically on the default branch and on tags; devices self-update
+  from there.
+- **provision** — one job per arch (e.g. a qcow2 for x86_64, a raw for aarch64).
+  `bootcher provision --target <arch> --disk <type> --skip-build` builds the disk
+  natively and publishes `output/` (packed as a single `tar`+`zstd` file) for you to
+  download and flash — to a **per-commit GitHub Release asset** on GitHub, or the
+  project's **generic Package Registry** on GitLab. Both sidestep the run-artifact
+  size limits (GitLab.com caps job artifacts at 1 GB; a sparse bootc disk easily
+  exceeds that), give a stable versioned download, and don't expire the way an
+  artifact does. Runs on demand, since you only need a fresh disk when enrolling a new
+  device. `--skip-build` **reuses the image `deploy` pushed** — it pulls that arch's
+  member out of `<registry>/<name>:latest` instead of rebuilding the container — so
+  the job skips the multi-minute container build and the flashed disk is byte-for-byte
+  what devices auto-update to (a rebuild from source could drift). To guarantee it
+  reuses *this commit's* image rather than a stale `:latest`, provision is **chained
+  behind deploy in the same run** (`needs`), gated manually so it only fires when you
+  want a disk: on GitLab a `when: manual` play button, on GitHub a job `environment`
+  with a required reviewer (a one-time Environment setup — see the `provision:` job in
+  the workflow file). The job logs in to the registry to pull (read access is enough);
+  for a **public** registry, drop that login — the pull is anonymous — and separately
+  pass `--anonymous` to `bootcher provision` so it bakes no pull credential into the
+  disk either (the device pulls updates anonymously too).
+
+The CI owns the `podman save`/`load` that moves the per-arch members between jobs, so
+bootcher's own `build`/`deploy` on a dev box are unchanged. Single-arch project?
+Drop one arch from the matrix (GitHub) / delete the second `build:`/`provision:` job
+(GitLab), and list only that arch in `[targets]`.
 
 | Platform | File | Copy it to |
 |---|---|---|
@@ -58,6 +74,16 @@ registry = "registry.gitlab.com/<group>/<project>"
 CI authenticates separately with `podman login` (GHCR via `GITHUB_TOKEN`, GitLab
 via the job's `CI_REGISTRY_*`), so the URL above carries no credential.
 
+These templates are multi-arch, so `bootcher.toml` must also list **both** arches in
+`[targets]`, mapped to the disk type each should produce — the `build`/`provision`
+jobs scope to one arch with `--target`:
+
+```toml
+[targets]
+x86_64  = "qcow2"   # a VM image
+aarch64 = "raw"     # a raw image for an edge device
+```
+
 ## The `bootcher.ci.toml` override
 
 Both pipelines run with `--manifest bootcher.ci.toml`, a small committed override
@@ -76,11 +102,10 @@ image = { type = "local", podman_opts = ["--network=host"] }
 Inside a privileged CI container, rootless/nested podman's per-container networking
 (netavark + nftables) is a common source of opaque build failures. `--network=host`
 makes podman reuse the runner's network namespace instead of programming its own,
-sidestepping the nftables path entirely. It's set on **both** roles so it covers
-`deploy` (the container build) and `provision` (the container build *and* the
-image-builder disk step). Everything else — name, registry, `[targets]`, deploy
-targets, hooks — is inherited from `bootcher.toml`, so this file never drifts: edit
-your real config there, not here.
+sidestepping the nftables path entirely. It's set on **both** roles so it covers the
+`build` jobs (the container build) and `provision` (the image-builder disk step).
+Everything else — name, registry, `[targets]`, deploy targets, hooks — is inherited
+from `bootcher.toml`, so this file never drifts: edit your real config there, not here.
 
 Local runs (`bootcher deploy` / `provision` with no `--manifest`) are unaffected —
 they still use the plain `bootcher.toml`, where podman's default networking works
@@ -123,19 +148,28 @@ assume registry mode.)
 
 ## Architecture
 
-The templates build a single architecture matching the runner. The bootcher image
-is multi-arch, so the same tag runs on either — just pick the runner's arch: on
-GitHub, `runs-on: ubuntu-24.04` (x86_64) or `ubuntu-24.04-arm` (aarch64); on GitLab,
-tag the job for a hosted arm64 runner — `tags: [saas-linux-small-arm64]` (the small
-size is available on all tiers; medium/large are Premium/Ultimate only) — or leave
-it untagged for the default x86_64 runner. If
-`[targets]` lists one arch, run the job on a runner of that arch. For a
-**multi-arch** image, either run the build on a runner whose `[builder]` routes the
-foreign arch to a `vm`/remote, or split into a per-arch job matrix on native
-runners: keep every arch in one `[targets]` table and pass `provision --target
-<arch>` (optionally `--disk <type>`) so each job builds only its runner's arch from
-the shared manifest, instead of maintaining one manifest per arch. Emulated
-cross-arch image-builder runs are slow and fragile — prefer native runners.
+The templates build **both** arches, each on a native-arch runner, and assemble them
+into one multi-arch image — no cross-arch emulation. The arch fan-out is the runner
+each job lands on: on GitHub a matrix over `runs-on: ubuntu-24.04` (x86_64) and
+`ubuntu-24.04-arm` (aarch64); on GitLab a job per arch, the aarch64 one tagged for a
+hosted arm64 runner — `tags: [saas-linux-small-arm64]` (the small size is on all
+tiers; medium/large are Premium/Ultimate only) — the x86_64 one on the default runner.
+Each `build`/`provision` job scopes bootcher to its runner's arch with `--target`
+(and `provision` picks the disk type with `--disk`), all from the **one shared
+`bootcher.toml`** — no per-arch manifest.
+
+The split exists because building a foreign arch on a single runner means qemu-user
+emulation: slow and occasionally fragile. The per-arch members are handed between
+jobs via the CI's artifact store (`podman save`/`load`), so the registry only ever
+receives the final assembled `:latest`, and the build jobs need no registry
+credentials. (If you'd rather not fan out — e.g. you only have x86_64 runners — point
+the aarch64 `[builder]` at a `vm`/remote and build everything in one job; expect the
+emulation cost.)
+
+**Single-arch project?** List only that arch in `[targets]`, and drop the other arch:
+on GitHub remove it from the `build`/`provision` `matrix.include`; on GitLab delete
+the second `build:`/`provision:` job. `--target` then names your one arch (a build for
+an arch not in `[targets]` is a hard error).
 
 ## Requirements & troubleshooting
 
@@ -147,7 +181,7 @@ cross-arch image-builder runs are slow and fragile — prefer native runners.
     the supported path.
   - **GitLab**: the job container must be privileged. GitLab.com's hosted
     `saas-linux-*` runners already run in privileged mode (each job in an isolated,
-    ephemeral VM), so both jobs work as-is — no runner setup needed. A self-managed
+    ephemeral VM), so the jobs work as-is — no runner setup needed. A self-managed
     runner (`privileged = true`, or a shell-executor on a podman host) is only needed
     if you want to narrow the privilege grant or route a build step to a `vm`/`/dev/kvm`.
 - **`podman build` networking errors** (netavark/nftables, "failed to set up

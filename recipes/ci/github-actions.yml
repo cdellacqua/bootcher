@@ -1,46 +1,61 @@
-# bootcher CI for GitHub Actions.
+# bootcher CI for GitHub Actions — multi-arch (x86_64 + aarch64).
 #
-# Copy this to your bootcher project as `.github/workflows/bootcher.yml`.
+# Copy this to your bootcher project as `.github/workflows/bootcher.yml`. It builds
+# both architectures on native runners (no cross-arch emulation), assembles them into
+# one multi-arch image, and can produce a flashable disk per arch — in three jobs:
 #
-# Both jobs run inside the published bootcher image
-# (ghcr.io/cdellacqua/bootcher — multi-arch, bundles podman + qemu), so there's
-# nothing to install. It needs a privileged container for podman to build images;
-# GitHub-hosted runners allow that. Pin `:latest` to a released `:vX.Y.Z` for
-# reproducible builds.
+#   build      — a matrix over the two arches, in parallel, each on a native-arch
+#                runner (ubuntu-24.04 / ubuntu-24.04-arm). `bootcher build --target
+#                <arch>` builds just that arch's container and stops at the per-arch
+#                member tag localhost/<name>:latest-<arch> (NO multi-arch list —
+#                `deploy` makes that). The job `podman save`s the member and uploads it
+#                as a run artifact. These jobs need NO registry credentials.
+#   deploy     — downloads both per-arch members, `podman load`s them, then `bootcher
+#                deploy --skip-build` (re)assembles the multi-arch manifest list from
+#                them and pushes <registry>/<name>:latest (+ an immutable CalVer tag) to
+#                GHCR (this repo's registry). The ONLY job that needs `packages: write`
+#                (and the signing key, if enabled). Devices self-update.
+#   provision  — a matrix (x86_64 → qcow2, aarch64 → raw), each on a native-arch runner.
+#                `bootcher provision --target <arch> --disk <type> --skip-build` pulls
+#                that arch's member back from GHCR (deploy just pushed it) and builds the
+#                disk natively, then publishes output/ (tar+zstd) as an asset on a
+#                per-commit GitHub Release to download and flash. No second container
+#                build; the disk is byte-for-byte what devices auto-update to.
 #
-# Because each job runs bootcher *inside* a container, the job's root fs is
-# overlayfs, so rootful `podman build`'s store would fall back to fuse-overlayfs
-# (the kernel refuses overlay-on-overlay), whose userspace coherence breaks a
-# large `dnf install` — rpm "loses" base-provided sonames mid-transaction. The
-# first step of each job sidesteps it by relocating the podman store onto a
-# loopback ext4 image: a real fs, so podman does a single kernel overlay (no fuse,
-# and only deltas — unlike STORAGE_DRIVER=vfs, which ENOSPCs on a chromium build).
-# It self-skips on a non-overlay store, and needs the privileged container (loop
-# mount). Tune the ceiling with the BOOTCHER_STORE_SIZE env var (`df -h` on the
+# Why split the build per arch? A multi-arch `bootcher deploy` on a single runner would
+# build the foreign arch under qemu-user emulation — slow and occasionally fragile.
+# Building each arch on its own native runner is faster and more reliable. The members
+# are handed between jobs as run artifacts: the CI owns the `podman save`/`load`, so
+# bootcher's own `build`/`deploy` on a dev box are untouched.
+#
+# All jobs run inside the published bootcher image (ghcr.io/cdellacqua/bootcher —
+# multi-arch, bundles podman + qemu), so there's nothing to install; they need a
+# privileged container (podman builds images / loop-mounts the store, and the disk step
+# launches a nested image-builder container). GitHub-hosted runners allow `--privileged`;
+# no /dev/kvm, so the in-process `local` builder is the supported path. Pin `:latest` to
+# a released `:vX.Y.Z` for reproducible builds.
+#
+# Because each job runs bootcher inside a container, the job's root fs is overlayfs, so
+# rootful `podman build`'s store would fall back to fuse-overlayfs (the kernel refuses
+# overlay-on-overlay), whose userspace coherence breaks a large `dnf install` — rpm
+# "loses" base-provided sonames mid-transaction. The first step of each job sidesteps it
+# by relocating the podman store onto a loopback ext4 image: a real fs, so podman does a
+# single kernel overlay (no fuse, only deltas — unlike STORAGE_DRIVER=vfs, which ENOSPCs
+# on a chromium build). It self-skips on a non-overlay store and needs the privileged
+# container (loop mount). Tune the ceiling with BOOTCHER_STORE_SIZE (`df -h` on the
 # runner). GitHub workflow YAML has no anchors, so the step is duplicated per job.
 #
-# Two jobs, one trigger (push):
-#   deploy    — on push to the default branch and on `v*` tags: `bootcher deploy`
-#               builds the container and pushes `<registry>/<name>:latest` to GHCR
-#               (the registry associated with this repo). Devices self-update.
-#   provision — chained behind deploy (`needs: [deploy]`) on default-branch pushes:
-#               `bootcher provision --skip-build` reuses the image deploy just pushed
-#               (pulled back from GHCR), builds the disk image from it, and publishes
-#               `output/` (tar+zstd) as an asset on a per-commit GitHub Release for you
-#               to download and flash — a release asset (up to 2 GB) holds the disk
-#               where a run artifact would be slow and eat the storage quota. No second
-#               container build, and — because it's in the same run as deploy — the
-#               disk is byte-for-byte *this push's* image, never a stale `:latest`.
-#               It's on-demand via a manual approval gate (a GitHub Environment with a
-#               required reviewer), not a separate "Run workflow", so it can depend on
-#               deploy. See the `provision:` job for the one-time Environment setup.
-#
-# bootcher.toml must point its registry at this repo's GHCR namespace:
+# bootcher.toml must (1) point its registry at this repo's GHCR namespace and (2) list
+# BOTH arches in [targets], mapped to the disk type each should produce:
 #
 #   [deploy]
 #   registry = "ghcr.io/<owner>"        # lowercase; image is ghcr.io/<owner>/<name>
 #
-# Both jobs run with `--manifest bootcher.ci.toml` — a committed override that
+#   [targets]
+#   x86_64  = "qcow2"   # a VM image
+#   aarch64 = "raw"     # a raw image for an edge device
+#
+# Every job runs with `--manifest bootcher.ci.toml` — a committed override that
 # `extend`s bootcher.toml and forces podman onto the host network, sidestepping
 # nested-podman nftables failures in the privileged CI container. Copy
 # recipes/ci/bootcher.ci.toml to your project root beside bootcher.toml.
@@ -67,20 +82,29 @@ on:
     tags: ["v*"]
 
 jobs:
-  # Push an update to the registry. Container build + `podman push`.
-  deploy:
-    runs-on: ubuntu-24.04 # build aarch64? use ubuntu-24.04-arm — same image tag
+  # --- build: one container per arch, on a native-arch runner ---------------------
+  # `build --target <arch>` builds only that arch and stops at the per-arch member tag
+  # localhost/<name>:latest-<arch> (no multi-arch list — `deploy` assembles that). The
+  # member is uploaded as a run artifact `deploy` downloads. No registry credentials
+  # needed here — only `deploy` pushes.
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm } # native arm64 runner, no emulation
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
-      packages: write # push to GHCR
     container:
       image: ghcr.io/cdellacqua/bootcher:latest
       options: --privileged # podman builds the container image (nested)
     steps:
       - uses: actions/checkout@v4
-      # Real-fs container store (see the header note): a loopback ext4 so podman
-      # does one kernel overlay instead of fuse-overlayfs-on-overlay. Self-skips
-      # when the store is already on a real fs.
+      # Real-fs container store (see the header note): a loopback ext4 so podman does
+      # one kernel overlay instead of fuse-overlayfs-on-overlay. Self-skips when the
+      # store is already on a real fs.
       - name: Prepare container store
         run: |
           set -eu
@@ -98,55 +122,43 @@ jobs:
           # Breadcrumb: expect `overlay` (kernel); a regression to fuse-overlayfs
           # means the store slipped back onto overlay-on-overlay (rpmdb bug returns).
           podman info --format 'podman store: {{.Store.GraphDriverName}} @ {{.Store.GraphRoot}}'
-      - name: Log in to GHCR
-        run: echo "$GITHUB_TOKEN" | podman login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # Signing? Materialise the cosign key `[deploy] registry.key` points at:
-      # - run: printf '%s' "$SIGN_KEY" > cosign.key
-      #   env: { SIGN_KEY: "${{ secrets.SIGN_KEY }}" }
-      - name: Deploy
-        # Registry mode: push the image and stop. Skipping the per-device `bootc
-        # upgrade` keeps the admin SSH key out of CI and doesn't assume the runner
-        # can reach the fleet — devices pick the update up on their auto-update
-        # timer. Drop the flag (and add the key) to roll immediately, or run
-        # `bootcher deploy` from a host on the devices' network.
-        run: bootcher --manifest bootcher.ci.toml deploy --skip-bootc-upgrade
-        env:
-          BOOTCHER_SIGN_PASSPHRASE: ${{ secrets.SIGN_PASSPHRASE }}
+      - name: Build ${{ matrix.arch }}
+        run: bootcher --manifest bootcher.ci.toml build --target "${{ matrix.arch }}"
+      - name: Save image member
+        # The build just produced exactly one image tagged `:latest-<arch>`. Save it;
+        # the repo:tag is restored on `podman load`, so `deploy` finds the member by
+        # name. zstd keeps the artifact small.
+        run: |
+          set -eu
+          img="$(podman images --format '{{.Repository}}:{{.Tag}}' | grep ":latest-${{ matrix.arch }}\$" | head -n1)"
+          test -n "$img" || { echo "no built image tagged :latest-${{ matrix.arch }}"; exit 1; }
+          podman save "$img" | zstd -T0 -10 -q -o "image-${{ matrix.arch }}.tar.zst"
+      - name: Upload image member
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-${{ matrix.arch }}
+          path: image-${{ matrix.arch }}.tar.zst
+          retention-days: 1
 
-  # Build a disk image to flash, reusing the image `deploy` just pushed rather than
-  # rebuilding it: `--skip-build` pulls `<registry>/<name>:latest` back from GHCR and
-  # the image-builder disk step (a nested privileged container) builds the disk from
-  # it.
-  #
-  # `needs: [deploy]` chains it behind deploy *in the same run*, so it always builds
-  # from this push's fresh image, never a stale `:latest`. It's still on-demand: the
-  # `environment:` below is the manual gate — GitHub holds the job "Waiting" until you
-  # approve it in the run (no `workflow_dispatch`/"Run workflow" button needed). One
-  # consequence: every default-branch push leaves a pending provision approval; just
-  # approve it when you actually need a disk, or let it expire. Restricted to the
-  # default branch (not `v*` tags), mirroring the GitLab recipe.
-  #
-  # SETUP (once): Settings → Environments → New environment `provision` → enable
-  # "Required reviewers" and add yourself. Without a protection rule the job wouldn't
-  # pause — it would provision on every push.
-  provision:
-    needs: [deploy]
-    if: github.ref == 'refs/heads/main'
-    environment: provision # required-reviewer protection = the manual approval gate
+  # --- deploy: assemble the multi-arch image from the members and push --------------
+  # Downloads both per-arch members the build matrix produced, `podman load`s them, then
+  # `deploy --skip-build` (re)assembles the multi-arch manifest list and pushes
+  # <registry>/<name>:latest (+ a CalVer tag). No container build, no disk step — the
+  # only job with `packages: write` (and the signing key, if enabled).
+  deploy:
+    needs: [build] # waits for every matrix arch
     runs-on: ubuntu-24.04
     permissions:
-      contents: write # create the Release + upload the disk as an asset
-      packages: read # pull the deploy-built image back from GHCR for --skip-build
+      contents: read
+      packages: write # push to GHCR
     container:
       image: ghcr.io/cdellacqua/bootcher:latest
       options: --privileged
     steps:
       - uses: actions/checkout@v4
-      # Real-fs container store (see the header note): a loopback ext4 so podman
-      # does one kernel overlay instead of fuse-overlayfs-on-overlay. Self-skips
-      # when the store is already on a real fs.
+      # Real-fs container store (see the header note): a loopback ext4 so podman does
+      # one kernel overlay instead of fuse-overlayfs-on-overlay. Self-skips when the
+      # store is already on a real fs.
       - name: Prepare container store
         run: |
           set -eu
@@ -161,8 +173,87 @@ jobs:
           else
             echo "container store already on a real fs; skipping loopback store"
           fi
-          # Breadcrumb: expect `overlay` (kernel); a regression to fuse-overlayfs
-          # means the store slipped back onto overlay-on-overlay (rpmdb bug returns).
+          podman info --format 'podman store: {{.Store.GraphDriverName}} @ {{.Store.GraphRoot}}'
+      # `needs:` doesn't auto-download artifacts on GitHub (unlike GitLab), so fetch
+      # every per-arch member into the workspace (flattened) explicitly.
+      - name: Download image members
+        uses: actions/download-artifact@v4
+        with:
+          pattern: image-*
+          merge-multiple: true
+      - name: Log in to GHCR
+        run: echo "$GITHUB_TOKEN" | podman login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Signing? Materialise the cosign key `[deploy] registry.key` points at:
+      # - run: printf '%s' "$SIGN_KEY" > cosign.key
+      #   env: { SIGN_KEY: "${{ secrets.SIGN_KEY }}" }
+      - name: Load members + deploy
+        # Load every per-arch member (restoring its localhost/<name>:latest-<arch> tag),
+        # then `--skip-build` (re)assembles the multi-arch list from them and pushes it.
+        # `--skip-bootc-upgrade` leaves the rollout to each device's auto-update timer
+        # (keeps the admin SSH key out of CI and doesn't assume the runner can reach the
+        # fleet). Drop the flag (and add the key) to roll immediately.
+        run: |
+          for f in image-*.tar.zst; do zstd -dc "$f" | podman load; done
+          bootcher --manifest bootcher.ci.toml deploy --skip-build --skip-bootc-upgrade
+        env:
+          BOOTCHER_SIGN_PASSPHRASE: ${{ secrets.SIGN_PASSPHRASE }}
+
+  # --- provision: build a flashable disk per arch, natively -------------------------
+  # A matrix (x86_64 → qcow2, aarch64 → raw), each on a native-arch runner.
+  # `provision --target <arch> --disk <type> --skip-build` pulls that arch's member back
+  # from GHCR (deploy just pushed it) and builds the disk natively, then publishes it as
+  # an asset on a per-commit GitHub Release. A release asset (up to 2 GB) holds the disk
+  # where a run artifact would be slow and eat the storage quota.
+  #
+  # `needs: [deploy]` chains it behind deploy *in the same run*, so it always builds from
+  # this push's fresh image, never a stale `:latest`. It's still on-demand: the
+  # `environment:` below is the manual gate — GitHub holds the provision job(s) "Waiting"
+  # until you approve in the run (no `workflow_dispatch` needed). One consequence: every
+  # default-branch push leaves a pending provision approval; approve it when you want a
+  # disk, or let it expire. Restricted to the default branch (not `v*` tags), mirroring
+  # the GitLab recipe.
+  #
+  # SETUP (once): Settings → Environments → New environment `provision` → enable
+  # "Required reviewers" and add yourself. Without a protection rule the job wouldn't
+  # pause — it would provision on every push.
+  provision:
+    needs: [deploy]
+    if: github.ref == 'refs/heads/main'
+    environment: provision # required-reviewer protection = the manual approval gate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, disk: qcow2, runner: ubuntu-24.04 }
+          - { arch: aarch64, disk: raw, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write # create the Release + upload the disk as an asset
+      packages: read # pull the deploy-built image back from GHCR for --skip-build
+    container:
+      image: ghcr.io/cdellacqua/bootcher:latest
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+      # Real-fs container store (see the header note): a loopback ext4 so podman does
+      # one kernel overlay instead of fuse-overlayfs-on-overlay. Self-skips when the
+      # store is already on a real fs.
+      - name: Prepare container store
+        run: |
+          set -eu
+          if [ "$(stat -f -c %T / 2>/dev/null)" = "overlayfs" ]; then
+            : "${BOOTCHER_STORE_SIZE:=20G}"
+            img=/bootcher-store.img
+            truncate -s "$BOOTCHER_STORE_SIZE" "$img"
+            mkfs.ext4 -q -F "$img"
+            mkdir -p /var/lib/containers/storage
+            mount -o loop "$img" /var/lib/containers/storage
+            echo "relocated podman store onto loopback ext4 (${BOOTCHER_STORE_SIZE} ceiling)"
+          else
+            echo "container store already on a real fs; skipping loopback store"
+          fi
           podman info --format 'podman store: {{.Store.GraphDriverName}} @ {{.Store.GraphRoot}}'
       # `--skip-build` pulls the deploy-built image back from GHCR, so this job needs
       # read access to the package. The workflow GITHUB_TOKEN has it for a package in
@@ -173,53 +264,56 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Write admin public key
-        # provision reads only the `.pub` sibling of `--ssh-key`, so the public key
-        # is all CI needs — `admin_key` itself never has to exist. Keeping the private
-        # key out of CI is safe: these jobs never SSH to a device.
+        # provision reads only the `.pub` sibling of `--ssh-key`, so the public key is
+        # all CI needs — `admin_key` itself never has to exist. Keeping the private key
+        # out of CI is safe: these jobs never SSH to a device.
         run: printf '%s\n' "$ADMIN_SSH_PUBKEY" > admin_key.pub
         env:
           ADMIN_SSH_PUBKEY: ${{ vars.ADMIN_SSH_PUBKEY }}
-      - name: Provision (reuse deploy's image + build disk)
-        # The disk bakes the admin pubkey and, in registry mode, the pull token so
-        # the device can fetch updates. For a public registry, drop the PULL_* env
-        # and append `--anonymous` instead. `--skip-build` reuses the image `deploy`
-        # pushed (pulled back above) instead of rebuilding the container.
-        run: bootcher --manifest bootcher.ci.toml provision --ssh-key admin_key --skip-build
+      - name: Provision ${{ matrix.arch }} (${{ matrix.disk }})
+        # Build just this runner's arch + disk type. `--skip-build` pulls that arch's
+        # member out of <registry>/<name>:latest (deploy pushed it) and builds the disk
+        # natively. The disk bakes the admin pubkey and, in registry mode, the pull token
+        # so the device can fetch updates. Public registry? Drop the PULL_* env and
+        # append `--anonymous` instead.
+        run: bootcher --manifest bootcher.ci.toml provision --ssh-key admin_key --target "${{ matrix.arch }}" --disk "${{ matrix.disk }}" --skip-build
         env:
           BOOTCHER_PULL_USER: ${{ secrets.PULL_USER }}
           BOOTCHER_PULL_TOKEN: ${{ secrets.PULL_TOKEN }}
-      # Publish the disk to a GitHub Release instead of a run artifact. A bootc raw
-      # disk is a large sparse file; tar+zstd crushes its unallocated zeros to a
-      # fraction of its size, and a release asset (up to 2 GB) holds it where uploading
-      # a 10 GiB sparse file as a run artifact would be slow and eat the storage quota.
-      # The release is tagged per commit, so every provision is an immutable, named
-      # download on the repo's Releases page — no expiry, unlike an artifact.
+      # Publish the disk to a per-commit GitHub Release (one release per commit; each arch
+      # uploads its own asset). A bootc raw disk is a large sparse file; tar+zstd crushes
+      # its unallocated zeros, and a release asset (up to 2 GB) holds it where a run
+      # artifact would be slow and eat the storage quota.
       - name: Publish disk image to a GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eu
           # No install step: the bootcher image bundles curl, jq, tar and zstd.
-          file=bootcher-output.tar.zst
+          file="bootcher-output-${{ matrix.arch }}.tar.zst"
           short=$(printf '%s' "$GITHUB_SHA" | cut -c1-12)
           tag="disk-$short"
           api="https://api.github.com/repos/$GITHUB_REPOSITORY"
           auth="Authorization: Bearer $GH_TOKEN"
-          # Pack the whole output/ tree (it may hold several arch/format disks) into one
-          # zstd tarball. --sparse skips the raw disk's unallocated zeros; -T0 uses
-          # every core; -10 is a good size/speed balance.
+          # Pack this arch's output/ tree into one zstd tarball. --sparse skips the raw
+          # disk's unallocated zeros; -T0 uses every core; -10 is a good size/speed balance.
           tar --sparse -cf - output | zstd -10 -T0 -q -o "$file"
-          # Reuse this commit's release if a previous provision made one, else create it
-          # (tagging the built commit). target_commitish ties the tag to this SHA.
-          id=$(curl -sf -H "$auth" "$api/releases/tags/$tag" 2>/dev/null | jq -r '.id // empty' || true)
+          # Resolve the per-commit release, creating it if absent. The two arch jobs run
+          # in parallel and share one release tag, so the create races: GET first, and if
+          # we have to create, ignore a failure (the sibling won) and GET again.
+          get_id() { curl -sf -H "$auth" "$api/releases/tags/$tag" 2>/dev/null | jq -r '.id // empty' || true; }
+          id=$(get_id)
           if [ -z "$id" ]; then
-            id=$(curl -sf -X POST -H "$auth" "$api/releases" \
+            curl -sf -X POST -H "$auth" "$api/releases" \
               -d "$(jq -n --arg t "$tag" --arg c "$GITHUB_SHA" \
-                    '{tag_name:$t, target_commitish:$c, name:$t, body:"bootcher provision disk for \($c)"}')" \
-              | jq -r '.id')
+                    '{tag_name:$t, target_commitish:$c, name:$t, body:"bootcher provision disks for \($c)"}')" \
+              >/dev/null 2>&1 || true
+            id=$(get_id)
           fi
-          # Replace a same-named asset from an earlier provision of this commit, then
+          test -n "$id" || { echo "could not get or create release $tag"; exit 1; }
+          # Replace this arch's asset from an earlier provision of this commit, then
           # upload (the asset endpoint lives on the uploads host, not api.github.com).
+          # Asset names are per-arch, so the two jobs never collide.
           old=$(curl -sf -H "$auth" "$api/releases/$id/assets" | jq -r --arg n "$file" '.[] | select(.name==$n) | .id')
           [ -n "$old" ] && curl -sf -X DELETE -H "$auth" "$api/releases/assets/$old"
           curl -s --fail-with-body -X POST \
