@@ -25,10 +25,18 @@ RUN cargo build --release --locked -p bootcher-cli
 # Fedora carries every system tool bootcher shells out to, plus libudev.so.1
 # (systemd-libs) and the UEFI firmware the VM builder boots guests with.
 #
+# sudo: the image-builder disk step (`bootcher provision`) shells out to it to run
+# the privileged disk build, so it belongs in the runtime even though the binary
+# never calls it directly on the deploy path.
+#
 # jq/unzip/python3 aren't used by the bootcher binary itself — they're the
 # interpreters the first-party hook recipes (recipes/*) shell out to, so the
 # containerized entry point can run them: hooks execute with `sh -c` in this
 # image. The raspi4 disk.post recipe needs all three.
+#
+# zstd: the CI recipes (recipes/ci/*) compress the built disk before uploading it
+# to a release/package registry. Baked in here so the pipelines need no `dnf
+# install` step — the published image is self-sufficient for the recipes it ships.
 FROM quay.io/fedora/fedora:44
 RUN dnf install -y --setopt=install_weak_deps=False \
       podman \
@@ -45,6 +53,8 @@ RUN dnf install -y --setopt=install_weak_deps=False \
       curl \
       which \
       tar \
+      sudo \
+      zstd \
       systemd-libs \
       jq \
       unzip \

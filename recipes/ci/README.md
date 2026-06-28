@@ -8,7 +8,11 @@ project's lifecycle:
   for GitHub, the project Container Registry for GitLab). Runs automatically on the
   default branch and on tags; devices self-update from there.
 - **provision** — `bootcher provision --skip-build` builds the disk image and
-  publishes `output/` as a downloadable CI artifact for you to flash or upload. Runs
+  publishes `output/` (packed as a single `tar`+`zstd` file) for you to download and
+  flash — to a **per-commit GitHub Release asset** on GitHub, or the project's
+  **generic Package Registry** on GitLab. Both sidestep the run-artifact size limits
+  (GitLab.com caps job artifacts at 1 GB; a sparse bootc disk easily exceeds that),
+  give a stable versioned download, and don't expire the way an artifact does. Runs
   on demand, since you only need a fresh disk when enrolling a new device.
   `--skip-build` **reuses the image `deploy` pushed** — it pulls
   `<registry>/<name>:latest` back from the registry instead of rebuilding the

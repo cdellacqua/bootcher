@@ -159,8 +159,17 @@ provision:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: manual
       allow_failure: true
+  variables:
+    # Where the finished disk lands in the generic Package Registry, versioned by
+    # commit so every provision is an immutable, retrievable build. A bootc raw disk
+    # is a large sparse file that won't fit a job artifact (GitLab.com caps those at
+    # 1 GB); tar+zstd crushes its unallocated zeros to a fraction of that, and the
+    # Package Registry allows 5 GB/file.
+    PKG_NAME: disk
+    PKG_FILE: bootcher-output.tar.zst
   script:
-    - dnf install -y --setopt=install_weak_deps=False sudo >/dev/null
+    # No dependency install: the bootcher image bundles everything these steps need —
+    # sudo (image-builder disk step), tar + zstd (pack/compress the disk), curl (upload).
     # `--skip-build` pulls the deploy-built image back from the registry, so this job
     # needs read access to it. The job token is read+write on this project's registry
     # and lives only for the pipeline — fine for a pull. Public registry? Drop this
@@ -175,6 +184,18 @@ provision:
     # public registry, append `--anonymous` instead. `--skip-build` reuses the image
     # `deploy` pushed (pulled back above) instead of rebuilding the container.
     - bootcher --manifest bootcher.ci.toml provision --ssh-key admin_key --skip-build
-  artifacts:
-    paths: [output/]
-    expire_in: 1 week
+    # Pack the whole output/ tree (it may hold several arch/format disks) into one
+    # zstd tarball. --sparse keeps the raw disk's unallocated zeros from being read
+    # out; -T0 uses every core; -10 is a good size/speed balance on a small runner.
+    - tar --sparse -cf - output | zstd -10 -T0 -q -o "$PKG_FILE"
+    # Publish to the project's generic Package Registry, versioned by commit. JOB-TOKEN
+    # authenticates as this pipeline; the PUT both creates the package version and
+    # stores the file.
+    - |
+      url="$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/$PKG_NAME/$CI_COMMIT_SHORT_SHA/$PKG_FILE"
+      curl --fail-with-body --retry 3 \
+        --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+        --upload-file "$PKG_FILE" "$url"
+      echo
+      echo "disk published: $url"
+      echo "download + unpack with: curl --header \"PRIVATE-TOKEN: <token>\" \"$url\" | zstd -d | tar -xf -"
