@@ -188,14 +188,31 @@ provision:
     # zstd tarball. --sparse keeps the raw disk's unallocated zeros from being read
     # out; -T0 uses every core; -10 is a good size/speed balance on a small runner.
     - tar --sparse -cf - output | zstd -10 -T0 -q -o "$PKG_FILE"
-    # Publish to the project's generic Package Registry, versioned by commit. JOB-TOKEN
-    # authenticates as this pipeline; the PUT both creates the package version and
-    # stores the file.
+    # Stream the whole output/ tree (it may hold several arch/format disks) straight to
+    # the generic Package Registry: tar+zstd into curl's stdin so the compressed tarball
+    # never lands on the runner's disk — it was the extra space-occupying file the disk
+    # couldn't spare. --sparse keeps the raw disk's unallocated zeros from being read out;
+    # -T0 uses every core; -10 is a good size/speed balance on a small runner. JOB-TOKEN
+    # authenticates as this pipeline; the (chunked) PUT both creates the package version
+    # and stores the streamed body, versioned by commit.
+    #
+    # Trade-offs of streaming vs. writing the file first:
+    #   - No `--retry`: curl can't rewind a pipe, so a flaky upload fails the job — just
+    #     re-run it. (Retrying would mean re-tarring the whole disk anyway.)
+    #   - pipefail (enabled below when the shell supports it) makes a tar/zstd failure
+    #     mid-pipe fail the job too, so a truncated stream can't be published as a
+    #     "successful" upload. On a strict-POSIX sh without pipefail we fall through
+    #     without it; --fail-with-body still catches a server-side rejection.
+    #   - Needs the registry to accept a chunked PUT (no Content-Length); GitLab's
+    #     generic registry does. If a future GitLab rejects it, fall back to writing
+    #     "$PKG_FILE" and uploading with --upload-file "$PKG_FILE" --retry 3.
     - |
+      if (set -o pipefail) 2>/dev/null; then set -o pipefail; fi
       url="$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/$PKG_NAME/$CI_COMMIT_SHORT_SHA/$PKG_FILE"
-      curl --fail-with-body --retry 3 \
-        --header "JOB-TOKEN: $CI_JOB_TOKEN" \
-        --upload-file "$PKG_FILE" "$url"
+      tar --sparse -cf - output | zstd -10 -T0 -q | \
+        curl --fail-with-body \
+          --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+          --upload-file - "$url"
       echo
       echo "disk published: $url"
       echo "download + unpack with: curl --header \"PRIVATE-TOKEN: <token>\" \"$url\" | zstd -d | tar -xf -"
