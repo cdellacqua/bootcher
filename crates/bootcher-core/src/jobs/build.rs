@@ -2,7 +2,7 @@ use crate::context::{Arch, ImageRef, Manifest};
 use crate::exec::run;
 use crate::preflight::{self, Checks};
 use crate::progress::Scope;
-use anyhow::Result;
+use anyhow::{Result, bail};
 use duct::cmd;
 
 /// Check the external tools the build fan-out needs: a local `podman` (every build
@@ -106,6 +106,73 @@ pub fn run(manifest: &Manifest, job: &mut Scope) -> Result<()> {
 	meta.stage = crate::hooks::Stage::Post;
 	crate::hooks::run(&meta, hooks.build.post.as_deref(), job)?;
 	Ok(())
+}
+
+/// For `--skip-build`: make sure every target arch's container member is in local
+/// rootless storage for the consuming phase to read, **pulling it from the
+/// configured registry** when the store doesn't already have it. The seeding
+/// counterpart to [`run()`] — same postcondition (each member resident under its
+/// [`ImageRef::tag`]), reached by a pull instead of a build.
+///
+/// A member already present is reused untouched (no network), e.g. one a prior
+/// `bootcher build` left behind. A missing member is pulled out of
+/// `<registry>/<name>:latest` — the multi-arch list `deploy` pushes — and tagged as
+/// its local member ref, so a `provision --skip-build` on an empty store (a fresh CI
+/// runner) builds the disk from the exact image `deploy` published, no container
+/// rebuild.
+///
+/// Registry mode only: with no `[deploy] registry` there's nowhere to pull a missing
+/// member from, so it's a hard error pointing at `bootcher build`. Pulling a private
+/// registry needs this host logged in (`podman login`) with at least read access —
+/// the same credential `deploy` uses to push.
+///
+/// # Errors
+///
+/// Returns an error if a member is missing with no registry to pull it from, or a
+/// registry pull/tag fails.
+pub(crate) fn ensure_local(manifest: &Manifest, job: &mut Scope) -> Result<()> {
+	// Only the absent members need fetching; the present ones (e.g. from a prior
+	// `bootcher build`) are reused untouched. Filtering first also keeps the whole
+	// step a silent no-op when nothing is missing.
+	let missing: Vec<ImageRef> =
+		manifest.images().into_iter().filter(|i| !image_present(&i.tag())).collect();
+	if missing.is_empty() {
+		return Ok(());
+	}
+	// The multi-arch list `deploy` pushed; absent it there's nothing to pull from.
+	let Some(list_ref) = manifest.registry_list_ref() else {
+		let absent: Vec<_> = missing.iter().map(|i| i.arch.to_string()).collect();
+		bail!(
+			"`--skip-build` needs the container in local storage, but it's missing for {} \
+			 and no `[deploy] registry` is configured to pull it from — run `bootcher build` \
+			 first, or set a registry in bootcher.toml",
+			absent.join(", ")
+		);
+	};
+	job.set_total(missing.len() as u64);
+	for image in &missing {
+		job.step(format!("fetch {}", image.arch));
+		// Pull this arch's member out of the multi-arch list and tag it as the local
+		// member ref the disk phase reads ([`ImageRef::tag`]). `--arch` resolves the
+		// member from the list; pulling the same list ref for a second arch only
+		// re-points the bare `list_ref` tag — which nothing relies on, since the disk
+		// build consumes the per-arch member tags created here.
+		run!(job, "podman", "pull", "--os", "linux", "--arch", image.arch.oci_arch(), &list_ref)?;
+		run!(job, "podman", "tag", &list_ref, image.tag())?;
+	}
+	Ok(())
+}
+
+/// Whether `tag` resolves to an image already in local rootless storage
+/// (`podman image exists`, exit 0 when present). Used by [`ensure_local`] to skip
+/// the registry pull for members a prior build already left behind.
+fn image_present(tag: &str) -> bool {
+	cmd!("podman", "image", "exists", tag)
+		.stdout_null()
+		.stderr_null()
+		.unchecked()
+		.run()
+		.is_ok_and(|o| o.status.success())
 }
 
 /// Assemble the per-arch member images into a local OCI **manifest list** named

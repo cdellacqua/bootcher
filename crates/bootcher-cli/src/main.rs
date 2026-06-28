@@ -69,7 +69,11 @@ enum Cmd {
 		anonymous: bool,
 		/// Build the disk from the already-built container, skipping the container
 		/// build — for iterating on the disk step alone, or when an earlier `build`
-		/// already produced the container.
+		/// already produced the container. The container is taken from local storage
+		/// when present, otherwise pulled from the configured registry — so a fresh CI
+		/// runner reuses the image a prior `deploy` already built and pushed instead of
+		/// rebuilding it (registry mode only; needs this host logged in to pull a
+		/// private registry).
 		#[arg(long = "skip-build")]
 		skip_build: bool,
 	},

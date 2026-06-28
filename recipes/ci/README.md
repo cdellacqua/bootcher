@@ -7,10 +7,17 @@ project's lifecycle:
   `<registry>/<name>:latest` to the **registry associated with your repo** (GHCR
   for GitHub, the project Container Registry for GitLab). Runs automatically on the
   default branch and on tags; devices self-update from there.
-- **provision** — `bootcher provision` builds the container *and* the disk image,
-  and publishes `output/` as a downloadable CI artifact for you to flash or upload.
+- **provision** — `bootcher provision --skip-build` builds the disk image and
+  publishes `output/` as a downloadable CI artifact for you to flash or upload.
   Runs on demand (manual trigger), since you only need a fresh disk when enrolling
-  a new device.
+  a new device. `--skip-build` **reuses the image `deploy` already pushed** — it
+  pulls `<registry>/<name>:latest` back from the registry instead of rebuilding the
+  container — so the manual job skips the multi-minute container build and the
+  flashed disk is byte-for-byte what devices auto-update to (a rebuild from source
+  could drift). The job therefore logs in to the registry to pull it (read access is
+  enough). For a **public** registry, drop that login — the pull is anonymous — and
+  separately pass `--anonymous` to `bootcher provision` so it bakes no pull
+  credential into the disk either (the device pulls updates anonymously too).
 
 | Platform | File | Copy it to |
 |---|---|---|

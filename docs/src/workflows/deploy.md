@@ -26,10 +26,12 @@ Every action command builds the container first by default. `--skip-build` opts 
 |---|---|
 | `bootcher build` | Build the container image and assemble the local multi-arch manifest list |
 | `bootcher deploy --skip-build` | Push the already-built image and trigger `bootc upgrade` on remotes (no rebuild) |
-| `bootcher provision --skip-build` | Build the disk artifact from the already-built container (no rebuild) |
+| `bootcher provision --skip-build` | Build the disk artifact from the already-built container, pulling it from the registry when it isn't already local (no rebuild) |
 | `bootcher takeover --skip-build` | Convert live hosts from the already-built container (no rebuild) |
 
 These are useful when iterating on a single phase, or when orchestrating a pipeline that runs `build` and the deploy/provision step as separate jobs.
+
+For `provision --skip-build` the "already-built container" can come from the registry, not just local storage: if the per-arch member isn't in the local store, it's pulled from `<registry>/<name>:latest` (the multi-arch list `deploy` pushes) and used as-is. That lets a manual provision job in CI reuse the exact image the automatic `deploy` already built and pushed — no second container build, and the flashed disk is byte-for-byte what devices auto-update to. It's registry mode only (there's nowhere else to pull from) and the machine needs registry read access for a private registry; with no registry a missing local image is still an error pointing back at `bootcher build`.
 
 ## Lifecycle hooks
 

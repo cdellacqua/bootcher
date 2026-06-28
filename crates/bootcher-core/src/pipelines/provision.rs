@@ -21,19 +21,23 @@ use crate::{jobs, progress};
 /// the built disks (embedding firmware or files outside the Containerfile's reach)
 /// is a `[hooks.disk] post` hook that walks the per-target output dirs.
 ///
-/// `skip_build` (`--skip-build`) builds the disk from the already-built container,
-/// skipping the container build — the disk phase alone — for iterating on the disk
-/// step or shipping an image an earlier `build` produced.
+/// `skip_build` (`--skip-build`) builds the disk from the already-built container
+/// instead of rebuilding it — the disk phase alone, for iterating on the disk step
+/// or shipping an image an earlier `build` produced. The container is taken from
+/// local storage when present, else pulled from the configured registry — so a
+/// `provision --skip-build` in a fresh CI runner reuses the exact image the
+/// automatically-run `deploy` already built and pushed, rather than rebuilding it.
 ///
 /// # Errors
 ///
-/// Returns an error if the build or disk phase fails.
+/// Returns an error if the build/fetch or disk phase fails.
 pub fn run(manifest: &Manifest, config: Option<&str>, skip_build: bool) -> Result<()> {
-	if skip_build {
-		return jobs::disk::run(manifest, config, &mut progress::Scope::standalone());
-	}
 	let mut b = progress::Scope::root("provision", Some(2));
-	jobs::build::run(manifest, &mut b.child("build"))?;
+	if skip_build {
+		jobs::build::ensure_local(manifest, &mut b.child("fetch image"))?;
+	} else {
+		jobs::build::run(manifest, &mut b.child("build"))?;
+	}
 	jobs::disk::run(manifest, config, &mut b.child("disk"))
 }
 

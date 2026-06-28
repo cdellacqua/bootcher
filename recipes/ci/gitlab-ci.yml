@@ -7,8 +7,11 @@
 #               container and pushes `<registry>/<name>:latest` to this project's
 #               Container Registry. Devices self-update.
 #   provision — a manual job: `bootcher deploy`'s sibling for first install —
-#               `bootcher provision` builds the container + disk image and saves
-#               `output/` as a job artifact for you to download and flash.
+#               `bootcher provision --skip-build` reuses the image the deploy job
+#               already built and pushed (pulled back from the registry), builds the
+#               disk image from it, and saves `output/` as a job artifact for you to
+#               download and flash. No second container build, and the disk is
+#               byte-for-byte what devices auto-update to.
 #
 # Runs inside the official bootcher image (it bundles podman + qemu). Both jobs
 # need a PRIVILEGED job container: podman builds containers, and the image-builder
@@ -133,8 +136,10 @@ deploy:
     # their auto-update timer. Drop the flag (and add the key) to roll immediately.
     - bootcher --manifest bootcher.ci.toml deploy --skip-bootc-upgrade
 
-# Build a disk image to flash. The image-builder disk step shells out to `sudo`,
-# which the base image doesn't ship — install it (root needs no password).
+# Build a disk image to flash, reusing the image `deploy` already pushed rather than
+# rebuilding it: `--skip-build` pulls `<registry>/<name>:latest` back into local
+# storage and builds the disk from it. The image-builder disk step shells out to
+# `sudo`, which the base image doesn't ship — install it (root needs no password).
 provision:
   stage: provision
   # Empty `needs` detaches this job from stage ordering: without it, `provision`
@@ -153,14 +158,20 @@ provision:
       allow_failure: true
   script:
     - dnf install -y --setopt=install_weak_deps=False sudo >/dev/null
+    # `--skip-build` pulls the deploy-built image back from the registry, so this job
+    # needs read access to it. The job token is read+write on this project's registry
+    # and lives only for the pipeline — fine for a pull. Public registry? Drop this
+    # login (the pull is anonymous) and add `--anonymous` below.
+    - echo "$CI_REGISTRY_PASSWORD" | podman login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
     # provision reads only the `.pub` sibling of `--ssh-key`, so the public key is all
     # CI needs (`admin_key` itself never has to exist). Keeping the private key out of
     # CI is safe: these jobs never SSH to a device.
     - printf '%s\n' "$ADMIN_SSH_PUBKEY" > admin_key.pub
     # The disk bakes the admin pubkey and, in registry mode, the pull token
     # ($BOOTCHER_PULL_USER/$BOOTCHER_PULL_TOKEN, read from the environment). For a
-    # public registry, append `--anonymous` instead.
-    - bootcher --manifest bootcher.ci.toml provision --ssh-key admin_key
+    # public registry, append `--anonymous` instead. `--skip-build` reuses the image
+    # `deploy` pushed (pulled back above) instead of rebuilding the container.
+    - bootcher --manifest bootcher.ci.toml provision --ssh-key admin_key --skip-build
   artifacts:
     paths: [output/]
     expire_in: 1 week

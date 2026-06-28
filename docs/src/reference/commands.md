@@ -21,7 +21,7 @@ First-time provisioning: collect secrets → build the container → build its d
 | `--ssh-key <path>` | Admin SSH private key; the `<path>.pub` sibling is injected into the device. Omit to pick interactively on a TTY |
 | `--skip-pull-check` | Skip the eager local pull-token validation |
 | `--anonymous` | The configured registry is public: provision with no pull credential, baking no `auth.json` (the device pulls anonymously). On a TTY, leaving the username blank does the same. No effect in LAN mode |
-| `--skip-build` | Build the disk from the already-built container, skipping the container build — for iterating on the disk step, or when an earlier `bootcher build` produced the container |
+| `--skip-build` | Build the disk from the already-built container instead of rebuilding it — for iterating on the disk step, or to reuse an image an earlier `bootcher build` (or `deploy`) produced. The container is taken from local storage when present, otherwise pulled from the configured registry — so a fresh CI runner reuses the exact image a prior `deploy` pushed rather than rebuilding it (registry mode only; needs registry read access to pull) |
 
 ---
 

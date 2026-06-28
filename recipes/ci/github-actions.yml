@@ -23,9 +23,12 @@
 #   deploy    — on push to the default branch and on `v*` tags: `bootcher deploy`
 #               builds the container and pushes `<registry>/<name>:latest` to GHCR
 #               (the registry associated with this repo). Devices self-update.
-#   provision — on a manual "Run workflow": `bootcher provision` builds the
-#               container, then the disk image, and uploads `output/` as a
-#               downloadable artifact for you to flash/upload.
+#   provision — on a manual "Run workflow": `bootcher provision --skip-build`
+#               reuses the image the deploy job already built and pushed (pulled
+#               back from GHCR), builds the disk image from it, and uploads `output/`
+#               as a downloadable artifact for you to flash/upload. No second
+#               container build, and the disk is byte-for-byte what devices
+#               auto-update to.
 #
 # bootcher.toml must point its registry at this repo's GHCR namespace:
 #
@@ -109,13 +112,16 @@ jobs:
         env:
           BOOTCHER_SIGN_PASSPHRASE: ${{ secrets.SIGN_PASSPHRASE }}
 
-  # Build a disk image to flash: the container build plus the image-builder disk
-  # step (a nested privileged container).
+  # Build a disk image to flash, reusing the image `deploy` already pushed rather
+  # than rebuilding it: `--skip-build` pulls `<registry>/<name>:latest` back from
+  # GHCR and the image-builder disk step (a nested privileged container) builds the
+  # disk from it.
   provision:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+      packages: read # pull the deploy-built image back from GHCR for --skip-build
     container:
       image: ghcr.io/cdellacqua/bootcher:latest
       options: --privileged
@@ -145,6 +151,14 @@ jobs:
       # doesn't ship — install it (we're root, so no password is needed).
       - name: Install sudo
         run: dnf install -y --setopt=install_weak_deps=False sudo
+      # `--skip-build` pulls the deploy-built image back from GHCR, so this job needs
+      # read access to the package. The workflow GITHUB_TOKEN has it for a package in
+      # this repo. Public package? Drop this login (the pull is anonymous) and add
+      # `--anonymous` below.
+      - name: Log in to GHCR
+        run: echo "$GITHUB_TOKEN" | podman login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Write admin public key
         # provision reads only the `.pub` sibling of `--ssh-key`, so the public key
         # is all CI needs — `admin_key` itself never has to exist. Keeping the private
@@ -152,11 +166,12 @@ jobs:
         run: printf '%s\n' "$ADMIN_SSH_PUBKEY" > admin_key.pub
         env:
           ADMIN_SSH_PUBKEY: ${{ vars.ADMIN_SSH_PUBKEY }}
-      - name: Provision (build container + disk image)
+      - name: Provision (reuse deploy's image + build disk)
         # The disk bakes the admin pubkey and, in registry mode, the pull token so
         # the device can fetch updates. For a public registry, drop the PULL_* env
-        # and append `--anonymous` instead.
-        run: bootcher --manifest bootcher.ci.toml provision --ssh-key admin_key
+        # and append `--anonymous` instead. `--skip-build` reuses the image `deploy`
+        # pushed (pulled back above) instead of rebuilding the container.
+        run: bootcher --manifest bootcher.ci.toml provision --ssh-key admin_key --skip-build
         env:
           BOOTCHER_PULL_USER: ${{ secrets.PULL_USER }}
           BOOTCHER_PULL_TOKEN: ${{ secrets.PULL_TOKEN }}

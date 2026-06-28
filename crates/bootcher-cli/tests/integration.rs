@@ -410,3 +410,24 @@ fn provision_without_key_on_non_tty_errors() {
 		.failure()
 		.stderr(predicate::str::contains("no key"));
 }
+
+#[test]
+fn provision_skip_build_without_registry_or_local_image_errors() {
+	// `--skip-build` reuses an already-built container: from local storage, else
+	// pulled from the registry. A freshly-scaffolded project is LAN mode (no
+	// `[deploy] registry`) and its container was never built, so there's nothing to
+	// reuse and nowhere to pull from — the seeding step must fail with a pointer to
+	// `bootcher build`, not an opaque podman error. (A registry-mode reuse needs a
+	// real registry to pull from, so it lives in the e2e suite.)
+	let (tmp, proj) = project("demo");
+	// A key so secret collection passes and we actually reach the seeding step;
+	// `provision` reads only the `.pub` sibling, so a placeholder line is enough.
+	let key = proj.join("admin_key");
+	fs::write(format!("{}.pub", key.display()), "ssh-ed25519 AAAA placeholder\n").unwrap();
+	bootcher_in(tmp.path(), &proj)
+		.args(["provision", "--skip-build", "--ssh-key"])
+		.arg(&key)
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("no `[deploy] registry`"));
+}
