@@ -71,14 +71,16 @@ pub(crate) fn run(
 	target: Option<Arch>,
 	disks: &[DiskType],
 	config: Option<&str>,
+	channel: &str,
 	job: &mut Scope,
 ) -> Result<()> {
 	let images = manifest.images_for(target);
 	let hooks = manifest.hooks();
 	// Project-level (arch-independent) refs the image-builder source ref each arch
 	// records as its bootc origin derives from (see `run_one`): the registry list ref
-	// (`Some` only in registry mode) takes precedence over the local list ref.
-	let registry_ref = manifest.registry_list_ref();
+	// for this run's channel (`Some` only in registry mode) takes precedence over the
+	// local list ref.
+	let registry_ref = manifest.registry_list_ref(channel);
 	let local_list_ref = manifest.local_list_ref();
 	warn_if_signing_unenforced(manifest, job);
 

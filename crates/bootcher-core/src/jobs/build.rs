@@ -169,6 +169,7 @@ pub fn run(manifest: &Manifest, target: Option<Arch>, job: &mut Scope) -> Result
 pub(crate) fn ensure_local(
 	manifest: &Manifest,
 	target: Option<Arch>,
+	channel: &str,
 	job: &mut Scope,
 ) -> Result<()> {
 	// Only the absent members need fetching; the present ones (e.g. from a prior
@@ -179,8 +180,9 @@ pub(crate) fn ensure_local(
 	if missing.is_empty() {
 		return Ok(());
 	}
-	// The multi-arch list `deploy` pushed; absent it there's nothing to pull from.
-	let Some(list_ref) = manifest.registry_list_ref() else {
+	// The multi-arch list `deploy` pushed to this run's channel; absent it there's
+	// nothing to pull from.
+	let Some(list_ref) = manifest.registry_list_ref(channel) else {
 		let absent: Vec<_> = missing.iter().map(|i| i.arch.to_string()).collect();
 		bail!(
 			"`--skip-build` needs the container in local storage, but it's missing for {} \

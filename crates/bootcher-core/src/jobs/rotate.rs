@@ -124,10 +124,14 @@ pub fn registry_token(manifest: &Manifest, skip_pull_check: bool, job: &mut Scop
 		secrets::verify_pull_login(ns, &user, &token)?;
 	}
 	let auth_json = secrets::render_auth_json(ns, &user, &token);
-	// The exact (suffix-free, multi-arch) registry ref each device pulls on
-	// upgrade — what the new credential is verified against on the device before
-	// it's committed. Project-level (arch-independent), straight off the manifest.
-	let registry_ref = manifest.registry_list_ref().expect("registry set ⇒ a registry ref exists");
+	// A suffix-free, multi-arch registry ref the new credential is verified against on
+	// the device before it's committed. Channel-agnostic: pull auth is scoped to the
+	// registry namespace, not the tag, and the default `latest` channel is the ref
+	// most likely to exist — so a credential probe uses it regardless of which channel
+	// a given device tracks. Project-level (arch-independent), straight off the manifest.
+	let registry_ref = manifest
+		.registry_list_ref(crate::context::DEFAULT_CHANNEL)
+		.expect("registry set ⇒ a registry ref exists");
 
 	fleet::for_each_remote(
 		&remotes,

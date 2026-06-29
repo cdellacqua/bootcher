@@ -232,6 +232,7 @@ pub(crate) fn run(
 	login: Option<&str>,
 	provisioning: &Provisioning,
 	ssh_key: &str,
+	channel: &str,
 	job: &mut Scope,
 ) -> Result<()> {
 	let images = manifest.images();
@@ -249,7 +250,7 @@ pub(crate) fn run(
 
 	let provenance = crate::context::GitProvenance::detect(std::path::Path::new("."));
 	let calver = crate::context::calver_now(provenance.short_sha().as_deref());
-	if let Some(latest_ref) = manifest.registry_list_ref()
+	if let Some(channel_ref) = manifest.registry_list_ref(channel)
 		&& let Some(version_ref) = manifest.registry_version_ref(&calver)
 	{
 		// Registry mode: the host pulls the ref directly, so it must be in the registry
@@ -257,13 +258,13 @@ pub(crate) fn run(
 		// host the ref + the pull credential (the device `auth.json`, when present).
 		upgrade::push_multiarch_list(
 			&manifest.local_list_ref(),
-			&latest_ref,
+			&channel_ref,
 			&version_ref,
 			manifest.signing().as_ref(),
 			job,
 		)?;
 		let auth_json = files.iter().find(|f| f.path == DEVICE_AUTH_JSON).map(|f| f.data.as_str());
-		let backend = Backend::Registry { reference: &latest_ref, auth_json };
+		let backend = Backend::Registry { reference: &channel_ref, auth_json };
 		run_fleet(&targets, &backend, &files, max_workers, job)
 	} else {
 		// LAN mode: stand up one loopback registry for the whole fleet (it handles

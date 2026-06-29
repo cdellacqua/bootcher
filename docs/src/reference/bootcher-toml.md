@@ -38,6 +38,7 @@ image = "local"            # disk-image (image-builder) backend
 # registry = "registry.gitlab.com/org/project"       # plain: registry mode, no signing
 # registry = { url = "registry.gitlab.com/org/project", key = "cosign.key" }  # with signing
 remotes = []               # SSH targets: "admin@host" or { remote = "...", ssh_opts = [...] }
+# channels = ["stable", "next"]   # extra release channels beyond the implicit "latest" (registry mode)
 
 # [concurrency]
 # build   = 2              # max parallel container builds
@@ -270,6 +271,22 @@ The object form accepts these per-target keys:
 |---|---|
 | `ssh_opts` | Extra `ssh` args prepended to every connection (identity file, port, host-key policy, …) |
 | `takeover_login` | The stock cloud login (`debian`/`ubuntu`/`cloud-user`/`root`) [`bootcher takeover`](../workflows/takeover.md) uses for its *initial* connection, before the image's `admin` user replaces it. Per-host override of `--login`. Unused outside takeover — the steady-state identity stays `admin@`, so after takeover this is an ordinary remote |
+
+### `channels`
+
+The named release channels this project publishes, **beyond** the implicit `latest` every project always has. A channel is a mutable registry tag a subset of devices tracks (`<registry>/<name>:<channel>`); `deploy --channel <name>` pushes the multi-arch list under that tag instead of `:latest`, and `provision`/`takeover --channel <name>` set a device's bootc origin to it so the device follows that channel from then on.
+
+```toml
+[deploy]
+registry = "registry.example.com/org/project"
+channels = ["stable", "next", "testing"]
+```
+
+Declaring channels is opt-in and does two things: it **validates** `--channel` against a known set (a typo'd `--channel nightyl` is rejected rather than silently minting a stray tag), and it gives `bootcher init` something to seed. Leaving it empty (the default) keeps the project on just `latest` — the single-channel case, where `--channel` is never needed.
+
+A channel is a *pointer*, not a separate identity: the same digest a `deploy` produces is **also** tagged with its immutable `:CalVer` (see [Image identity](../concepts/image-identity.md)) regardless of channel, so the version tag is the durable rollback/audit handle and the channel tag is just which subscribers see it. Channels are a **registry-mode** concept — they have no LAN (SSH-tunnel) equivalent, so a non-`latest` `--channel` with no `registry` configured is an error.
+
+> **Note** — `latest` is always a valid channel without being listed here, and is the default when `--channel` is omitted. Existing devices provisioned before channels existed track `:latest` and stay on it untouched. Don't rename `latest`; add named channels alongside it.
 
 ---
 

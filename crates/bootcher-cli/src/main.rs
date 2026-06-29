@@ -88,6 +88,12 @@ enum Cmd {
 		/// private registry).
 		#[arg(long = "skip-build")]
 		skip_build: bool,
+		/// Provision the device to track this release channel instead of the default
+		/// `latest`: its bootc origin is set to `<registry>/<name>:<channel>`, so it
+		/// upgrades only when *that* channel is deployed to. Must be one of `[deploy]
+		/// channels` in bootcher.toml. Registry mode only.
+		#[arg(long = "channel")]
+		channel: Option<String>,
 	},
 	/// Subsequent deployment to the configured targets in `bootcher.toml`: build the
 	/// container, then push it and trigger `bootc upgrade`.
@@ -108,6 +114,13 @@ enum Cmd {
 		/// push/upgrade step alone.
 		#[arg(long = "skip-build")]
 		skip_build: bool,
+		/// Publish to this release channel instead of the default `latest`: the image
+		/// is pushed under the mutable `<registry>/<name>:<channel>` tag (the immutable
+		/// `CalVer` tag is shared across channels), and only the devices tracking that
+		/// channel pick it up. Must be one of `[deploy] channels` in bootcher.toml.
+		/// Registry mode only — channels have no LAN equivalent.
+		#[arg(long = "channel")]
+		channel: Option<String>,
 	},
 	/// Build the bootc container image.
 	Build {
@@ -158,6 +171,12 @@ enum Cmd {
 		/// already produced the image.
 		#[arg(long = "skip-build")]
 		skip_build: bool,
+		/// Take the hosts over onto this release channel instead of the default
+		/// `latest`: each host's bootc origin is set to `<registry>/<name>:<channel>`,
+		/// so it follows that channel from then on. Must be one of `[deploy] channels`
+		/// in bootcher.toml. Registry mode only.
+		#[arg(long = "channel")]
+		channel: Option<String>,
 	},
 	/// Image-signing helpers (registry mode). See `sign`.
 	#[command(subcommand)]
@@ -291,12 +310,21 @@ fn run() -> Result<()> {
 	let manifest_path = cli.manifest.as_str();
 	match cli.cmd {
 		Cmd::Init { name, yes, force } => jobs::init::run(name, yes, force),
-		Cmd::Provision { ssh_key, skip_pull_check, anonymous, target, disk, skip_build } => {
+		Cmd::Provision {
+			ssh_key,
+			skip_pull_check,
+			anonymous,
+			target,
+			disk,
+			skip_build,
+			channel,
+		} => {
 			let manifest = Manifest::load(manifest_path)?;
 			// Validate the `--target`/`--disk` selection once up front (no manifest
 			// narrowing); the selection is then threaded to each phase, which projects
-			// the manifest through it.
+			// the manifest through it. The `--channel` is resolved/validated the same way.
 			manifest.check_selection(target, &disk)?;
+			let channel = manifest.resolve_channel(channel.as_deref())?;
 			pipelines::provision::preflight(&manifest, target, skip_build)?;
 			let config = jobs::secrets::Provisioning::collect(
 				&manifest,
@@ -305,12 +333,13 @@ fn run() -> Result<()> {
 				anonymous,
 			)?
 			.blueprint()?;
-			pipelines::provision::run(&manifest, target, &disk, Some(&config), skip_build)
+			pipelines::provision::run(&manifest, target, &disk, Some(&config), skip_build, &channel)
 		}
-		Cmd::Deploy { skip_bootc_upgrade, skip_build } => {
+		Cmd::Deploy { skip_bootc_upgrade, skip_build, channel } => {
 			let manifest = Manifest::load(manifest_path)?;
+			let channel = manifest.resolve_channel(channel.as_deref())?;
 			pipelines::deploy::preflight(&manifest, skip_bootc_upgrade, skip_build)?;
-			pipelines::deploy::run(&manifest, skip_bootc_upgrade, skip_build)
+			pipelines::deploy::run(&manifest, skip_bootc_upgrade, skip_build, &channel)
 		}
 		Cmd::Build { target } => {
 			let manifest = Manifest::load(manifest_path)?;
@@ -322,8 +351,9 @@ fn run() -> Result<()> {
 			jobs::build::preflight(&manifest, target)?;
 			jobs::build::run(&manifest, target, &mut Scope::standalone())
 		}
-		Cmd::Takeover { ssh_key, login, skip_pull_check, anonymous, yes, skip_build } => {
+		Cmd::Takeover { ssh_key, login, skip_pull_check, anonymous, yes, skip_build, channel } => {
 			let manifest = Manifest::load(manifest_path)?;
+			let channel = manifest.resolve_channel(channel.as_deref())?;
 			// Pre-flight before collecting secrets or building: local build tools, plus
 			// the per-host over-SSH readiness checks (podman/sudo, arch, layout) — so a
 			// disqualified host fails fast rather than after a multi-GB build.
@@ -348,6 +378,7 @@ fn run() -> Result<()> {
 				&provisioning,
 				key_path,
 				skip_build,
+				&channel,
 			)
 		}
 		Cmd::Sign(cmd) => run_sign(cmd, manifest_path),

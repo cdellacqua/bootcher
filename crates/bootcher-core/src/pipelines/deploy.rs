@@ -25,7 +25,12 @@ use anyhow::Result;
 /// # Errors
 ///
 /// Returns an error if the build or upgrade phase fails.
-pub fn run(manifest: &Manifest, skip_bootc_upgrade: bool, skip_build: bool) -> Result<()> {
+pub fn run(
+	manifest: &Manifest,
+	skip_bootc_upgrade: bool,
+	skip_build: bool,
+	channel: &str,
+) -> Result<()> {
 	if skip_build {
 		let mut job = progress::Scope::standalone();
 		// `upgrade` pushes the local manifest list but doesn't assemble it (the build
@@ -40,14 +45,14 @@ pub fn run(manifest: &Manifest, skip_bootc_upgrade: bool, skip_build: bool) -> R
 			&manifest.local_list_ref(),
 			&mut job.child("manifest list"),
 		)?;
-		return jobs::upgrade::run(manifest, skip_bootc_upgrade, &mut job);
+		return jobs::upgrade::run(manifest, skip_bootc_upgrade, channel, &mut job);
 	}
 	let mut b = progress::Scope::root("deploy", Some(2));
 	// `deploy` publishes the whole multi-arch image, never a single-arch subset, so the
 	// build is unscoped (`None`) — every arch, list assembled. Splitting the build per
 	// arch is a separate-job concern (`build --target` + `deploy --skip-build`).
 	jobs::build::run(manifest, None, &mut b.child("build"))?;
-	jobs::upgrade::run(manifest, skip_bootc_upgrade, &mut b.child("upgrade"))
+	jobs::upgrade::run(manifest, skip_bootc_upgrade, channel, &mut b.child("upgrade"))
 }
 
 /// Check the external tools `deploy` needs — its two phases in order (`build` then

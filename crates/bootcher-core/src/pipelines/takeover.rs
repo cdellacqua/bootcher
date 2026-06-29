@@ -26,6 +26,7 @@ pub fn run(
 	provisioning: &Provisioning,
 	ssh_key: &str,
 	skip_build: bool,
+	channel: &str,
 ) -> Result<()> {
 	if skip_build {
 		return jobs::takeover::run(
@@ -33,12 +34,13 @@ pub fn run(
 			login,
 			provisioning,
 			ssh_key,
+			channel,
 			&mut progress::Scope::standalone(),
 		);
 	}
 	let mut b = progress::Scope::root("takeover", Some(2));
 	jobs::build::run(manifest, None, &mut b.child("build"))?;
-	jobs::takeover::run(manifest, login, provisioning, ssh_key, &mut b.child("takeover"))
+	jobs::takeover::run(manifest, login, provisioning, ssh_key, channel, &mut b.child("takeover"))
 }
 
 /// Check `takeover`'s prerequisites up front, before the build: the local build

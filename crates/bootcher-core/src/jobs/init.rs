@@ -22,9 +22,9 @@
 
 use crate::builder;
 use crate::context::{
-	Arch, ArchBuilder, BuilderConfig, BuilderSpec, ConcurrencyConfig, DeployConfig, DiskType,
-	General, Hooks, MANIFEST, Manifest, RegistryConfig, RemoteConfig, Rootfs, SCHEMA,
-	SCHEMA_DIRECTIVE, Targets, manifest_schema_json,
+	Arch, ArchBuilder, BuilderConfig, BuilderSpec, ConcurrencyConfig, DEFAULT_CHANNEL,
+	DeployConfig, DiskType, General, Hooks, MANIFEST, Manifest, RegistryConfig, RemoteConfig,
+	Rootfs, SCHEMA, SCHEMA_DIRECTIVE, Targets, manifest_schema_json,
 };
 use crate::hooks::{METADATA_SCHEMA, metadata_schema_json};
 use anyhow::{Context, Result, bail};
@@ -124,6 +124,24 @@ const SIGNING_EXAMPLE: &str = "\
 # at `provision`. Rotate a leaked/expiring key with `bootcher rotate sign-key`.
 ";
 
+/// Release-channels hint appended to the scaffolded manifest when a registry is
+/// configured but no channels were declared at init — documents how to add them.
+/// Omitted in LAN mode (channels are registry-only) and when the manifest already
+/// lists some (the rendered `[deploy] channels` then speaks for itself).
+const CHANNELS_EXAMPLE: &str = "\
+# Release channels (optional, registry mode): publish to named mutable tags beyond
+# the implicit `latest` every project always ships. A channel is a registry tag a
+# subset of devices tracks (<registry>/<name>:<channel>): `deploy --channel stable`
+# pushes the image under :stable instead of :latest, and `provision`/`takeover
+# --channel stable` point a device's bootc origin at it so it follows that channel.
+# The immutable :CalVer tag is shared across channels — a channel is just *which*
+# subscribers see a build, not a separate identity. Declaring them here validates
+# `--channel` against the set (a typo is rejected, not silently published).
+#
+# [deploy]
+# channels = [\"stable\", \"next\", \"testing\"]
+";
+
 /// Resolve the destination first (so an invalid/occupied target fails before any
 /// prompting), collect the manifest settings per interaction mode, then scaffold.
 ///
@@ -156,6 +174,11 @@ struct Settings {
 	/// bare connection string (`[user@]host` or `ssh://[user@]host[:port]`) with
 	/// no per-target SSH options — those can be added by hand later.
 	remotes: Vec<String>,
+	/// Extra release channels beyond the implicit `latest` (`[deploy] channels`).
+	/// Registry-mode only and empty by default — the single-`latest` case is the
+	/// common one; a project that wants `stable`/`nightly`/… names them here so
+	/// `deploy --channel` validates against the set.
+	channels: Vec<String>,
 	/// Builder config for the `[builder]` table; always concrete so the scaffolded
 	/// manifest records every key explicitly.
 	builder: BuilderConfig,
@@ -233,6 +256,7 @@ impl Target {
 					.iter()
 					.map(|r| RemoteConfig::ConnStr(r.clone()))
 					.collect(),
+				channels: settings.channels.clone(),
 			},
 			// Unbounded by default (each fan-out scales to the host's cores);
 			// `ConcurrencyConfig::is_empty` keeps the `[concurrency]` table out of the
@@ -251,6 +275,13 @@ impl Target {
 		// and redundant when signing is already live in the rendered manifest.
 		let signing_doc =
 			if settings.registry.is_some() && !settings.signing { SIGNING_EXAMPLE } else { "" };
+		// Same gate for the channels hint: registry-only, and only when none were
+		// declared at init (a rendered `[deploy] channels` already documents itself).
+		let channels_doc = if settings.registry.is_some() && settings.channels.is_empty() {
+			CHANNELS_EXAMPLE
+		} else {
+			""
+		};
 		// Emit the JSON Schemas (generated from the live types, so they can't drift)
 		// into `schemas/`: the manifest schema, bound to the manifest by a first-line
 		// `#:schema` directive so editors (Taplo / Even Better TOML) validate and
@@ -268,7 +299,7 @@ impl Target {
 		fs::write(
 			&manifest_path,
 			format!(
-				"{SCHEMA_DIRECTIVE}\n{rendered}{BUILDER_OVERRIDE_EXAMPLE}{CONCURRENCY_EXAMPLE}{HOOKS_EXAMPLE}{signing_doc}"
+				"{SCHEMA_DIRECTIVE}\n{rendered}{BUILDER_OVERRIDE_EXAMPLE}{CONCURRENCY_EXAMPLE}{HOOKS_EXAMPLE}{signing_doc}{channels_doc}"
 			),
 		)
 		.with_context(|| format!("writing {}", manifest_path.display()))?;
@@ -322,6 +353,8 @@ fn collect(yes: bool) -> Result<Settings> {
 			// No registry under `-y`, so signing (registry-only) is off.
 			signing: false,
 			remotes: Vec::new(),
+			// No registry under `-y`, so channels (registry-only) stay empty.
+			channels: Vec::new(),
 			builder: BuilderConfig::default(),
 		})
 	} else if std::io::stdin().is_terminal() {
@@ -400,6 +433,24 @@ fn questionnaire() -> Result<Settings> {
 			)
 			.prompt()?;
 
+	// Extra release channels are registry-mode only (a channel is a mutable registry
+	// tag with no LAN equivalent) and opt-in: blank keeps the project on just the
+	// implicit `latest`, the common single-channel case. A comma-separated list is
+	// parsed into the declared set `deploy --channel` then validates against; `latest`
+	// is always implicit, so it's dropped if the user lists it.
+	let channels = if registry.is_some() {
+		let raw = inquire::Text::new("Extra release channels beyond `latest` (comma-separated, blank for none):")
+			.with_help_message("e.g. stable, next, testing — each a registry tag a subset of devices tracks; deploy to one with `--channel`")
+			.prompt()?;
+		raw.split(',')
+			.map(str::trim)
+			.filter(|c| !c.is_empty() && *c != DEFAULT_CHANNEL)
+			.map(str::to_owned)
+			.collect()
+	} else {
+		Vec::new()
+	};
+
 	// Collect deploy targets: plain connection strings only (no per-remote SSH
 	// options — those can be added by hand in the manifest later). An empty entry
 	// ends the loop; the list may be left empty and filled in afterward.
@@ -467,7 +518,7 @@ fn questionnaire() -> Result<Settings> {
 		}
 	};
 
-	Ok(Settings { targets, rootfs, registry, signing, remotes, builder: builder_config })
+	Ok(Settings { targets, rootfs, registry, signing, remotes, channels, builder: builder_config })
 }
 
 /// The default target arch: the host arch, or `x86_64` on an arch bootcher doesn't

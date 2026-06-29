@@ -43,14 +43,15 @@ pub fn run(
 	disks: &[DiskType],
 	config: Option<&str>,
 	skip_build: bool,
+	channel: &str,
 ) -> Result<()> {
 	let mut b = progress::Scope::root("provision", Some(2));
 	if skip_build {
-		jobs::build::ensure_local(manifest, target, &mut b.child("fetch image"))?;
+		jobs::build::ensure_local(manifest, target, channel, &mut b.child("fetch image"))?;
 	} else {
 		jobs::build::run(manifest, target, &mut b.child("build"))?;
 	}
-	jobs::disk::run(manifest, target, disks, config, &mut b.child("disk"))
+	jobs::disk::run(manifest, target, disks, config, channel, &mut b.child("disk"))
 }
 
 /// Check the external tools `provision` needs — its two phases in order (`build`

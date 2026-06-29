@@ -70,7 +70,12 @@ pub(crate) fn preflight(manifest: &Manifest, skip_bootc_upgrade: bool) -> Result
 ///
 /// Returns an error if no target arches are configured, a hook fails, the push fails,
 /// or any device's upgrade fails.
-pub(crate) fn run(manifest: &Manifest, skip_bootc_upgrade: bool, job: &mut Scope) -> Result<()> {
+pub(crate) fn run(
+	manifest: &Manifest,
+	skip_bootc_upgrade: bool,
+	channel: &str,
+	job: &mut Scope,
+) -> Result<()> {
 	let images = manifest.images();
 	let remotes = manifest.deploy_remotes().to_ssh();
 	let hooks = manifest.hooks();
@@ -88,8 +93,9 @@ pub(crate) fn run(manifest: &Manifest, skip_bootc_upgrade: bool, job: &mut Scope
 		image_name: manifest.general.name.clone(),
 		arches: images.iter().map(|i| i.arch).collect(),
 		// The ref pushed/served and recorded as the device bootc origin: the registry
-		// list ref in registry mode, else the LAN-served local list ref.
-		image_ref: manifest.registry_list_ref().unwrap_or_else(|| manifest.local_list_ref()),
+		// list ref for this run's channel in registry mode, else the LAN-served local
+		// list ref (LAN has no channels).
+		image_ref: manifest.registry_list_ref(channel).unwrap_or_else(|| manifest.local_list_ref()),
 		revision: provenance.revision,
 		version: provenance.version,
 		output_dir: None,
@@ -97,7 +103,7 @@ pub(crate) fn run(manifest: &Manifest, skip_bootc_upgrade: bool, job: &mut Scope
 		remotes: (!remote_hosts.is_empty()).then_some(remote_hosts),
 	};
 	crate::hooks::run(&meta, hooks.upgrade.pre.as_deref(), job)?;
-	if let Some(latest_ref) = manifest.registry_list_ref()
+	if let Some(channel_ref) = manifest.registry_list_ref(channel)
 	// The immutable companion tag for this push (see `run_registry`); both refs
 	// come from the manifest, not any one arch's image.
 	 && let Some(version_ref) = manifest.registry_version_ref(&calver)
@@ -105,7 +111,7 @@ pub(crate) fn run(manifest: &Manifest, skip_bootc_upgrade: bool, job: &mut Scope
 		let signing = manifest.signing();
 		run_registry(
 			&manifest.local_list_ref(),
-			(&latest_ref, &version_ref),
+			(&channel_ref, &version_ref),
 			&remotes,
 			signing.as_ref(),
 			manifest.concurrency().upgrade,
@@ -132,10 +138,10 @@ pub(crate) fn run(manifest: &Manifest, skip_bootc_upgrade: bool, job: &mut Scope
 }
 
 /// Registry backend: assemble the per-arch members into one multi-arch manifest
-/// list, push it to the configured registry (under the mutable `:latest` channel
-/// tag and an immutable `CalVer` tag — `:YYYYMMDD.HHMM.g<short-sha>`, or
-/// `:YYYYMMDD.HH.MM` with no git — for the same digest), then
-/// point each listed device's
+/// list, push it to the configured registry (under the run's mutable channel tag
+/// — `:latest` by default — and an immutable `CalVer` tag —
+/// `:YYYYMMDD.HHMM.g<short-sha>`, or `:YYYYMMDD.HH.MM` with no git — for the same
+/// digest), then point each listed device's
 /// bootc origin at the (suffix-free) registry ref and upgrade it now. With no
 /// remotes the push is the whole job — every target's auto-update timer fetches
 /// the new revision (and resolves its own arch out of the list) on its own. The
@@ -143,8 +149,9 @@ pub(crate) fn run(manifest: &Manifest, skip_bootc_upgrade: bool, job: &mut Scope
 /// the ref).
 fn run_registry(
 	local_list_ref: &str,
-	// `(latest_ref, version_ref)`: the mutable `:latest` channel tag and the
-	// immutable CalVer tag (see `calver_now`), both for the same pushed digest.
+	// `(channel_ref, version_ref)`: the run's mutable channel tag (`:latest` by
+	// default) and the immutable CalVer tag (see `calver_now`), both for the same
+	// pushed digest.
 	refs: (&str, &str),
 	remotes: &[Ssh],
 	signing: Option<&SigningConfig>,
@@ -152,12 +159,12 @@ fn run_registry(
 	skip_bootc_upgrade: bool,
 	job: &mut Scope,
 ) -> Result<()> {
-	let (latest_ref, version_ref) = refs;
-	let enforce_sig = push_multiarch_list(local_list_ref, latest_ref, version_ref, signing, job)?;
+	let (channel_ref, version_ref) = refs;
+	let enforce_sig = push_multiarch_list(local_list_ref, channel_ref, version_ref, signing, job)?;
 
 	if remotes.is_empty() || skip_bootc_upgrade {
 		job.println(format!(
-			"pushed {latest_ref} (also tagged {version_ref}) — targets will pull it on their next \
+			"pushed {channel_ref} (also tagged {version_ref}) — targets will pull it on their next \
 			 auto-update; add a target to `[deploy] remotes` to apply it immediately"
 		));
 		return Ok(());
@@ -165,15 +172,16 @@ fn run_registry(
 
 	// Apply to every listed device in parallel, attempting all (see `fleet`).
 	fleet::for_each_remote(remotes, "upgrade", max_workers, job, |remote, scope| {
-		apply_registry(latest_ref, enforce_sig, remote, scope)
+		apply_registry(channel_ref, enforce_sig, remote, scope)
 	})
 }
 
 /// Assemble the per-arch members into one multi-arch manifest list and push it to
-/// the registry under both the mutable `latest_ref` (`:latest`) channel tag and the
-/// immutable `version_ref` (`CalVer`, see `calver_now`) tag — the same digest under
-/// both. Returns whether signature enforcement is in effect (`true` iff `signing`
-/// is configured), so the caller records a verifying origin on each device.
+/// the registry under both the mutable `channel_ref` (`:<channel>`, `:latest` by
+/// default) tag and the immutable `version_ref` (`CalVer`, see `calver_now`) tag —
+/// the same digest under both. Returns whether signature enforcement is in effect
+/// (`true` iff `signing` is configured), so the caller records a verifying origin on
+/// each device.
 ///
 /// Shared by `upgrade`/`deploy` (which then switch + reboot each device) and
 /// [`crate::jobs::takeover`] (where each host pulls the pushed ref directly): both
@@ -185,7 +193,7 @@ fn run_registry(
 /// isn't logged in to the registry).
 pub(crate) fn push_multiarch_list(
 	local_list_ref: &str,
-	latest_ref: &str,
+	channel_ref: &str,
 	version_ref: &str,
 	signing: Option<&SigningConfig>,
 	job: &mut Scope,
@@ -208,7 +216,7 @@ pub(crate) fn push_multiarch_list(
 		["podman", "manifest", "push", "--all"].iter().map(|&s| OsString::from(s)).collect();
 	let passguard = match signing {
 		Some(cfg) => {
-			let ns = crate::jobs::signing::registry_namespace(latest_ref);
+			let ns = crate::jobs::signing::registry_namespace(channel_ref);
 			crate::jobs::signing::ensure_push_attachments(ns, job)?;
 			let passguard = crate::jobs::signing::sign_args(cfg)?;
 			push_argv.extend(passguard.flags().iter().cloned());
@@ -217,11 +225,11 @@ pub(crate) fn push_multiarch_list(
 		None => None,
 	};
 	push_argv.push(OsString::from(local_list_ref));
-	push_argv.push(OsString::from(latest_ref));
+	push_argv.push(OsString::from(channel_ref));
 	run_argv_labeled(job, &push_argv, "podman manifest push").with_context(|| {
-		let host = latest_ref.split('/').next().unwrap_or(latest_ref);
+		let host = channel_ref.split('/').next().unwrap_or(channel_ref);
 		format!(
-			"`podman manifest push` to {latest_ref} failed — is this machine logged in? (`podman login {host}`)"
+			"`podman manifest push` to {channel_ref} failed — is this machine logged in? (`podman login {host}`)"
 		)
 	})?;
 	// The push is done; the temp passphrase file (held by `passguard`) can go now.
@@ -247,7 +255,7 @@ pub(crate) fn push_multiarch_list(
 	Ok(enforce_sig)
 }
 
-/// Switch one device's bootc origin to `latest_ref` and reboot it into the upgrade.
+/// Switch one device's bootc origin to `channel_ref` and reboot it into the upgrade.
 /// When `enforce_sig` (i.e. signing is configured in `[deploy] registry`), the switch carries
 /// `--enforce-container-sigpolicy`, which records the origin so bootc verifies the
 /// image against `/etc/containers/policy.json` and rejects an unsigned/tampered one
@@ -255,7 +263,7 @@ pub(crate) fn push_multiarch_list(
 /// remembers). Runs on its own concurrent [`Scope`] (the device name is its
 /// header), so each step renders as a live bar beneath without a per-device counter.
 fn apply_registry(
-	latest_ref: &str,
+	channel_ref: &str,
 	enforce_sig: bool,
 	remote: &Ssh,
 	job: &mut Scope,
@@ -264,7 +272,7 @@ fn apply_registry(
 	//    unchanged" on every run after the first (incl. the switch away from a LAN
 	//    containers-storage origin). The signing flag is a no-op to re-apply.
 	let flag = if enforce_sig { "--enforce-container-sigpolicy " } else { "" };
-	remote.run_sh(job, "bootc switch", &[], format!("sudo bootc switch {flag}{latest_ref}"))?;
+	remote.run_sh(job, "bootc switch", &[], format!("sudo bootc switch {flag}{channel_ref}"))?;
 
 	// 2. Stage a new deployment, pulling from the registry.
 	remote.run_sh(job, "bootc upgrade", &[], "sudo bootc upgrade".into())?;

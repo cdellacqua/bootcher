@@ -12,6 +12,14 @@ use crate::ssh::Ssh;
 /// directory as a bootcher project; [`Manifest::load`] parses it.
 pub const MANIFEST: &str = "bootcher.toml";
 
+/// The implicit default release channel every project ships, used as the mutable
+/// registry tag (`<registry>/<name>:latest`) when no `--channel` is given. It's
+/// always valid without being declared in `[deploy] channels` (see
+/// [`Manifest::resolve_channel`]); a single-channel project never names a channel
+/// at all. The OCI-conventional `latest`, kept so existing devices — provisioned
+/// against `:latest` before channels existed — stay on their channel untouched.
+pub const DEFAULT_CHANNEL: &str = "latest";
+
 /// Directory `bootcher init` writes the generated JSON Schemas into (the manifest
 /// schema [`SCHEMA`] and the hook-metadata schema), keeping them out of the
 /// project root. Relative to the project root.
@@ -796,6 +804,27 @@ pub struct DeployConfig {
 	pub registry: Option<RegistryConfig>,
 	#[serde(default)]
 	pub remotes: Vec<RemoteConfig>,
+	/// Named release channels this project publishes, beyond the implicit
+	/// [`DEFAULT_CHANNEL`] (`latest`) every project always has. Each is a mutable
+	/// registry tag a subset of devices tracks (`<registry>/<name>:<channel>`),
+	/// pushed in place of `:latest` by a `--channel <name>` deploy; the immutable
+	/// `:CalVer` tag for the same digest is shared across channels, so a channel is
+	/// a *pointer*, not a separate identity (see [`Manifest::registry_version_ref`]).
+	///
+	/// Declaring them is opt-in and serves two purposes: it validates `--channel`
+	/// against a known set (a typo'd `--channel nightyl` is rejected rather than
+	/// silently minting a stray tag), and it gives `bootcher init` something to seed.
+	/// An empty list (the default) means the project only ships `latest` — the simple
+	/// single-channel case, where `--channel` is never needed. Channels are a
+	/// registry-mode concept: with no `[deploy] registry`, only `latest` is valid.
+	///
+	/// ```toml
+	/// [deploy]
+	/// registry = "registry.example.com/org/project"
+	/// channels = ["stable", "next", "testing"]
+	/// ```
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub channels: Vec<String>,
 }
 
 /// The `[concurrency]` section: optional caps on how many workers each parallel
@@ -1072,16 +1101,63 @@ impl Manifest {
 	}
 
 	/// Suffix-free, fully-qualified registry reference for registry-mode deploys
-	/// (`<namespace>/<name>:latest`, e.g.
+	/// (`<namespace>/<name>:<channel>`, e.g.
 	/// `registry.gitlab.com/org/project/kiosk:latest`), or `None` when no registry
 	/// is configured — in which case `deploy`/`upgrade` use the LAN (ssh-tunnelled
 	/// pull from a temporary builder-local registry) backend. It's the multi-arch
 	/// manifest list bootcher pushes and that each device pulls its own arch from.
-	/// Project-level (it spans every arch): both name and namespace come from the
-	/// manifest, so it doesn't belong to any one [`ImageRef`].
+	/// `channel` is the mutable channel tag a run publishes to / a device tracks
+	/// (default [`DEFAULT_CHANNEL`]; resolved from `--channel` by
+	/// [`Self::resolve_channel`]). Project-level (it spans every arch): both name and
+	/// namespace come from the manifest, so it doesn't belong to any one [`ImageRef`].
 	#[must_use]
-	pub fn registry_list_ref(&self) -> Option<String> {
-		self.registry().map(|ns| format!("{ns}/{}:latest", self.general.name))
+	pub fn registry_list_ref(&self, channel: &str) -> Option<String> {
+		self.registry().map(|ns| format!("{ns}/{}:{channel}", self.general.name))
+	}
+
+	/// The release channels this project declares it publishes — the implicit
+	/// [`DEFAULT_CHANNEL`] always first, then any extra `[deploy] channels`. The set
+	/// [`Self::resolve_channel`] validates a `--channel` against and `bootcher init`
+	/// lists; `latest` is always present even when the manifest declares none.
+	#[must_use]
+	pub fn declared_channels(&self) -> Vec<&str> {
+		let mut v = vec![DEFAULT_CHANNEL];
+		v.extend(self.deploy.channels.iter().map(String::as_str).filter(|c| *c != DEFAULT_CHANNEL));
+		v
+	}
+
+	/// Resolve a run's active channel from the `--channel` flag: `None` is
+	/// [`DEFAULT_CHANNEL`]; a given name must be one this project declares (see
+	/// [`Self::declared_channels`]) and the project must be in registry mode, since a
+	/// channel is a registry tag with no LAN analogue. The validated channel is then
+	/// threaded into [`Self::registry_list_ref`] like the `--target`/`--disk`
+	/// selection — it narrows what a run publishes/tracks without touching the manifest.
+	///
+	/// # Errors
+	///
+	/// Returns an error if a non-default channel is named with no `[deploy] registry`
+	/// configured, or if it isn't one of the declared channels (each naming the valid
+	/// choices).
+	pub fn resolve_channel(&self, flag: Option<&str>) -> Result<String> {
+		let Some(channel) = flag else { return Ok(DEFAULT_CHANNEL.to_owned()) };
+		if channel == DEFAULT_CHANNEL {
+			return Ok(channel.to_owned());
+		}
+		if self.registry().is_none() {
+			bail!(
+				"`--channel {channel}` needs a registry: channels are mutable registry tags with \
+				 no LAN equivalent. Set `[deploy] registry` to publish to a channel."
+			);
+		}
+		let declared = self.declared_channels();
+		if !declared.contains(&channel) {
+			bail!(
+				"`--channel {channel}` isn't a declared channel; `[deploy] channels` allows: {}. \
+				 Add it there to publish to it.",
+				declared.join(", ")
+			);
+		}
+		Ok(channel.to_owned())
 	}
 
 	/// Suffix-free **local** manifest-list ref (`localhost/<name>:latest`) — the
@@ -1443,9 +1519,8 @@ impl GitProvenance {
 
 	/// The provenance as ready-to-splice `--label <key>=<value>` argv tokens — one
 	/// pair per field that resolved, empty when none did. Reused for both the argv
-	/// (in-process build) and shell-string (remote build, via
-	/// [`crate::podman::opts_shell`]) `podman build` invocations, so the two backends
-	/// stamp identical labels.
+	/// (in-process build) and shell-string (remote build) `podman build`
+	/// invocations, so the two backends stamp identical labels.
 	#[must_use]
 	pub fn label_args(&self) -> Vec<String> {
 		let mut out = Vec::new();
@@ -1750,7 +1825,15 @@ mod tests {
 		// The list ref and registry refs are project-level (arch-independent) — they
 		// live on the manifest, not the per-arch image.
 		assert_eq!(m.local_list_ref(), "localhost/kiosk:latest");
-		assert_eq!(m.registry_list_ref().as_deref(), Some("reg.example.com/org/kiosk:latest"));
+		assert_eq!(
+			m.registry_list_ref(DEFAULT_CHANNEL).as_deref(),
+			Some("reg.example.com/org/kiosk:latest")
+		);
+		// A non-default channel is a different mutable tag for the same project.
+		assert_eq!(
+			m.registry_list_ref("stable").as_deref(),
+			Some("reg.example.com/org/kiosk:stable")
+		);
 		assert_eq!(
 			m.registry_version_ref("20260113.12.33").as_deref(),
 			Some("reg.example.com/org/kiosk:20260113.12.33")
@@ -1760,8 +1843,30 @@ mod tests {
 	#[test]
 	fn registry_version_ref_is_none_without_registry() {
 		let m = parse("[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n");
-		assert!(m.registry_list_ref().is_none());
+		assert!(m.registry_list_ref(DEFAULT_CHANNEL).is_none());
 		assert!(m.registry_version_ref("20260113.12.33").is_none());
+	}
+
+	#[test]
+	fn resolve_channel_validates_against_declared_set() {
+		let m = parse(
+			"[general]\nname = \"kiosk\"\n[targets]\nx86_64 = \"qcow2\"\n\
+			 [deploy]\nregistry = \"reg.example.com/org\"\nchannels = [\"stable\", \"next\"]\n",
+		);
+		// No flag → the implicit default; a declared channel passes through.
+		assert_eq!(m.resolve_channel(None).unwrap(), DEFAULT_CHANNEL);
+		assert_eq!(m.resolve_channel(Some("latest")).unwrap(), "latest");
+		assert_eq!(m.resolve_channel(Some("stable")).unwrap(), "stable");
+		// An undeclared channel is rejected.
+		assert!(m.resolve_channel(Some("nightly")).is_err());
+	}
+
+	#[test]
+	fn resolve_channel_rejects_non_default_without_registry() {
+		let m = parse("[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n");
+		// `latest` is always fine; any other channel needs a registry.
+		assert_eq!(m.resolve_channel(None).unwrap(), DEFAULT_CHANNEL);
+		assert!(m.resolve_channel(Some("stable")).is_err());
 	}
 
 	#[test]
@@ -1790,11 +1895,14 @@ mod tests {
 
 	#[test]
 	fn short_sha_truncates_and_keeps_dirty_marker() {
-		let clean = GitProvenance { revision: Some("0a1b2c3d4e5f6a7b8c9d".to_owned()), version: None };
+		let clean =
+			GitProvenance { revision: Some("0a1b2c3d4e5f6a7b8c9d".to_owned()), version: None };
 		assert_eq!(clean.short_sha().as_deref(), Some("0a1b2c3d4e5f"));
 
-		let dirty =
-			GitProvenance { revision: Some("0a1b2c3d4e5f6a7b8c9d-dirty".to_owned()), version: None };
+		let dirty = GitProvenance {
+			revision: Some("0a1b2c3d4e5f6a7b8c9d-dirty".to_owned()),
+			version: None,
+		};
 		assert_eq!(dirty.short_sha().as_deref(), Some("0a1b2c3d4e5f-dirty"));
 
 		let none = GitProvenance::default();
