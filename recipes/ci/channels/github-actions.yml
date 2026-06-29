@@ -1,0 +1,299 @@
+# bootcher CI with RELEASE CHANNELS — GitHub Actions, multi-arch (x86_64 + aarch64).
+#
+# A channels-aware variant of ../github-actions.yml. The job *shape* is identical —
+# build (per-arch, native runners) → deploy (assemble + push) → provision (per-arch
+# disks), the loopback container store, and the `changes` path gate — so this header
+# only covers what's DIFFERENT: which channel each trigger publishes to. For the store
+# relocation, the per-arch split rationale, and the secrets, read ../github-actions.yml
+# and ../README.md; nothing there changes.
+#
+#   push to main  → deploy to the default `latest` channel  (rolling / canary fleet)
+#   push a v* tag → deploy to the `stable` channel          (production fleet)
+#
+# THE MECHANISM (see ../../../docs/src/reference/bootcher-toml.md#channels). A channel
+# is a mutable registry tag `<registry>/<name>:<channel>` that a SUBSET of devices
+# tracks. `bootcher deploy --channel stable` pushes the multi-arch list under :stable
+# instead of :latest, so only devices whose bootc origin is :stable pick it up. Every
+# deploy ALSO stamps that same digest with its immutable :CalVer tag regardless of
+# channel — so the version tag is the durable rollback/audit handle and the channel is
+# just a moving pointer to "what that audience sees now".
+#
+# THE PROMOTION MODEL this encodes:
+#   - Every merge to main publishes :latest. Devices provisioned on the default channel
+#     (your dev boxes / QA rigs) auto-update to it on their timer — that's the canary.
+#   - When a commit on main has proven good, tag it `vX.Y.Z`. The tag pipeline rebuilds
+#     THAT commit and publishes it to :stable; production devices (provisioned with
+#     `--channel stable`) only now auto-update. The tag is on the same source commit, so
+#     stable is that validated revision, and `git describe` stamps `vX.Y.Z` as its
+#     version label. (bootcher rebuilds on the tag rather than re-tagging main's exact
+#     digest — same source, fresh CalVer; the immutable CalVer tag is the per-build
+#     identity either way. If you need bit-identical promotion, pull main's CalVer image
+#     and `podman manifest push` it to :stable by hand instead of tagging.)
+#
+# bootcher.toml must DECLARE the channel so `--channel stable` validates — a typo'd
+# channel is rejected, not silently minted as a stray tag:
+#
+#   [deploy]
+#   registry = "ghcr.io/<owner>"     # lowercase; image is ghcr.io/<owner>/<name>
+#   channels = ["stable"]            # the named channel beyond the implicit `latest`
+#
+#   [targets]
+#   x86_64  = "qcow2"
+#   aarch64 = "raw"
+#
+# ENROLLING a device onto a channel is a one-time `provision`/`takeover` from your
+# machine (channels are registry-mode only; there's no LAN equivalent):
+#   bootcher provision --ssh-key admin_key --channel stable   # → follows :stable
+#   bootcher provision --ssh-key admin_key                    # → follows :latest
+# The CI `provision` job below bakes whichever channel matches its trigger, so a
+# tag-triggered run yields a stable-tracking disk and a main run a latest-tracking one.
+#
+# Secrets/variables and the `bootcher.ci.toml` override are unchanged — see ../README.md.
+
+name: bootcher
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+jobs:
+  # --- changes: did anything that affects the image actually change? ----------------
+  # Identical to the base recipe: an allowlist of image inputs; a `v*` tag bypasses it
+  # in `build.if`. Adjust the list to your project.
+  changes:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      image: ${{ steps.filter.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            image:
+              - Containerfile
+              - sysroot/**
+              - bootcher.toml
+              - bootcher.ci.toml
+              - .github/workflows/bootcher.yml
+
+  # --- build: one container per arch, on a native-arch runner -----------------------
+  # Unchanged from the base recipe — channel-agnostic. The per-arch member it saves is
+  # the same artifact whether deploy later publishes it to :latest or :stable; the
+  # channel is chosen only at push time, in `deploy`.
+  build:
+    needs: [changes]
+    if: needs.changes.outputs.image == 'true' || startsWith(github.ref, 'refs/tags/')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm } # native arm64 runner, no emulation
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    container:
+      image: ghcr.io/cdellacqua/bootcher:latest
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+      # Real-fs container store (loopback ext4 so podman does one kernel overlay instead
+      # of fuse-overlayfs-on-overlay). Self-skips on a real fs. Full rationale: the
+      # header of ../github-actions.yml.
+      - name: Prepare container store
+        run: |
+          set -eu
+          if [ "$(stat -f -c %T / 2>/dev/null)" = "overlayfs" ]; then
+            : "${BOOTCHER_STORE_SIZE:=20G}"
+            img=/bootcher-store.img
+            truncate -s "$BOOTCHER_STORE_SIZE" "$img"
+            mkfs.ext4 -q -F "$img"
+            mkdir -p /var/lib/containers/storage
+            mount -o loop "$img" /var/lib/containers/storage
+            echo "relocated podman store onto loopback ext4 (${BOOTCHER_STORE_SIZE} ceiling)"
+          else
+            echo "container store already on a real fs; skipping loopback store"
+          fi
+          podman info --format 'podman store: {{.Store.GraphDriverName}} @ {{.Store.GraphRoot}}'
+      - name: Build ${{ matrix.arch }}
+        run: bootcher --manifest bootcher.ci.toml build --target "${{ matrix.arch }}"
+      - name: Save image member
+        run: |
+          set -eu
+          img="$(podman images --format '{{.Repository}}:{{.Tag}}' | grep ":latest-${{ matrix.arch }}\$" | head -n1)"
+          test -n "$img" || { echo "no built image tagged :latest-${{ matrix.arch }}"; exit 1; }
+          podman save "$img" | zstd -T0 -10 -q -o "image-${{ matrix.arch }}.tar.zst"
+      - name: Upload image member
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-${{ matrix.arch }}
+          path: image-${{ matrix.arch }}.tar.zst
+          retention-days: 1
+
+  # --- deploy: assemble the members and push to THIS RUN's channel ------------------
+  # Same as the base recipe, except the channel is chosen by the trigger: a `v*` tag
+  # publishes to `stable`, anything else (a main push) to the default `latest`. The
+  # `CHANNEL` env resolves to `stable` only on a tag ref; when it's empty we omit the
+  # flag entirely, so bootcher uses its built-in `latest` default (and never has to be
+  # told a channel for the common case).
+  deploy:
+    needs: [build] # waits for every matrix arch
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write # push to GHCR
+    container:
+      image: ghcr.io/cdellacqua/bootcher:latest
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare container store
+        run: |
+          set -eu
+          if [ "$(stat -f -c %T / 2>/dev/null)" = "overlayfs" ]; then
+            : "${BOOTCHER_STORE_SIZE:=20G}"
+            img=/bootcher-store.img
+            truncate -s "$BOOTCHER_STORE_SIZE" "$img"
+            mkfs.ext4 -q -F "$img"
+            mkdir -p /var/lib/containers/storage
+            mount -o loop "$img" /var/lib/containers/storage
+            echo "relocated podman store onto loopback ext4 (${BOOTCHER_STORE_SIZE} ceiling)"
+          else
+            echo "container store already on a real fs; skipping loopback store"
+          fi
+          podman info --format 'podman store: {{.Store.GraphDriverName}} @ {{.Store.GraphRoot}}'
+      - name: Download image members
+        uses: actions/download-artifact@v4
+        with:
+          pattern: image-*
+          merge-multiple: true
+      - name: Log in to GHCR
+        run: echo "$GITHUB_TOKEN" | podman login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Signing? Materialise the cosign key `[deploy] registry.key` points at:
+      # - run: printf '%s' "$SIGN_KEY" > cosign.key
+      #   env: { SIGN_KEY: "${{ secrets.SIGN_KEY }}" }
+      - name: Load members + deploy to channel
+        # Load every per-arch member, then assemble + push under this run's channel.
+        # `--channel` is added only on a tag (CHANNEL=stable); a main push leaves it
+        # empty and falls through to bootcher's `latest` default. `--skip-bootc-upgrade`
+        # leaves the rollout to each device's auto-update timer (see ../README.md).
+        run: |
+          set -eu
+          for f in image-*.tar.zst; do zstd -dc "$f" | podman load; done
+          if [ -n "${CHANNEL:-}" ]; then
+            echo "deploying to channel: $CHANNEL"
+            bootcher --manifest bootcher.ci.toml deploy --skip-build --skip-bootc-upgrade --channel "$CHANNEL"
+          else
+            echo "deploying to default channel: latest"
+            bootcher --manifest bootcher.ci.toml deploy --skip-build --skip-bootc-upgrade
+          fi
+        env:
+          # tag (refs/tags/v*) → stable; main push → empty → bootcher's default `latest`.
+          CHANNEL: ${{ startsWith(github.ref, 'refs/tags/v') && 'stable' || '' }}
+          BOOTCHER_SIGN_PASSPHRASE: ${{ secrets.SIGN_PASSPHRASE }}
+
+  # --- provision: build a flashable disk that TRACKS this run's channel -------------
+  # Same as the base recipe, but (1) it runs on tags too, not only main, and (2) it bakes
+  # the matching channel into the disk: a `v*`-tag run yields a disk whose bootc origin is
+  # :stable (a production device), a main run a :latest disk (a canary device). `provision
+  # --channel` sets the device origin, so the flashed device follows that channel from
+  # first boot — no post-flash `bootc switch` needed. The per-commit Release tag/asset is
+  # namespaced by channel so the latest- and stable-tracking disks never overwrite each
+  # other.
+  #
+  # SETUP (once): Settings → Environments → New environment `provision` → enable
+  # "Required reviewers" and add yourself, so each disk build pauses for approval.
+  provision:
+    needs: [deploy]
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    environment: provision # required-reviewer protection = the manual approval gate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, disk: qcow2, runner: ubuntu-24.04 }
+          - { arch: aarch64, disk: raw, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write # create the Release + upload the disk as an asset
+      packages: read # pull the deploy-built image back from GHCR for --skip-build
+    container:
+      image: ghcr.io/cdellacqua/bootcher:latest
+      options: --privileged
+    env:
+      # The channel this disk will track, mirroring the deploy above: tag → stable,
+      # main → latest. Used both for `provision --channel` and to namespace the Release.
+      CHANNEL: ${{ startsWith(github.ref, 'refs/tags/v') && 'stable' || 'latest' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare container store
+        run: |
+          set -eu
+          if [ "$(stat -f -c %T / 2>/dev/null)" = "overlayfs" ]; then
+            : "${BOOTCHER_STORE_SIZE:=20G}"
+            img=/bootcher-store.img
+            truncate -s "$BOOTCHER_STORE_SIZE" "$img"
+            mkfs.ext4 -q -F "$img"
+            mkdir -p /var/lib/containers/storage
+            mount -o loop "$img" /var/lib/containers/storage
+            echo "relocated podman store onto loopback ext4 (${BOOTCHER_STORE_SIZE} ceiling)"
+          else
+            echo "container store already on a real fs; skipping loopback store"
+          fi
+          podman info --format 'podman store: {{.Store.GraphDriverName}} @ {{.Store.GraphRoot}}'
+      - name: Log in to GHCR
+        run: echo "$GITHUB_TOKEN" | podman login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Write admin public key
+        run: printf '%s\n' "$ADMIN_SSH_PUBKEY" > admin_key.pub
+        env:
+          ADMIN_SSH_PUBKEY: ${{ vars.ADMIN_SSH_PUBKEY }}
+      - name: Provision ${{ matrix.arch }} (${{ matrix.disk }}) tracking ${{ env.CHANNEL }}
+        # `--channel "$CHANNEL"` sets the disk's bootc origin to <registry>/<name>:<channel>
+        # and `--skip-build` pulls that arch's member out of the SAME channel tag deploy just
+        # pushed. `latest` is always valid without being declared, so the main case needs no
+        # manifest change; `stable` must be in `[deploy] channels`. Public registry? Drop the
+        # PULL_* env and append `--anonymous`.
+        run: bootcher --manifest bootcher.ci.toml provision --ssh-key admin_key --target "${{ matrix.arch }}" --disk "${{ matrix.disk }}" --skip-build --channel "$CHANNEL"
+        env:
+          BOOTCHER_PULL_USER: ${{ secrets.PULL_USER }}
+          BOOTCHER_PULL_TOKEN: ${{ secrets.PULL_TOKEN }}
+      - name: Publish disk image to a GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          # Namespace the asset + release tag by channel so stable and latest disks for the
+          # same commit don't clobber each other.
+          file="bootcher-output-${CHANNEL}-${{ matrix.arch }}.tar.zst"
+          short=$(printf '%s' "$GITHUB_SHA" | cut -c1-12)
+          tag="disk-${CHANNEL}-$short"
+          api="https://api.github.com/repos/$GITHUB_REPOSITORY"
+          auth="Authorization: Bearer $GH_TOKEN"
+          tar --sparse -cf - output | zstd -10 -T0 -q -o "$file"
+          get_id() { curl -sf -H "$auth" "$api/releases/tags/$tag" 2>/dev/null | jq -r '.id // empty' || true; }
+          id=$(get_id)
+          if [ -z "$id" ]; then
+            curl -sf -X POST -H "$auth" "$api/releases" \
+              -d "$(jq -n --arg t "$tag" --arg c "$GITHUB_SHA" \
+                    '{tag_name:$t, target_commitish:$c, name:$t, body:"bootcher provision disks (\($t)) for \($c)"}')" \
+              >/dev/null 2>&1 || true
+            id=$(get_id)
+          fi
+          test -n "$id" || { echo "could not get or create release $tag"; exit 1; }
+          old=$(curl -sf -H "$auth" "$api/releases/$id/assets" | jq -r --arg n "$file" '.[] | select(.name==$n) | .id')
+          [ -n "$old" ] && curl -sf -X DELETE -H "$auth" "$api/releases/assets/$old"
+          curl -s --fail-with-body -X POST \
+            -H "$auth" -H "Content-Type: application/zstd" \
+            --data-binary @"$file" \
+            "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$id/assets?name=$file"
+          echo
+          echo "disk published to release: $tag (asset $file) — tracks the '$CHANNEL' channel"
+          echo "download from the repo's Releases page, then unpack: zstd -d < $file | tar -xf -"

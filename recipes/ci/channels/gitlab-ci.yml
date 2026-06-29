@@ -1,0 +1,211 @@
+# bootcher CI with RELEASE CHANNELS — GitLab CI, multi-arch (x86_64 + aarch64).
+#
+# A channels-aware variant of ../gitlab-ci.yml. The pipeline *shape* is identical —
+# build (per-arch, native runners) → deploy (assemble + push) → provision (per-arch
+# disks), the loopback container store in `before_script`, and the `.image-rules` path
+# gate — so this header only covers what's DIFFERENT: which channel each trigger
+# publishes to. For the store relocation, the per-arch split rationale, and the CI/CD
+# variables, read ../gitlab-ci.yml and ../README.md; nothing there changes.
+#
+#   push to default branch → deploy to the default `latest` channel  (rolling / canary)
+#   push a v* tag          → deploy to the `stable` channel          (production fleet)
+#
+# THE MECHANISM (see ../../../docs/src/reference/bootcher-toml.md#channels). A channel
+# is a mutable registry tag `<registry>/<name>:<channel>` that a SUBSET of devices
+# tracks. `bootcher deploy --channel stable` pushes the multi-arch list under :stable
+# instead of :latest, so only devices whose bootc origin is :stable pick it up. Every
+# deploy ALSO stamps that same digest with its immutable :CalVer tag regardless of
+# channel — so the version tag is the durable rollback/audit handle and the channel is
+# just a moving pointer to "what that audience sees now".
+#
+# THE PROMOTION MODEL this encodes:
+#   - Every push to the default branch publishes :latest. Devices provisioned on the
+#     default channel (dev boxes / QA rigs) auto-update to it on their timer — the canary.
+#   - When a commit has proven good, tag it `vX.Y.Z`. The tag pipeline rebuilds THAT
+#     commit and publishes it to :stable; production devices (provisioned with `--channel
+#     stable`) only now auto-update. The tag is on the same source commit, so stable is
+#     that validated revision and `git describe` stamps `vX.Y.Z` as its version label.
+#     (bootcher rebuilds on the tag rather than re-tagging the default branch's exact
+#     digest — same source, fresh CalVer; the immutable CalVer tag is the per-build
+#     identity either way. Need bit-identical promotion? Pull the branch's CalVer image
+#     and `podman manifest push` it to :stable by hand instead of tagging.)
+#
+# bootcher.toml must DECLARE the channel so `--channel stable` validates — a typo'd
+# channel is rejected, not silently minted as a stray tag:
+#
+#   [deploy]
+#   registry = "registry.gitlab.com/<group>/<project>"   # == $CI_REGISTRY_IMAGE
+#   channels = ["stable"]                                # beyond the implicit `latest`
+#
+#   [targets]
+#   x86_64  = "qcow2"
+#   aarch64 = "raw"
+#
+# ENROLLING a device onto a channel is a one-time `provision`/`takeover` from your
+# machine (channels are registry-mode only; there's no LAN equivalent):
+#   bootcher provision --ssh-key admin_key --channel stable   # → follows :stable
+#   bootcher provision --ssh-key admin_key                    # → follows :latest
+# The `provision` jobs below bake whichever channel matches the trigger, so a tag
+# pipeline yields stable-tracking disks and a branch pipeline latest-tracking ones.
+#
+# CI/CD variables, Secure Files (signing), and the `bootcher.ci.toml` override are
+# unchanged — see ../README.md.
+
+default:
+  image:
+    name: ghcr.io/cdellacqua/bootcher:latest
+    entrypoint: [""]
+  before_script:
+    # Real-fs container store (loopback ext4 so podman does one kernel overlay instead
+    # of fuse-overlayfs-on-overlay). Self-skips on a real fs. Full rationale: the header
+    # of ../gitlab-ci.yml.
+    - |
+      set -eu
+      if [ "$(stat -f -c %T / 2>/dev/null)" = "overlayfs" ]; then
+        : "${BOOTCHER_STORE_SIZE:=20G}"
+        img=/bootcher-store.img
+        truncate -s "$BOOTCHER_STORE_SIZE" "$img"
+        mkfs.ext4 -q -F "$img"
+        mkdir -p /var/lib/containers/storage
+        mount -o loop "$img" /var/lib/containers/storage
+        echo "relocated podman store onto loopback ext4 (${BOOTCHER_STORE_SIZE} ceiling)"
+      else
+        echo "container store already on a real fs; skipping loopback store"
+      fi
+      podman info --format 'podman store: {{.Store.GraphDriverName}} @ {{.Store.GraphRoot}}'
+
+stages: [build, deploy, provision]
+
+# --- when to run: only when something that affects the image changed --------------
+# Identical to the base recipe: an allowlist of image inputs on the default-branch
+# rule, and a tag rule with no `changes:` (a `v*` tag always builds). Tune the list to
+# your project.
+.image-rules:
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes:
+        paths:
+          - Containerfile
+          - sysroot/**/*
+          - bootcher.toml
+          - bootcher.ci.toml
+          - .gitlab-ci.yml
+
+# --- build: one container per arch, on a native-arch runner -----------------------
+# Unchanged from the base recipe — channel-agnostic. The per-arch member it saves is the
+# same artifact whether deploy later publishes it to :latest or :stable; the channel is
+# chosen only at push time, in `deploy`.
+.build:
+  stage: build
+  rules: !reference [.image-rules, rules]
+  script:
+    - bootcher --manifest bootcher.ci.toml build --target "$ARCH"
+    - |
+      img="$(podman images --format '{{.Repository}}:{{.Tag}}' | grep ":latest-${ARCH}\$" | head -n1)"
+      test -n "$img" || { echo "no built image tagged :latest-${ARCH}"; exit 1; }
+      podman save "$img" | zstd -T0 -10 -q -o "image-${ARCH}.tar.zst"
+  artifacts:
+    paths: ["image-${ARCH}.tar.zst"]
+    expire_in: 1 day
+
+build:x86_64:
+  extends: .build
+  variables:
+    ARCH: x86_64
+
+build:aarch64:
+  extends: .build
+  variables:
+    ARCH: aarch64
+  tags: [saas-linux-small-arm64]
+
+# --- deploy: assemble the members and push to THIS PIPELINE's channel -------------
+# Same as the base recipe, except the channel is chosen by the trigger: a `v*` tag
+# publishes to `stable`, anything else (a default-branch push) to the default `latest`.
+# `$CI_COMMIT_TAG` is set only on a tag pipeline, so we add `--channel stable` then and
+# omit the flag otherwise — letting bootcher use its built-in `latest` default.
+deploy:
+  stage: deploy
+  needs: ["build:x86_64", "build:aarch64"]
+  rules: !reference [.image-rules, rules]
+  # Signing? Uncomment to set the cosign key passphrase (use "" if it has none):
+  # variables:
+  #   BOOTCHER_SIGN_PASSPHRASE: ""
+  script:
+    - echo "$CI_REGISTRY_PASSWORD" | podman login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
+    - for f in image-*.tar.zst; do zstd -dc "$f" | podman load; done
+    # Signing? Fetch the cosign key from Secure Files first (see ../gitlab-ci.yml).
+    # `--channel stable` on a tag pipeline; otherwise no flag → bootcher's `latest`.
+    # `--skip-bootc-upgrade` leaves the rollout to each device's auto-update timer.
+    - |
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then CHANNEL=stable; else CHANNEL=; fi
+      if [ -n "$CHANNEL" ]; then
+        echo "deploying to channel: $CHANNEL"
+        bootcher --manifest bootcher.ci.toml deploy --skip-build --skip-bootc-upgrade --channel "$CHANNEL"
+      else
+        echo "deploying to default channel: latest"
+        bootcher --manifest bootcher.ci.toml deploy --skip-build --skip-bootc-upgrade
+      fi
+
+# --- provision: build a flashable disk that TRACKS this pipeline's channel --------
+# Same as the base recipe, but it's playable on tag pipelines too, and it bakes the
+# matching channel into the disk: a `v*`-tag run yields a disk whose bootc origin is
+# :stable (a production device), a default-branch run a :latest disk (a canary device).
+# `provision --channel` sets the device origin, so the flashed device follows that
+# channel from first boot. The Package Registry path is namespaced by channel so the
+# stable and latest disks for a commit don't overwrite each other.
+.provision:
+  stage: provision
+  needs: ["deploy"]
+  rules:
+    # Manual on BOTH a tag and the default branch (the base recipe is default-branch
+    # only). `when: manual` must live inside the rule, and `allow_failure: true` keeps
+    # this optional job from blocking the pipeline — play it from the UI for a disk.
+    - if: $CI_COMMIT_TAG
+      when: manual
+      allow_failure: true
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: true
+  variables:
+    PKG_NAME: disk
+  script:
+    - echo "$CI_REGISTRY_PASSWORD" | podman login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
+    - printf '%s\n' "$ADMIN_SSH_PUBKEY" > admin_key.pub
+    # The channel this disk will track, mirroring the deploy: tag → stable, branch → latest.
+    # `--channel` sets the disk's bootc origin and `--skip-build` pulls that arch's member
+    # out of the SAME channel tag deploy pushed. `latest` is always valid without being
+    # declared; `stable` must be in `[deploy] channels`. Public registry? Append `--anonymous`.
+    - |
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then CHANNEL=stable; else CHANNEL=latest; fi
+      echo "provisioning a disk that tracks the '$CHANNEL' channel"
+      bootcher --manifest bootcher.ci.toml provision --ssh-key admin_key --target "$ARCH" --disk "$DISK" --skip-build --channel "$CHANNEL"
+    # Stream output/ to the generic Package Registry, versioned by channel + commit + arch
+    # so stable and latest disks never collide. See ../gitlab-ci.yml for the streaming
+    # trade-offs (no --retry on a pipe; pipefail guards a truncated upload).
+    - |
+      if (set -o pipefail) 2>/dev/null; then set -o pipefail; fi
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then CHANNEL=stable; else CHANNEL=latest; fi
+      file="bootcher-output-${CHANNEL}-${ARCH}.tar.zst"
+      url="$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/$PKG_NAME/$CHANNEL-$CI_COMMIT_SHORT_SHA/$file"
+      tar --sparse -cf - output | zstd -10 -T0 -q | \
+        curl --fail-with-body \
+          --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+          --upload-file - "$url"
+      echo
+      echo "disk published: $url — tracks the '$CHANNEL' channel"
+      echo "download + unpack with: curl --header \"PRIVATE-TOKEN: <token>\" \"$url\" | zstd -d | tar -xf -"
+
+provision:x86_64:
+  extends: .provision
+  variables:
+    ARCH: x86_64
+    DISK: qcow2
+
+provision:aarch64:
+  extends: .provision
+  variables:
+    ARCH: aarch64
+    DISK: raw
+  tags: [saas-linux-small-arm64]

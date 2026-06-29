@@ -49,6 +49,12 @@ Drop one arch from the matrix (GitHub) / delete the second `build:`/`provision:`
 | GitLab CI | [`gitlab-ci.yml`](gitlab-ci.yml) | `.gitlab-ci.yml` (repo root) |
 | Both | [`bootcher.ci.toml`](bootcher.ci.toml) | `bootcher.ci.toml` (repo root, beside `bootcher.toml`) |
 
+**Release channels?** For a workflow where the default branch publishes the rolling
+`latest` channel and a `v*` git tag promotes to a `stable` channel for a production
+fleet, see the [`channels/`](channels/) variant of this recipe — same pipeline shape,
+with the trigger choosing which [channel](../../docs/src/reference/bootcher-toml.md#channels)
+each push publishes to.
+
 Both pipelines run **inside the published bootcher image**,
 [`ghcr.io/cdellacqua/bootcher`](https://ghcr.io/cdellacqua/bootcher) — multi-arch
 (amd64 + arm64), bundling podman and qemu — so there's nothing to install in the
