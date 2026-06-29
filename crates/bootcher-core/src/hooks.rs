@@ -96,6 +96,17 @@ pub(crate) struct HookMetadata {
 	/// at `build`, the bootc-origin source ref at `disk`, the pushed/served list ref
 	/// at `upgrade`. Deterministic from the manifest, so it's valid even at `pre`.
 	pub image_ref: String,
+	/// The git commit the image was built from (`org.opencontainers.image.revision`),
+	/// `-dirty`-suffixed for an uncommitted tree. Mirrors the OCI label stamped on the
+	/// container, so a hook and the device's `bootc status` agree. Omitted when the
+	/// project isn't a git work tree (see [`crate::context::GitProvenance`]).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub revision: Option<String>,
+	/// A human description of the build (`org.opencontainers.image.version` —
+	/// `git describe`: nearest tag, else short SHA). Mirrors the OCI label; omitted
+	/// outside a git work tree. See [`crate::context::GitProvenance`].
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub version: Option<String>,
 	/// The base output dir (relative to the project root) — `disk` phase only.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub output_dir: Option<PathBuf>,
@@ -182,6 +193,8 @@ mod tests {
 			image_name: "kiosk".into(),
 			arches: vec![Arch::X86_64, Arch::Aarch64],
 			image_ref: "registry.example.com/org/kiosk:latest".into(),
+			revision: None,
+			version: None,
 			output_dir: Some(PathBuf::from("output")),
 			targets: Some(vec![
 				DiskTargetMeta {
@@ -225,6 +238,8 @@ mod tests {
 			image_name: "kiosk".into(),
 			arches: vec![Arch::X86_64],
 			image_ref: "localhost/kiosk:latest".into(),
+			revision: None,
+			version: None,
 			output_dir: None,
 			targets: None,
 			remotes: None,
@@ -237,6 +252,28 @@ mod tests {
 		assert!(!obj.contains_key("output_dir"));
 		assert!(!obj.contains_key("targets"));
 		assert!(!obj.contains_key("remotes"));
+		// Provenance is absent outside a git work tree — omitted, not null.
+		assert!(!obj.contains_key("revision"));
+		assert!(!obj.contains_key("version"));
+	}
+
+	#[test]
+	fn provenance_fields_serialize_when_present() {
+		let meta = HookMetadata {
+			phase: Phase::Build,
+			stage: Stage::Post,
+			image_name: "kiosk".into(),
+			arches: vec![Arch::X86_64],
+			image_ref: "localhost/kiosk:latest".into(),
+			revision: Some("abc123-dirty".into()),
+			version: Some("v1.2.3-4-gabc123-dirty".into()),
+			output_dir: None,
+			targets: None,
+			remotes: None,
+		};
+		let v = json_of(&meta);
+		assert_eq!(v["revision"], "abc123-dirty");
+		assert_eq!(v["version"], "v1.2.3-4-gabc123-dirty");
 	}
 
 	#[test]
@@ -247,6 +284,8 @@ mod tests {
 			image_name: "kiosk".into(),
 			arches: vec![Arch::X86_64],
 			image_ref: "registry.example.com/org/kiosk:latest".into(),
+			revision: None,
+			version: None,
 			output_dir: None,
 			targets: None,
 			remotes: Some(vec!["root@10.0.0.2".into()]),

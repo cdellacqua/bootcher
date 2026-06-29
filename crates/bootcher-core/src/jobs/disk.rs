@@ -95,12 +95,15 @@ pub(crate) fn run(
 				.map(|disk_type| DiskTarget { image: image.clone(), disk_type })
 		})
 		.collect();
+	let provenance = crate::context::GitProvenance::detect(std::path::Path::new("."));
 	let mut meta = HookMetadata {
 		phase: Phase::Disk,
 		stage: Stage::Pre,
 		image_name: manifest.general.name.clone(),
 		arches: images.iter().map(|i| i.arch).collect(),
 		image_ref: registry_ref.clone().unwrap_or_else(|| local_list_ref.clone()),
+		revision: provenance.revision,
+		version: provenance.version,
 		output_dir: Some(PathBuf::from("output")),
 		targets: Some(target_meta(&targets, false)),
 		remotes: None,

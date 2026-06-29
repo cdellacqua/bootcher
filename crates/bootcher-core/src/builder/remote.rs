@@ -81,8 +81,11 @@ impl Builder for RemoteBuilder {
 		//    is a no-op rather than emulation — the whole point of relocating).
 		//    `FROM localhost/base:…` resolves because the caller built base first.
 		let build = format!(
-			"sudo podman build{opts} --os linux --arch {arch} -t {tag} -f {ctx_dir}/Containerfile {ctx_dir}",
+			"sudo podman build{opts}{labels} --os linux --arch {arch} -t {tag} -f {ctx_dir}/Containerfile {ctx_dir}",
 			opts = crate::podman::opts_shell(&self.podman_opts),
+			// Provenance `--label`s, sh-quoted like `podman_opts` so the same tokens
+			// the in-process build splices as argv land here identically.
+			labels = crate::podman::opts_shell(&image.labels),
 			arch = image.arch.oci_arch(),
 		);
 		let argv = self.ssh.argv(&[], &build);

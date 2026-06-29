@@ -247,8 +247,10 @@ pub(crate) fn run(
 	let files = provisioning.files();
 	let max_workers = manifest.concurrency().takeover;
 
+	let provenance = crate::context::GitProvenance::detect(std::path::Path::new("."));
+	let calver = crate::context::calver_now(provenance.short_sha().as_deref());
 	if let Some(latest_ref) = manifest.registry_list_ref()
-		&& let Some(version_ref) = manifest.registry_version_ref(&crate::context::calver_now())
+		&& let Some(version_ref) = manifest.registry_version_ref(&calver)
 	{
 		// Registry mode: the host pulls the ref directly, so it must be in the registry
 		// first. Push the multi-arch list (signing it if configured), then hand each

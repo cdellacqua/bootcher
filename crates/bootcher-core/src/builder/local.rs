@@ -51,6 +51,9 @@ impl Builder for LocalBuilder {
 			"-t".into(), image.tag().into(),
 			"-f".into(), image.build_ctx.join("Containerfile").into(),
 		]);
+		// Provenance `--label`s (git revision/describe); empty unless the build path
+		// set them. Spliced like `podman_opts` — a plain `&[String]` → argv map.
+		args.extend(image.labels.iter().map(OsString::from));
 		args.push(image.build_ctx.clone().into());
 		let build_cmd = cmd("podman", args);
 

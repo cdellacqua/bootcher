@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::num::NonZeroUsize;
@@ -1051,6 +1052,9 @@ impl Manifest {
 			rootfs: self.general.rootfs,
 			build_ctx: PathBuf::from("."),
 			registry: self.deploy.registry.as_ref().map(|r| r.namespace().to_owned()),
+			// Filled on the build path (see `jobs::build`); empty for the many
+			// non-build callers that only read a ref, so this never invokes git.
+			labels: Vec::new(),
 		}
 	}
 
@@ -1318,6 +1322,11 @@ pub struct ImageRef {
 	/// Registry namespace from the manifest, if any — the registry/LAN deploy
 	/// switch (see [`Manifest::registry_list_ref`]).
 	pub registry: Option<String>,
+	/// OCI provenance labels to stamp on the built container, as ready-to-splice
+	/// `--label <key>=<value>` argv tokens (from [`GitProvenance::label_args`]).
+	/// Empty unless the build path enriched it — [`Manifest::image`] leaves it empty
+	/// so reading an image ref never shells out to git.
+	pub labels: Vec<String>,
 }
 
 impl fmt::Display for ImageRef {
@@ -1360,13 +1369,124 @@ impl DiskTarget {
 	}
 }
 
-/// The current UTC instant as a `CalVer` tag, `YYYYMMDD.HH.MM` (e.g.
-/// `20260113.12.33`). Minute resolution: two pushes within the same minute reuse
-/// the tag (the later overwrites the pointer, both at the same digest anyway).
-/// UTC so tags from different machines sort and compare unambiguously.
+/// The current UTC instant as a `CalVer` tag. With a git `short_sha` it reads
+/// `YYYYMMDD.HHMM.g<short-sha>` (e.g. `20260113.1233.g0a1b2c3d4e5f`); without one
+/// (no git) it falls back to `YYYYMMDD.HH.MM` (e.g. `20260113.12.33`).
+///
+/// The commit suffix is what makes the tag a *stable identity* rather than a mere
+/// clock reading: it pins the exact source the image was built from, so the tag
+/// can't silently mean two different trees built in the same minute. Without git
+/// the timestamp is all we have, so minute resolution is the collision floor: two
+/// separate deploys within the same minute reuse the tag, and the later one
+/// silently re-points it at its own (freshly built, distinct) digest.
+/// UTC throughout so tags from different machines sort and compare unambiguously.
 #[must_use]
-pub fn calver_now() -> String {
-	jiff::Timestamp::now().strftime("%Y%m%d.%H.%M").to_string()
+pub fn calver_now(short_sha: Option<&str>) -> String {
+	let now = jiff::Timestamp::now();
+	match short_sha {
+		Some(sha) => format!("{}.g{sha}", now.strftime("%Y%m%d.%H%M")),
+		None => now.strftime("%Y%m%d.%H.%M").to_string(),
+	}
+}
+
+/// Git provenance for the project tree at `dir` (the build context / project
+/// root): the commit a build came from and a human-readable description of it.
+/// Stamped onto the built container as the standard OCI `org.opencontainers.image.*`
+/// labels (so a device's `bootc status` can name what it's running) and surfaced
+/// in `BOOTCHER_METADATA` for hooks.
+///
+/// Strictly best-effort: every field is `None` when it can't be resolved — `dir`
+/// isn't a git work tree, `git` isn't installed, or the repo has no commit yet —
+/// so a project that doesn't live in git just builds without provenance rather
+/// than failing. This is the one place bootcher consults git; it never gates a build.
+#[derive(Clone, Debug, Default)]
+pub struct GitProvenance {
+	/// Full commit SHA (`git rev-parse HEAD`), suffixed `-dirty` when the work tree
+	/// has uncommitted changes — so a label can't silently claim a clean commit the
+	/// image wasn't actually built from. `org.opencontainers.image.revision`.
+	pub revision: Option<String>,
+	/// Human description (`git describe --tags --always --dirty`): the nearest tag
+	/// (with the commit distance/SHA when ahead of it), or a short SHA when the repo
+	/// is untagged, `-dirty`-suffixed likewise. `org.opencontainers.image.version`.
+	pub version: Option<String>,
+}
+
+impl GitProvenance {
+	/// Detect the provenance of the work tree at `dir` (the build context). Runs a
+	/// few quiet `git` queries; any failure leaves the corresponding field `None`
+	/// (see the type docs). Called once on the build path, not from
+	/// [`Manifest::image`], so merely reading an image ref never shells out to git.
+	#[must_use]
+	pub fn detect(dir: &Path) -> Self {
+		let revision = git_capture(dir, &["rev-parse", "HEAD"])
+			.map(|sha| if git_dirty(dir) { format!("{sha}-dirty") } else { sha });
+		let version = git_capture(dir, &["describe", "--tags", "--always", "--dirty"]);
+		Self { revision, version }
+	}
+
+	/// The abbreviated commit for use as the `CalVer` tag suffix (see [`calver_now`]):
+	/// the first 12 hex chars of [`Self::revision`], with its `-dirty` marker preserved
+	/// (so a tag built from an uncommitted tree can't masquerade as the clean commit).
+	/// `None` when there's no revision — i.e. no git — which is exactly when
+	/// [`calver_now`] drops back to its timestamp-only form.
+	#[must_use]
+	pub fn short_sha(&self) -> Option<String> {
+		self.revision.as_deref().map(|rev| {
+			let (sha, dirty) = match rev.strip_suffix("-dirty") {
+				Some(clean) => (clean, "-dirty"),
+				None => (rev, ""),
+			};
+			let short: String = sha.chars().take(12).collect();
+			format!("{short}{dirty}")
+		})
+	}
+
+	/// The provenance as ready-to-splice `--label <key>=<value>` argv tokens — one
+	/// pair per field that resolved, empty when none did. Reused for both the argv
+	/// (in-process build) and shell-string (remote build, via
+	/// [`crate::podman::opts_shell`]) `podman build` invocations, so the two backends
+	/// stamp identical labels.
+	#[must_use]
+	pub fn label_args(&self) -> Vec<String> {
+		let mut out = Vec::new();
+		for (key, val) in [
+			("org.opencontainers.image.revision", &self.revision),
+			("org.opencontainers.image.version", &self.version),
+		] {
+			if let Some(val) = val {
+				out.push("--label".to_owned());
+				out.push(format!("{key}={val}"));
+			}
+		}
+		out
+	}
+}
+
+/// Run `git -C <dir> <args>`, returning trimmed stdout, or `None` on any failure
+/// (not a git work tree, `git` missing, empty repo, non-zero exit). git's stderr is
+/// discarded — provenance detection is silent and best-effort. An empty result is
+/// also `None`, so a clean `git status --porcelain` reads as "no output".
+fn git_capture(dir: &Path, args: &[&str]) -> Option<String> {
+	let mut full: Vec<OsString> = vec!["-C".into(), dir.into()];
+	full.extend(args.iter().map(OsString::from));
+	duct::cmd("git", full)
+		.stderr_null()
+		.stdout_capture()
+		.unchecked()
+		.run()
+		.ok()
+		.filter(|o| o.status.success())
+		.and_then(|o| {
+			let s = String::from_utf8_lossy(&o.stdout).trim().to_owned();
+			(!s.is_empty()).then_some(s)
+		})
+}
+
+/// Whether the work tree at `dir` has uncommitted changes (`git status --porcelain`
+/// is non-empty). Only consulted once `rev-parse HEAD` has confirmed `dir` is a git
+/// repo, so a `false` here always means "clean", never "not git".
+fn git_dirty(dir: &Path) -> bool {
+	git_capture(dir, &["status", "--porcelain"]).is_some()
 }
 
 #[cfg(test)]
@@ -1645,15 +1765,132 @@ mod tests {
 	}
 
 	#[test]
-	fn calver_now_has_expected_shape() {
+	fn calver_now_without_git_is_timestamp_only() {
 		// `YYYYMMDD.HH.MM`: 8 digits, dot, 2 digits, dot, 2 digits — all numeric.
-		let v = calver_now();
+		let v = calver_now(None);
 		let (date, time) = v.split_once('.').expect("a dot after the date");
 		let (hh, mm) = time.split_once('.').expect("a dot between hour and minute");
 		assert_eq!(date.len(), 8, "date is YYYYMMDD: {v}");
 		assert_eq!(hh.len(), 2, "hour is HH: {v}");
 		assert_eq!(mm.len(), 2, "minute is MM: {v}");
 		assert!(v.chars().all(|c| c.is_ascii_digit() || c == '.'), "digits and dots only: {v}");
+	}
+
+	#[test]
+	fn calver_now_with_git_appends_commit_suffix() {
+		// `YYYYMMDD.HHMM.g<short-sha>`: minute folded into one field, commit suffixed.
+		let v = calver_now(Some("0a1b2c3d4e5f"));
+		let (date, rest) = v.split_once('.').expect("a dot after the date");
+		let (hhmm, sha) = rest.split_once('.').expect("a dot before the commit suffix");
+		assert_eq!(date.len(), 8, "date is YYYYMMDD: {v}");
+		assert_eq!(hhmm.len(), 4, "time is HHMM: {v}");
+		assert!(hhmm.chars().all(|c| c.is_ascii_digit()), "time is numeric: {v}");
+		assert_eq!(sha, "g0a1b2c3d4e5f", "commit suffix is g-prefixed: {v}");
+	}
+
+	#[test]
+	fn short_sha_truncates_and_keeps_dirty_marker() {
+		let clean = GitProvenance { revision: Some("0a1b2c3d4e5f6a7b8c9d".to_owned()), version: None };
+		assert_eq!(clean.short_sha().as_deref(), Some("0a1b2c3d4e5f"));
+
+		let dirty =
+			GitProvenance { revision: Some("0a1b2c3d4e5f6a7b8c9d-dirty".to_owned()), version: None };
+		assert_eq!(dirty.short_sha().as_deref(), Some("0a1b2c3d4e5f-dirty"));
+
+		let none = GitProvenance::default();
+		assert_eq!(none.short_sha(), None);
+	}
+
+	/// Run `git -C dir <args>` in a test, asserting it succeeds — the setup half of
+	/// the provenance tests (the production [`git_capture`] is the read half).
+	fn git(dir: &Path, args: &[&str]) {
+		let mut full: Vec<OsString> = vec!["-C".into(), dir.into()];
+		full.extend(args.iter().map(OsString::from));
+		let out = duct::cmd("git", full).stdout_null().stderr_capture().unchecked().run().unwrap();
+		assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+	}
+
+	#[test]
+	fn provenance_detects_revision_and_tag_then_dirty() {
+		let repo = tempfile::TempDir::new().unwrap();
+		let dir = repo.path();
+		// A self-contained repo: local identity and no signing, so the commit doesn't
+		// depend on (or trip over) the host's global git config.
+		git(dir, &["init", "-q"]);
+		git(dir, &["config", "user.email", "t@example.com"]);
+		git(dir, &["config", "user.name", "Test"]);
+		git(dir, &["config", "commit.gpgsign", "false"]);
+		fs::write(dir.join("Containerfile"), "FROM scratch\n").unwrap();
+		git(dir, &["add", "-A"]);
+		git(dir, &["commit", "-qm", "init"]);
+		git(dir, &["tag", "v1.0.0"]);
+
+		// Clean tree: revision is the full HEAD sha (no `-dirty`), version is the tag.
+		let head = git_capture(dir, &["rev-parse", "HEAD"]).expect("HEAD sha");
+		let clean = GitProvenance::detect(dir);
+		assert_eq!(clean.revision.as_deref(), Some(head.as_str()));
+		assert_eq!(clean.version.as_deref(), Some("v1.0.0"));
+
+		// Dirty the work tree: both fields gain the `-dirty` suffix.
+		fs::write(dir.join("Containerfile"), "FROM scratch\nRUN true\n").unwrap();
+		let dirty = GitProvenance::detect(dir);
+		assert_eq!(dirty.revision.as_deref(), Some(format!("{head}-dirty").as_str()));
+		assert_eq!(dirty.version.as_deref(), Some("v1.0.0-dirty"));
+	}
+
+	#[test]
+	fn provenance_in_untagged_repo_uses_short_sha() {
+		let repo = tempfile::TempDir::new().unwrap();
+		let dir = repo.path();
+		git(dir, &["init", "-q"]);
+		git(dir, &["config", "user.email", "t@example.com"]);
+		git(dir, &["config", "user.name", "Test"]);
+		git(dir, &["config", "commit.gpgsign", "false"]);
+		fs::write(dir.join("Containerfile"), "FROM scratch\n").unwrap();
+		git(dir, &["add", "-A"]);
+		git(dir, &["commit", "-qm", "init"]);
+		// No tag: revision is still the full HEAD sha, but `git describe --always`
+		// falls back to the abbreviated sha — which is a prefix of the full revision.
+		let head = git_capture(dir, &["rev-parse", "HEAD"]).expect("HEAD sha");
+		let p = GitProvenance::detect(dir);
+		assert_eq!(p.revision.as_deref(), Some(head.as_str()));
+		let version = p.version.expect("describe falls back to a short sha");
+		assert!(!version.is_empty(), "version is the abbreviated sha, not empty");
+		assert!(
+			head.starts_with(&version),
+			"untagged describe ({version}) should be a prefix of HEAD ({head})"
+		);
+	}
+
+	#[test]
+	fn provenance_is_empty_outside_a_git_tree() {
+		// A bare temp dir (no `git init`) resolves nothing — provenance is best-effort.
+		let dir = tempfile::TempDir::new().unwrap();
+		let p = GitProvenance::detect(dir.path());
+		assert_eq!(p.revision, None);
+		assert_eq!(p.version, None);
+		assert!(p.label_args().is_empty());
+	}
+
+	#[test]
+	fn provenance_label_args_emits_only_present_fields() {
+		// Both fields → two `--label k=v` pairs, revision before version.
+		let both =
+			GitProvenance { revision: Some("abc123".into()), version: Some("v1.0.0".into()) };
+		assert_eq!(
+			both.label_args(),
+			[
+				"--label",
+				"org.opencontainers.image.revision=abc123",
+				"--label",
+				"org.opencontainers.image.version=v1.0.0",
+			]
+		);
+		// A single resolved field yields a single pair…
+		let rev_only = GitProvenance { revision: Some("abc123".into()), version: None };
+		assert_eq!(rev_only.label_args(), ["--label", "org.opencontainers.image.revision=abc123"]);
+		// …and nothing resolved (not a git tree) stamps no labels at all.
+		assert!(GitProvenance::default().label_args().is_empty());
 	}
 
 	#[test]

@@ -79,6 +79,7 @@ fn assembles_a_multi_arch_manifest_list_from_per_arch_members() {
 		rootfs: Rootfs::Ext4,
 		build_ctx: PathBuf::from("."),
 		registry: None,
+		labels: Vec::new(),
 	};
 	let images = [image(Arch::X86_64), image(Arch::Aarch64)];
 

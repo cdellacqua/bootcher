@@ -78,6 +78,10 @@ pub(crate) fn run(manifest: &Manifest, skip_bootc_upgrade: bool, job: &mut Scope
 		bail!("no target arches to deploy — set `[targets]` in bootcher.toml");
 	}
 	let remote_hosts: Vec<String> = remotes.iter().map(|s| s.host().to_owned()).collect();
+	let provenance = crate::context::GitProvenance::detect(std::path::Path::new("."));
+	// Compute the immutable CalVer tag now, while `provenance` is still whole (its
+	// fields are moved into `meta` just below). The commit suffix pins the tag to source.
+	let calver = crate::context::calver_now(provenance.short_sha().as_deref());
 	let mut meta = HookMetadata {
 		phase: Phase::Upgrade,
 		stage: Stage::Pre,
@@ -86,6 +90,8 @@ pub(crate) fn run(manifest: &Manifest, skip_bootc_upgrade: bool, job: &mut Scope
 		// The ref pushed/served and recorded as the device bootc origin: the registry
 		// list ref in registry mode, else the LAN-served local list ref.
 		image_ref: manifest.registry_list_ref().unwrap_or_else(|| manifest.local_list_ref()),
+		revision: provenance.revision,
+		version: provenance.version,
 		output_dir: None,
 		targets: None,
 		remotes: (!remote_hosts.is_empty()).then_some(remote_hosts),
@@ -94,7 +100,7 @@ pub(crate) fn run(manifest: &Manifest, skip_bootc_upgrade: bool, job: &mut Scope
 	if let Some(latest_ref) = manifest.registry_list_ref()
 	// The immutable companion tag for this push (see `run_registry`); both refs
 	// come from the manifest, not any one arch's image.
-	 && let Some(version_ref) = manifest.registry_version_ref(&crate::context::calver_now())
+	 && let Some(version_ref) = manifest.registry_version_ref(&calver)
 	{
 		let signing = manifest.signing();
 		run_registry(
@@ -127,7 +133,8 @@ pub(crate) fn run(manifest: &Manifest, skip_bootc_upgrade: bool, job: &mut Scope
 
 /// Registry backend: assemble the per-arch members into one multi-arch manifest
 /// list, push it to the configured registry (under the mutable `:latest` channel
-/// tag and an immutable `:YYYYMMDD.HH.MM` `CalVer` tag for the same digest), then
+/// tag and an immutable `CalVer` tag — `:YYYYMMDD.HHMM.g<short-sha>`, or
+/// `:YYYYMMDD.HH.MM` with no git — for the same digest), then
 /// point each listed device's
 /// bootc origin at the (suffix-free) registry ref and upgrade it now. With no
 /// remotes the push is the whole job — every target's auto-update timer fetches
@@ -137,7 +144,7 @@ pub(crate) fn run(manifest: &Manifest, skip_bootc_upgrade: bool, job: &mut Scope
 fn run_registry(
 	local_list_ref: &str,
 	// `(latest_ref, version_ref)`: the mutable `:latest` channel tag and the
-	// immutable `:YYYYMMDD.HH.MM` CalVer tag, both for the same pushed digest.
+	// immutable CalVer tag (see `calver_now`), both for the same pushed digest.
 	refs: (&str, &str),
 	remotes: &[Ssh],
 	signing: Option<&SigningConfig>,
@@ -164,7 +171,7 @@ fn run_registry(
 
 /// Assemble the per-arch members into one multi-arch manifest list and push it to
 /// the registry under both the mutable `latest_ref` (`:latest`) channel tag and the
-/// immutable `version_ref` (`:YYYYMMDD.HH.MM` `CalVer`) tag — the same digest under
+/// immutable `version_ref` (`CalVer`, see `calver_now`) tag — the same digest under
 /// both. Returns whether signature enforcement is in effect (`true` iff `signing`
 /// is configured), so the caller records a verifying origin on each device.
 ///

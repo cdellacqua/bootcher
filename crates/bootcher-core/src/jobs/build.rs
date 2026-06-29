@@ -74,8 +74,16 @@ pub fn preflight(manifest: &Manifest, target: Option<Arch>) -> Result<()> {
 ///
 /// Returns an error if any arch's build fails, a hook fails, or a signal interrupts.
 pub fn run(manifest: &Manifest, target: Option<Arch>, job: &mut Scope) -> Result<()> {
-	let images = manifest.images_for(target);
+	let mut images = manifest.images_for(target);
 	let hooks = manifest.hooks();
+	// Detect git provenance once (the build context is the project root, shared by
+	// every arch) and stamp it as OCI labels on each arch's `podman build`, plus
+	// surface it to the hooks below. Best-effort: absent outside a git work tree.
+	let provenance = crate::context::GitProvenance::detect(std::path::Path::new("."));
+	let labels = provenance.label_args();
+	for image in &mut images {
+		image.labels.clone_from(&labels);
+	}
 	// The hook's `image_ref` names what the build leaves behind: the assembled list
 	// for a full run, or the lone member tag for a targeted (list-less) build, so a
 	// `build.post` hook always points at a ref that exists. Derived straight from the
@@ -91,6 +99,8 @@ pub fn run(manifest: &Manifest, target: Option<Arch>, job: &mut Scope) -> Result
 		image_name: manifest.general.name.clone(),
 		arches: images.iter().map(|i| i.arch).collect(),
 		image_ref,
+		revision: provenance.revision,
+		version: provenance.version,
 		output_dir: None,
 		targets: None,
 		remotes: None,

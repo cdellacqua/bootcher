@@ -14,9 +14,11 @@ bootcher deploy
 2. Collect the freshly-built per-arch images into a local multi-arch manifest list (`localhost/<name>:latest`).
 3. **Push + upgrade** — push the update and trigger `bootc upgrade` on each device. The push backend depends on the manifest:
    - **LAN mode** — serve the image from a loopback registry and forward it over SSH; see [LAN backend](../concepts/deploy-backends.md).
-   - **Registry mode** — `podman push` to `<registry>/<name>:latest`; SSH into each `[deploy] remotes` device and run `bootc upgrade`.
+   - **Registry mode** — `podman push` to `<registry>/<name>:latest`, *and* to an immutable `<registry>/<name>:<version>` tag for the same digest (see [Image identity & provenance](../concepts/image-identity.md)); SSH into each `[deploy] remotes` device and run `bootc upgrade`.
 
 In registry mode with no `[deploy] remotes` configured, the push to the registry is the whole operation. Devices self-update on their `bootc-fetch-apply-updates.timer` schedule.
+
+Both tags carry the git commit they were built from as OCI labels, and you can read either tag or label back from a workstation or a running device — see [Image identity & provenance](../concepts/image-identity.md).
 
 ## Skipping the build
 

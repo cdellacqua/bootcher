@@ -6,6 +6,7 @@
 # Concepts
 
 - [Deploy backends: LAN vs registry](concepts/deploy-backends.md)
+- [Image identity & provenance](concepts/image-identity.md)
 - [Image signing](concepts/signing.md)
 - [Secrets](concepts/secrets.md)
 

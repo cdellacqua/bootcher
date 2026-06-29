@@ -314,6 +314,8 @@ Every hook is run with a single environment variable, `BOOTCHER_METADATA`, holdi
   "image_name": "kiosk",
   "arches": ["x86_64", "aarch64"],
   "image_ref": "registry.example.com/org/kiosk:latest",
+  "revision": "9f3a1c2-dirty",        // git commit the image was built from (omitted outside a git tree)
+  "version": "v1.4.0-2-g9f3a1c2",      // git describe: nearest tag / short SHA (omitted outside a git tree)
 
   // disk phase only:
   "output_dir": "output",
@@ -333,6 +335,8 @@ Every hook is run with a single environment variable, `BOOTCHER_METADATA`, holdi
 | `image_name` | all | `[general] name` |
 | `arches` | all | the `[targets]` keys |
 | `image_ref` | all | suffix-free ref: local list ref at `build`, bootc-origin source ref at `disk`, pushed/served list ref at `upgrade` |
+| `revision` | all | git commit the image was built from (`git rev-parse HEAD`, `-dirty`-suffixed for an uncommitted tree); the `org.opencontainers.image.revision` label stamped on the container. Omitted outside a git work tree |
+| `version` | all | human build description (`git describe --tags --always --dirty`: nearest tag, else short SHA); the `org.opencontainers.image.version` label. Omitted outside a git work tree |
 | `output_dir` | disk | base output dir, relative to the project root |
 | `targets[]` | disk | the `(arch × disk_type)` build matrix; `file` is the resolved `disk.<ext>`, present only at `disk.post` (and omitted if a dir doesn't hold exactly one `disk.*` — fall back to `dir`) |
 | `remotes[]` | upgrade | LAN ssh targets; omitted in pure-registry mode |

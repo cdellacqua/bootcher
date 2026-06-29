@@ -50,6 +50,7 @@ fn serves_a_local_image_that_podman_can_pull() {
 		rootfs: Rootfs::Ext4,
 		build_ctx: ctx.path().to_path_buf(),
 		registry: None,
+		labels: Vec::new(),
 	};
 	let tag = image.tag();
 
