@@ -255,7 +255,7 @@ pub fn verify(image_ref: &str, pubkey_path: &Path, tls_verify: bool, job: &Scope
 	let pubkey_str = tmp_pubkey.to_str().context("pubkey path is not valid UTF-8")?;
 
 	let tmp_policy = tmp.path().join("policy.json");
-	fs::write(&tmp_policy, render_policy_json(ns, &[pubkey_str]))
+	fs::write(&tmp_policy, render_policy_json(image_repo(image_ref), &[pubkey_str]))
 		.context("writing verify policy.json")?;
 	let policy_str = tmp_policy.to_str().context("policy path is not valid UTF-8")?;
 
@@ -273,18 +273,26 @@ pub fn verify(image_ref: &str, pubkey_path: &Path, tls_verify: bool, job: &Scope
 	run_argv(job, &argv)
 }
 
+/// Derive the image repository from a fully-qualified image reference by
+/// stripping the tag (or digest), keeping the registry, namespace, and image-name.
+///
+/// `"192.168.1.1:5000/proj/name:latest"` → `"192.168.1.1:5000/proj/name"`.
+pub(crate) fn image_repo(image_ref: &str) -> &str {
+	// Strip @digest first, then :tag. A colon is a tag separator only when
+	// there's a '/' before it (the colon is inside the path, not host:port).
+	let s = image_ref.split('@').next().unwrap_or(image_ref);
+	if let Some(i) = s.rfind(':') { if s[..i].contains('/') { &s[..i] } else { s } } else { s }
+}
+
 /// Derive the registry namespace from a fully-qualified image reference by
 /// stripping the tag (or digest) and the trailing image-name component.
 ///
 /// `"192.168.1.1:5000/proj/name:latest"` → `"192.168.1.1:5000/proj"`.
 pub(crate) fn registry_namespace(image_ref: &str) -> &str {
-	// Strip @digest first, then :tag. A colon is a tag separator only when
-	// there's a '/' before it (the colon is inside the path, not host:port).
-	let s = image_ref.split('@').next().unwrap_or(image_ref);
-	let s =
-		if let Some(i) = s.rfind(':') { if s[..i].contains('/') { &s[..i] } else { s } } else { s };
-	// Drop the last path component (image name) to arrive at the namespace.
-	s.rfind('/').map_or(s, |i| &s[..i])
+	// Drop the last path component (image name) from the repository to arrive at
+	// the namespace.
+	let repo = image_repo(image_ref);
+	repo.rfind('/').map_or(repo, |i| &repo[..i])
 }
 
 /// Collect the signing passphrase: `BOOTCHER_SIGN_PASSPHRASE` if set (the
@@ -603,6 +611,25 @@ mod tests {
 		];
 		for (input, expected) in cases {
 			assert_eq!(registry_namespace(input), expected, "input: {input}");
+		}
+	}
+
+	#[test]
+	fn image_repo_strips_only_the_tag_or_digest() {
+		let cases = [
+			// typical: host:port / multi-component path / tag — image name kept
+			("192.168.1.1:5000/proj/name:latest", "192.168.1.1:5000/proj/name"),
+			// single path component
+			("localhost:5000/busybox:latest", "localhost:5000/busybox"),
+			// no tag — unchanged
+			("localhost:5000/busybox", "localhost:5000/busybox"),
+			// digest instead of tag
+			("reg.example.com/proj/name@sha256:abc123", "reg.example.com/proj/name"),
+			// bare host:port (no path) — port colon must NOT be treated as tag
+			("localhost:5000", "localhost:5000"),
+		];
+		for (input, expected) in cases {
+			assert_eq!(image_repo(input), expected, "input: {input}");
 		}
 	}
 

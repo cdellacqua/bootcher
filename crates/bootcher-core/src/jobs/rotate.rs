@@ -264,7 +264,7 @@ pub fn signing_key(manifest: &Manifest, pubkey: Option<&str>, job: &mut Scope) -
 
 	let name = &manifest.general.name;
 	let device_pubkey_path = secrets::device_pubkey_path(name);
-	let policy_json = secrets::render_policy_json(ns, &[&device_pubkey_path]);
+	let policy_json = secrets::render_policy_json(&format!("{ns}/{name}"), &[&device_pubkey_path]);
 	let registries_d_path = secrets::device_registries_d_path();
 	let registries_d = secrets::render_registries_d(ns);
 

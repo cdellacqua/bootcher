@@ -65,5 +65,5 @@ See [Signing key rotation](../workflows/rotate/sign-key.md) for the full workflo
 | Path | Purpose |
 |---|---|
 | `/etc/pki/containers/<name>.pub` | The cosign public key the policy verifies against |
-| `/etc/containers/policy.json` | Requires a valid sigstore signature for the project's registry namespace |
+| `/etc/containers/policy.json` | Requires a valid sigstore signature for the project's OS image (other images pull unsigned) |
 | `/etc/containers/registries.d/bootcher-<name>.yaml` | Enables `use-sigstore-attachments` so the signature is fetched alongside the image |

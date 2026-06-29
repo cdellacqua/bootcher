@@ -235,7 +235,7 @@ impl SigningFiles {
 		})?;
 		Ok(Self {
 			name: name.to_owned(),
-			policy_json: render_policy_json(ns, &[&device_pubkey_path(name)]),
+			policy_json: render_policy_json(&format!("{ns}/{name}"), &[&device_pubkey_path(name)]),
 			registries_d: render_registries_d(ns),
 			pubkey_pem,
 		})
@@ -243,14 +243,20 @@ impl SigningFiles {
 }
 
 /// Render the device `policy.json`: a `default: reject` baseline (so the
-/// `ostree-image-signed` origin's `ContainerPolicy` is satisfied — it refuses a
-/// permissive default) plus a `sigstoreSigned` requirement pinning the registry
-/// namespace to the on-device public key(s), with `matchRepository` identity (so
-/// any tag/arch under the namespace verifies against the same key). A single key
-/// uses `keyPath`; several (a `rotate sign-key` transition trusting both the
-/// current and incoming key) use `keyPaths`. `containers-storage` stays permissive
-/// so the device's already-pulled local images keep working.
-pub(crate) fn render_policy_json(ns: &str, keypaths: &[&str]) -> String {
+/// `ostree-image-signed` origin's `ContainerPolicy` is satisfied — ostree-ext
+/// makes a blanket check on the global `default` and refuses to deploy when it's
+/// permissive, regardless of any per-scope rule) plus a `sigstoreSigned`
+/// requirement pinning the OS image repository `repo` to the on-device public
+/// key(s), with `matchRepository` identity (so any tag/arch of that image
+/// verifies against the same key). A single key uses `keyPath`; several (a
+/// `rotate sign-key` transition trusting both the current and incoming key) use
+/// `keyPaths`. A `docker` transport-wide `""` scope of `insecureAcceptAnything`
+/// (more specific than the global `default`, so it wins for everything but
+/// `repo`) lets every *other* image pull unsigned — only the OS image is bound by
+/// the signing policy, so sibling images under the same registry namespace (and
+/// images from any other registry) keep working. `containers-storage` stays
+/// permissive so the device's already-pulled local images keep working.
+pub(crate) fn render_policy_json(repo: &str, keypaths: &[&str]) -> String {
 	let mut req = serde_json::json!({
 		"type": "sigstoreSigned",
 		"signedIdentity": { "type": "matchRepository" }
@@ -264,7 +270,10 @@ pub(crate) fn render_policy_json(ns: &str, keypaths: &[&str]) -> String {
 	let doc = serde_json::json!({
 		"default": [{ "type": "reject" }],
 		"transports": {
-			"docker": { ns: [req] },
+			"docker": {
+				repo: [req],
+				"": [{ "type": "insecureAcceptAnything" }]
+			},
 			"containers-storage": { "": [{ "type": "insecureAcceptAnything" }] }
 		}
 	});
@@ -649,16 +658,21 @@ mod tests {
 	}
 
 	#[test]
-	fn policy_json_requires_a_signature_and_rejects_by_default() {
-		let policy = render_policy_json("reg.example.com/org", &["/etc/pki/containers/kiosk.pub"]);
+	fn policy_json_signs_only_the_os_image_and_rejects_by_default() {
+		let policy =
+			render_policy_json("reg.example.com/org/kiosk", &["/etc/pki/containers/kiosk.pub"]);
 		let v: serde_json::Value = serde_json::from_str(&policy).unwrap();
-		// `default: reject` — ostree-image-signed's ContainerPolicy refuses a permissive
-		// default, and anything outside the signed namespace is denied.
+		// `default: reject` — ostree-image-signed's ContainerPolicy makes a blanket check
+		// on the global `default` and refuses a permissive one.
 		assert_eq!(v["default"][0]["type"], "reject");
-		let req = &v["transports"]["docker"]["reg.example.com/org"][0];
+		// Signing is pinned to the OS image repository, not the whole namespace.
+		let req = &v["transports"]["docker"]["reg.example.com/org/kiosk"][0];
 		assert_eq!(req["type"], "sigstoreSigned");
 		assert_eq!(req["keyPath"], "/etc/pki/containers/kiosk.pub");
 		assert_eq!(req["signedIdentity"]["type"], "matchRepository");
+		// Every *other* image (sibling images under the same namespace, or any other
+		// registry) pulls unsigned via the docker transport-wide wildcard.
+		assert_eq!(v["transports"]["docker"][""][0]["type"], "insecureAcceptAnything");
 		// Local already-pulled images must keep working.
 		assert_eq!(v["transports"]["containers-storage"][""][0]["type"], "insecureAcceptAnything");
 	}
@@ -668,11 +682,11 @@ mod tests {
 		// A `rotate sign-key` transition trusts both the current and incoming key, so
 		// the requirement carries `keyPaths` (plural) rather than `keyPath`.
 		let policy = render_policy_json(
-			"reg/org",
+			"reg/org/name",
 			&["/etc/pki/containers/k.pub", "/etc/pki/containers/k-next.pub"],
 		);
 		let v: serde_json::Value = serde_json::from_str(&policy).unwrap();
-		let req = &v["transports"]["docker"]["reg/org"][0];
+		let req = &v["transports"]["docker"]["reg/org/name"][0];
 		assert!(req["keyPath"].is_null(), "{policy}");
 		assert_eq!(req["keyPaths"][0], "/etc/pki/containers/k.pub");
 		assert_eq!(req["keyPaths"][1], "/etc/pki/containers/k-next.pub");
@@ -693,7 +707,10 @@ mod tests {
 			signing: Some(SigningFiles {
 				name: "kiosk".into(),
 				pubkey_pem: "-----BEGIN PUBLIC KEY-----\nabc\n-----END PUBLIC KEY-----\n".into(),
-				policy_json: render_policy_json("reg/org", &["/etc/pki/containers/kiosk.pub"]),
+				policy_json: render_policy_json(
+					"reg/org/kiosk",
+					&["/etc/pki/containers/kiosk.pub"],
+				),
 				registries_d: render_registries_d("reg/org"),
 			}),
 		};
