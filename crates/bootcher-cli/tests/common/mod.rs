@@ -11,12 +11,17 @@
 //! test that includes it.
 #![allow(dead_code)]
 
+use std::ffi::OsStr;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
+use assert_cmd::Command as AssertCommand;
 use bootcher_core::context::Arch;
+use bootcher_core::progress::Scope;
+use bootcher_core::qemu;
 
 /// The provisioned admin `authorized_keys` file (mirrors the scaffold sshd config).
 pub(crate) const ADMIN_KEYS: &str = "/etc/ssh/authorized_keys.d/admin";
@@ -27,6 +32,12 @@ pub(crate) const SSH_TIMEOUT: Duration = Duration::from_mins(10);
 /// Root for the throwaway run dir *and* the podman store — disk-backed `/var/tmp`,
 /// not tmpfs `/tmp` (might be too small for a ~2GB bootc image) and not the user's home.
 pub(crate) const SCRATCH_BASE: &str = "/var/tmp";
+/// The image-baked sentinel the e2es read back after an upgrade. Under `/usr` so an
+/// upgrade swaps it atomically; [`SENTINEL_REL`] is the same path inside the sysroot
+/// overlay (see [`set_sentinel`]).
+pub(crate) const SENTINEL_PATH: &str = "/usr/lib/bootcher-e2e-sentinel";
+/// Sysroot-relative form of [`SENTINEL_PATH`] (what gets baked into the image).
+pub(crate) const SENTINEL_REL: &str = "usr/lib/bootcher-e2e-sentinel";
 
 // ----------------------------------------------------------------- ssh-agent
 
@@ -348,4 +359,251 @@ impl Drop for StoreGuard {
 		// EACCES on those files wherever podman uses a subuid range).
 		bootcher_core::exec::best_effort(&duct::cmd!("podman", "unshare", "rm", "-rf", &self.dir));
 	}
+}
+
+// ----------------------------------------------------------------- project + image
+
+/// Scaffold a throwaway project with `bootcher init -y <name>` under `hp`, returning
+/// the project dir. Each harness then overwrites `bootcher.toml` with its own manifest.
+pub(crate) fn scaffold_project(hp: &Path, name: &str) -> PathBuf {
+	AssertCommand::cargo_bin("bootcher")
+		.unwrap()
+		.args(["init", "-y", name])
+		.current_dir(hp)
+		.env("HOME", hp)
+		.assert()
+		.success();
+	hp.join(name)
+}
+
+/// Write `content` to `<proj>/sysroot/<rel>` (parent dirs created) — the image overlay
+/// that gets baked into the next build.
+pub(crate) fn write_sysroot(proj: &Path, rel: &str, content: &str) {
+	let p = proj.join("sysroot").join(rel);
+	std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+	std::fs::write(p, content).unwrap();
+}
+
+/// Bake the sentinel value (newline-terminated) into the sysroot overlay at
+/// [`SENTINEL_REL`].
+pub(crate) fn set_sentinel(proj: &Path, value: &str) {
+	write_sysroot(proj, SENTINEL_REL, &format!("{value}\n"));
+}
+
+/// The image-builder-produced `disk.qcow2` under `<proj>/output`.
+pub(crate) fn built_disk(proj: &Path) -> PathBuf {
+	let output = proj.join("output");
+	find_file(&output, "disk.qcow2")
+		.unwrap_or_else(|| panic!("no disk.qcow2 under {}", output.display()))
+}
+
+/// Base `bootcher` command rooted at the project with the env every harness shares —
+/// the throwaway `$HOME`, the e2e's own podman store (`XDG_DATA_HOME`), and (when
+/// `Some`) the ssh-agent socket. Callers chain `.args(...)` and any test-specific
+/// `.env(...)` (signing passphrase, pull credential, cache home).
+pub(crate) fn bootcher_cmd(
+	proj: &Path,
+	home: &Path,
+	store: &str,
+	agent_sock: Option<&Path>,
+) -> AssertCommand {
+	let mut c = AssertCommand::cargo_bin("bootcher").unwrap();
+	c.current_dir(proj).env("HOME", home).env("XDG_DATA_HOME", store);
+	if let Some(sock) = agent_sock {
+		c.env("SSH_AUTH_SOCK", sock);
+	}
+	c
+}
+
+// ----------------------------------------------------------------- boot + serial
+
+/// Create a copy-on-write qcow2 overlay on `base` at `overlay`, optionally grown to
+/// `size` (e.g. `"20G"` for a small cloud image that must fit a `bootc install`). The
+/// base stays pristine so a re-boot starts clean.
+pub(crate) fn make_overlay(base: &Path, overlay: &Path, size: Option<&str>) {
+	let mut args: Vec<&OsStr> =
+		["create", "-q", "-f", "qcow2", "-F", "qcow2", "-b"].into_iter().map(OsStr::new).collect();
+	args.push(base.as_os_str());
+	args.push(overlay.as_os_str());
+	if let Some(size) = size {
+		args.push(OsStr::new(size));
+	}
+	duct::cmd("qemu-img", args).run().expect("creating boot overlay");
+}
+
+/// Copy the guest serial log out of the (about-to-be-removed) temp dir and print its
+/// tail — the only window into a boot that never answered ssh. `tag` names the saved
+/// file (`bootcher-e2e-<tag>-serial.log`) so parallel e2e binaries don't clobber it.
+pub(crate) fn dump_serial(serial_log: &Path, tag: &str) {
+	let dest = PathBuf::from(SCRATCH_BASE).join(format!("bootcher-e2e-{tag}-serial.log"));
+	let _ = std::fs::copy(serial_log, &dest);
+	eprintln!("--- guest serial log (saved to {}) ---", dest.display());
+	if let Ok(s) = std::fs::read_to_string(serial_log) {
+		for line in s.lines().rev().take(50).collect::<Vec<_>>().into_iter().rev() {
+			eprintln!("{line}");
+		}
+	}
+}
+
+/// Wait for `user@127.0.0.1:port` to answer ssh with `key`; on timeout dump the serial
+/// log (which the temp dir would otherwise take with it) and panic with `what`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn wait_for_ssh(
+	user: &str,
+	port: u16,
+	key: &Path,
+	timeout: Duration,
+	scope: &Scope,
+	serial_log: &Path,
+	tag: &str,
+	what: &str,
+) {
+	if let Err(e) = qemu::ssh(user, port, key).wait_until_reachable(timeout, scope) {
+		dump_serial(serial_log, tag);
+		panic!("{what}: {e:#}");
+	}
+}
+
+// ----------------------------------------------------------------- ssh
+
+/// A borrow-only view of one ssh identity to the guest — the login user, forwarded
+/// port, key, and whether to share an ssh-agent. Every harness's `ssh_*` helpers
+/// funnel through this so the retry/transport handling lives in one place. Cheap to
+/// build per call (all borrows), so a test that rotates keys or switches login users
+/// just varies a field.
+pub(crate) struct Ssh<'a> {
+	pub home: &'a Path,
+	pub user: &'a str,
+	pub port: u16,
+	pub key: &'a Path,
+	/// `Some` to share an agent (e.g. takeover's initial login); `None` to offer
+	/// *only* `-i key`, the basis for the rotation tests' "this key works / is
+	/// rejected" assertions.
+	pub agent_sock: Option<&'a Path>,
+}
+
+impl Ssh<'_> {
+	fn command(&self, cmd: &str) -> Command {
+		let argv = qemu::ssh(self.user, self.port, self.key).argv(&[], cmd);
+		let (program, rest) = argv.split_first().unwrap();
+		let mut c = Command::new(program);
+		c.args(rest).env("HOME", self.home);
+		match self.agent_sock {
+			Some(sock) => {
+				c.env("SSH_AUTH_SOCK", sock);
+			}
+			None => {
+				c.env_remove("SSH_AUTH_SOCK");
+			}
+		}
+		c
+	}
+
+	/// Run `cmd` once over a fresh login, capturing its output (stdin nulled).
+	pub(crate) fn capture(&self, cmd: &str) -> Output {
+		self.command(cmd).stdin(Stdio::null()).output().expect("ssh")
+	}
+
+	/// `true` iff a single login runs `cmd` to a zero exit.
+	pub(crate) fn ok(&self, cmd: &str) -> bool {
+		self.capture(cmd).status.success()
+	}
+
+	/// Capture stdout of `cmd`, retrying ~10s through a transient transport blip —
+	/// `Connection timed out during banner exchange`, the guest's sshd answering
+	/// slowly over qemu's user-net (SLIRP) right after a reboot, with no bearing on
+	/// auth (the key is already proven). Used for reads we expect to succeed.
+	pub(crate) fn out(&self, cmd: &str) -> Option<String> {
+		for i in 0..20 {
+			if i > 0 {
+				std::thread::sleep(Duration::from_millis(500));
+			}
+			let out = self.capture(cmd);
+			if out.status.success() {
+				return Some(String::from_utf8_lossy(&out.stdout).into_owned());
+			}
+		}
+		None
+	}
+
+	/// `true` iff a login succeeds within the same retry budget as [`Self::out`].
+	pub(crate) fn reachable(&self) -> bool {
+		(0..20).any(|i| {
+			if i > 0 {
+				std::thread::sleep(Duration::from_millis(500));
+			}
+			self.ok("true")
+		})
+	}
+}
+
+// ----------------------------------------------------------------- registry client
+
+/// The throwaway registry as the *build host* addresses it: bundles the podman env
+/// (project dir, throwaway `$HOME`, dedicated store) and the `<ns>/<name>` reference
+/// the registry-mode e2es query and push to. Every method shells out under that env so
+/// the insecure-registry drop-in in `$HOME` applies. Built ad hoc per call (all borrows).
+pub(crate) struct RegistryClient<'a> {
+	pub proj: &'a Path,
+	pub home: &'a Path,
+	pub store: &'a str,
+	/// `<host_ip>:<reg_port>/<repo>` — the namespace both build host and guest use.
+	pub ns: &'a str,
+	pub name: &'a str,
+}
+
+impl RegistryClient<'_> {
+	/// `podman manifest inspect <ns>/<name>:<tag>`, returning its stdout (the OCI index
+	/// JSON) on success or `None` when the tag is absent / unreachable.
+	pub(crate) fn manifest_inspect(&self, tag: &str) -> Option<String> {
+		let reference = format!("{}/{}:{tag}", self.ns, self.name);
+		let out = duct::cmd!("podman", "manifest", "inspect", "--tls-verify=false", &reference)
+			.dir(self.proj)
+			.env("HOME", self.home)
+			.env("XDG_DATA_HOME", self.store)
+			.stderr_null()
+			.unchecked()
+			.stdout_capture()
+			.run()
+			.ok()?;
+		out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+	}
+
+	/// Whether `<ns>/<name>:<tag>` resolves in the registry (manifest-only, no blobs) —
+	/// proof a push landed under the expected tag (and didn't silently create another).
+	pub(crate) fn has_tag(&self, tag: &str) -> bool {
+		self.manifest_inspect(tag).is_some()
+	}
+
+	/// A content-identifying digest for `<ns>/<name>:<tag>`, or `None` if absent — the
+	/// first `sha256:<hex>` in the OCI index (the first arch member's digest), enough to
+	/// compare two tags for pointing at the same (or distinct) images. Formatting-agnostic.
+	pub(crate) fn digest(&self, tag: &str) -> Option<String> {
+		let json = self.manifest_inspect(tag)?;
+		let (_, rest) = json.split_once("sha256:")?;
+		let hex: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
+		(!hex.is_empty()).then(|| format!("sha256:{hex}"))
+	}
+
+	/// Push the locally-built `localhost/<name>:latest` list to `<ns>/<name>:latest`
+	/// **without** signing — the tamper case the signing/enrollment e2es assert is rejected.
+	pub(crate) fn push_unsigned(&self) {
+		let reg_ref = format!("{}/{}:latest", self.ns, self.name);
+		let list = format!("localhost/{}:latest", self.name);
+		duct::cmd!("podman", "manifest", "push", "--all", &list, &reg_ref)
+			.dir(self.proj)
+			.env("HOME", self.home)
+			.env("XDG_DATA_HOME", self.store)
+			.run()
+			.unwrap_or_else(|_| panic!("unsigned push to {reg_ref} failed"));
+	}
+}
+
+/// Tell the *build host's* podman the throwaway registry (`reg_addr`) is plain HTTP, by
+/// writing a `registries.conf` into the test's throwaway `$HOME` (so the user's real
+/// config is untouched). The guest gets the same via a baked/pushed sysroot drop-in.
+pub(crate) fn write_host_insecure_registry(hp: &Path, reg_addr: &str) {
+	let conf_dir = hp.join(".config/containers");
+	std::fs::create_dir_all(&conf_dir).unwrap();
+	std::fs::write(conf_dir.join("registries.conf"), insecure_registries_conf(reg_addr)).unwrap();
 }

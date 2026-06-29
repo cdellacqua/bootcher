@@ -24,7 +24,6 @@
 //! natively by `e2e_vm.rs`.
 
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use assert_cmd::Command as AssertCommand;
@@ -34,11 +33,10 @@ use bootcher_core::qemu::{self, Vm, VmConfig};
 
 mod common;
 use common::{
-	ADMIN_KEYS, CrossPrereqs, SCRATCH_BASE, StoreGuard, VM_USER, find_file, keygen, read_pub_key,
+	ADMIN_KEYS, CrossPrereqs, SCRATCH_BASE, SENTINEL_PATH, Ssh, StoreGuard, VM_USER, keygen,
+	read_pub_key,
 };
 
-/// On-device path of the image-baked sentinel (under `/usr`, like the LAN e2e).
-const SENTINEL_PATH: &str = "/usr/lib/bootcher-e2e-sentinel";
 /// Podman store for this e2e (own dir, out of the user's real store). Wiped on
 /// teardown by default ([`StoreGuard`]); set `BOOTCHER_E2E_KEEP_STORE` to keep it.
 /// (The separate `CACHE_DIR` download cache below is always kept.)
@@ -119,14 +117,7 @@ impl Harness {
 		let admin_key = keygen(&keydir, "admin");
 
 		let port = qemu::free_port().expect("free port");
-		let proj = hp.join("e2ecross");
-		AssertCommand::cargo_bin("bootcher")
-			.unwrap()
-			.args(["init", "-y", "e2ecross"])
-			.current_dir(hp)
-			.env("HOME", hp)
-			.assert()
-			.success();
+		let proj = common::scaffold_project(hp, "e2ecross");
 		std::fs::write(proj.join("bootcher.toml"), manifest(env.cross, port)).unwrap();
 
 		let h = Self {
@@ -140,14 +131,8 @@ impl Harness {
 			home,
 			_store: store,
 		};
-		h.set_sentinel("sentinel-v1");
+		common::set_sentinel(&h.proj, "sentinel-v1");
 		h
-	}
-
-	fn set_sentinel(&self, value: &str) {
-		let p = self.proj.join("sysroot/usr/lib/bootcher-e2e-sentinel");
-		std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-		std::fs::write(p, format!("{value}\n")).unwrap();
 	}
 
 	/// `bootcher provision` for the cross arch: the container builds locally under
@@ -163,21 +148,7 @@ impl Harness {
 	}
 
 	fn boot(&self, scope: &Scope) -> Vm {
-		let disk = self.built_disk();
-		duct::cmd!(
-			"qemu-img",
-			"create",
-			"-q",
-			"-f",
-			"qcow2",
-			"-F",
-			"qcow2",
-			"-b",
-			&disk,
-			&self.overlay
-		)
-		.run()
-		.expect("creating boot overlay");
+		common::make_overlay(&self.built_disk(), &self.overlay, None);
 		Vm::spawn(
 			&VmConfig {
 				arch: self.cross,
@@ -196,67 +167,47 @@ impl Harness {
 		.expect("spawning qemu")
 	}
 
-	fn dump_serial(&self) {
-		let dest = PathBuf::from(SCRATCH_BASE).join("bootcher-e2e-cross-serial.log");
-		let _ = std::fs::copy(&self.serial_log, &dest);
-		eprintln!("--- guest serial log (saved to {}) ---", dest.display());
-		if let Ok(s) = std::fs::read_to_string(&self.serial_log) {
-			for line in s.lines().rev().take(50).collect::<Vec<_>>().into_iter().rev() {
-				eprintln!("{line}");
-			}
-		}
-	}
-
 	fn wait_for_ssh(&self, scope: &Scope, what: &str) {
-		if let Err(e) = qemu::ssh(VM_USER, self.port, &self.admin_key)
-			.wait_until_reachable(TCG_SSH_TIMEOUT, scope)
-		{
-			self.dump_serial();
-			panic!("{what}: {e:#}");
-		}
+		common::wait_for_ssh(
+			VM_USER,
+			self.port,
+			&self.admin_key,
+			TCG_SSH_TIMEOUT,
+			scope,
+			&self.serial_log,
+			"cross",
+			what,
+		);
 	}
 
 	fn built_disk(&self) -> PathBuf {
-		let output = self.proj.join("output");
-		find_file(&output, "disk.qcow2")
-			.unwrap_or_else(|| panic!("no disk.qcow2 under {}", output.display()))
+		common::built_disk(&self.proj)
 	}
 
 	fn bootcher(&self, args: &[&str]) -> AssertCommand {
-		let mut c = AssertCommand::cargo_bin("bootcher").unwrap();
+		// No agent socket: cross-arch provision is LAN mode but bootcher's ssh isn't
+		// exercised here (provision only builds), and the e2e uses raw `-i key` ssh.
+		let mut c = common::bootcher_cmd(&self.proj, self.home.path(), STORE_DIR, None);
 		c.args(args)
-			.current_dir(&self.proj)
-			.env("HOME", self.home.path())
-			.env("XDG_DATA_HOME", STORE_DIR)
 			// Persist the builder VM's cloud-image download + prepared overlay across
 			// runs (the builder reads `XDG_CACHE_HOME`), out of the throwaway $HOME.
 			.env("XDG_CACHE_HOME", CACHE_DIR);
 		c
 	}
 
-	fn ssh_capture(&self, cmd: &str) -> std::process::Output {
-		let argv = qemu::ssh(VM_USER, self.port, &self.admin_key).argv(&[], cmd);
-		let (program, rest) = argv.split_first().unwrap();
-		Command::new(program)
-			.args(rest)
-			.env("HOME", self.home.path())
-			.env_remove("SSH_AUTH_SOCK")
-			.stdin(Stdio::null())
-			.output()
-			.expect("ssh")
+	/// An ssh view to the guest with the admin key (no agent — only `-i admin`).
+	fn ssh(&self) -> Ssh<'_> {
+		Ssh {
+			home: self.home.path(),
+			user: VM_USER,
+			port: self.port,
+			key: &self.admin_key,
+			agent_sock: None,
+		}
 	}
 
 	fn ssh_out(&self, cmd: &str) -> Option<String> {
-		for i in 0..20 {
-			if i > 0 {
-				std::thread::sleep(Duration::from_millis(500));
-			}
-			let out = self.ssh_capture(cmd);
-			if out.status.success() {
-				return Some(String::from_utf8_lossy(&out.stdout).into_owned());
-			}
-		}
-		None
+		self.ssh().out(cmd)
 	}
 
 	fn admin_pub(&self) -> String {

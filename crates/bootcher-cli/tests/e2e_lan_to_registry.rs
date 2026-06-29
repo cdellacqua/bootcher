@@ -41,12 +41,10 @@ use bootcher_core::qemu::{self, Vm, VmConfig};
 
 mod common;
 use common::{
-	Agent, Prereqs, RegistryGuard, SCRATCH_BASE, SSH_TIMEOUT, StoreGuard, VM_USER, find_file,
-	host_primary_ip, insecure_registries_conf, keygen,
+	Agent, Prereqs, RegistryGuard, SCRATCH_BASE, SENTINEL_PATH, SSH_TIMEOUT, Ssh, StoreGuard,
+	VM_USER, host_primary_ip, insecure_registries_conf, keygen,
 };
 
-/// On-device sentinel, under `/usr` so an upgrade swaps it atomically.
-const SENTINEL_PATH: &str = "/usr/lib/bootcher-e2e-sentinel";
 /// Podman store for this e2e (own dir, out of the user's real store). Wiped on
 /// teardown by default ([`StoreGuard`]); set `BOOTCHER_E2E_KEEP_STORE` to keep it.
 const STORE_DIR: &str = "/var/tmp/bootcher-e2e-lan2reg-store";
@@ -201,20 +199,10 @@ impl Harness {
 		let reg = RegistryGuard::start(REG_NAME, reg_port);
 
 		// Build host: the registry is plain HTTP (for the post-switch push).
-		let conf_dir = hp.join(".config/containers");
-		std::fs::create_dir_all(&conf_dir).unwrap();
-		std::fs::write(conf_dir.join("registries.conf"), insecure_registries_conf(&reg_addr))
-			.unwrap();
+		common::write_host_insecure_registry(hp, &reg_addr);
 
 		// Scaffold the project, then write a *LAN* manifest (no registry) over it.
-		let proj = hp.join(&name);
-		AssertCommand::cargo_bin("bootcher")
-			.unwrap()
-			.args(["init", "-y", &name])
-			.current_dir(hp)
-			.env("HOME", hp)
-			.assert()
-			.success();
+		let proj = common::scaffold_project(hp, &name);
 		std::fs::write(proj.join("bootcher.toml"), lan_manifest(&name, env.arch, ssh_port))
 			.unwrap();
 
@@ -237,7 +225,7 @@ impl Harness {
 		// Nothing registry-related is baked: this is a genuine LAN provision. The
 		// plain-HTTP exception the guest needs is pushed over ssh at transition time
 		// (see `phase_switch_to_registry`), not pre-installed.
-		h.set_sentinel("sentinel-v1");
+		common::set_sentinel(&h.proj, "sentinel-v1");
 		h
 	}
 
@@ -251,21 +239,7 @@ impl Harness {
 	}
 
 	fn boot(&self, scope: &Scope) -> Vm {
-		let disk = self.built_disk();
-		duct::cmd!(
-			"qemu-img",
-			"create",
-			"-q",
-			"-f",
-			"qcow2",
-			"-F",
-			"qcow2",
-			"-b",
-			&disk,
-			&self.overlay
-		)
-		.run()
-		.expect("creating boot overlay");
+		common::make_overlay(&self.built_disk(), &self.overlay, None);
 		Vm::spawn(
 			&VmConfig {
 				arch: self.arch,
@@ -304,74 +278,50 @@ impl Harness {
 	}
 
 	fn set_sentinel(&self, value: &str) {
-		let p = self.proj.join("sysroot/usr/lib/bootcher-e2e-sentinel");
-		std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-		std::fs::write(p, format!("{value}\n")).unwrap();
-	}
-
-	fn dump_serial(&self) {
-		let dest = PathBuf::from(SCRATCH_BASE).join("bootcher-e2e-lan2reg-serial.log");
-		let _ = std::fs::copy(&self.serial_log, &dest);
-		eprintln!("--- guest serial log (saved to {}) ---", dest.display());
-		if let Ok(s) = std::fs::read_to_string(&self.serial_log) {
-			for line in s.lines().rev().take(50).collect::<Vec<_>>().into_iter().rev() {
-				eprintln!("{line}");
-			}
-		}
-	}
-
-	fn wait_for_ssh(&self, scope: &Scope, what: &str) {
-		if let Err(e) = qemu::ssh(VM_USER, self.ssh_port, &self.admin_key)
-			.wait_until_reachable(SSH_TIMEOUT, scope)
-		{
-			self.dump_serial();
-			panic!("{what}: {e:#}");
-		}
+		common::set_sentinel(&self.proj, value);
 	}
 
 	fn built_disk(&self) -> PathBuf {
-		let output = self.proj.join("output");
-		find_file(&output, "disk.qcow2")
-			.unwrap_or_else(|| panic!("no disk.qcow2 under {}", output.display()))
+		common::built_disk(&self.proj)
+	}
+
+	fn wait_for_ssh(&self, scope: &Scope, what: &str) {
+		common::wait_for_ssh(
+			VM_USER,
+			self.ssh_port,
+			&self.admin_key,
+			SSH_TIMEOUT,
+			scope,
+			&self.serial_log,
+			"lan2reg",
+			what,
+		);
 	}
 
 	fn bootcher(&self, args: &[&str]) -> AssertCommand {
-		let mut c = AssertCommand::cargo_bin("bootcher").unwrap();
-		c.args(args)
-			.current_dir(&self.proj)
-			.env("HOME", self.home.path())
-			.env("SSH_AUTH_SOCK", self.agent.sock())
-			.env("XDG_DATA_HOME", STORE_DIR);
+		let mut c =
+			common::bootcher_cmd(&self.proj, self.home.path(), STORE_DIR, Some(self.agent.sock()));
+		c.args(args);
 		c
 	}
 
-	fn ssh_capture(&self, cmd: &str) -> std::process::Output {
-		let argv = qemu::ssh(VM_USER, self.ssh_port, &self.admin_key).argv(&[], cmd);
-		let (program, rest) = argv.split_first().unwrap();
-		Command::new(program)
-			.args(rest)
-			.env("HOME", self.home.path())
-			.env_remove("SSH_AUTH_SOCK")
-			.stdin(Stdio::null())
-			.output()
-			.expect("ssh")
+	/// An ssh view to the guest with the admin key (no agent — only `-i admin`).
+	fn ssh(&self) -> Ssh<'_> {
+		Ssh {
+			home: self.home.path(),
+			user: VM_USER,
+			port: self.ssh_port,
+			key: &self.admin_key,
+			agent_sock: None,
+		}
 	}
 
 	fn ssh_ok(&self, cmd: &str) -> bool {
-		self.ssh_capture(cmd).status.success()
+		self.ssh().ok(cmd)
 	}
 
 	fn ssh_out(&self, cmd: &str) -> Option<String> {
-		for i in 0..20 {
-			if i > 0 {
-				std::thread::sleep(std::time::Duration::from_millis(500));
-			}
-			let out = self.ssh_capture(cmd);
-			if out.status.success() {
-				return Some(String::from_utf8_lossy(&out.stdout).into_owned());
-			}
-		}
-		None
+		self.ssh().out(cmd)
 	}
 }
 

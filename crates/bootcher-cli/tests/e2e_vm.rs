@@ -26,8 +26,6 @@
 //! and a wrong new key can't be "validated" by the old key.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::Duration;
 
 use assert_cmd::Command as AssertCommand;
 use bootcher_core::context::Arch;
@@ -36,13 +34,9 @@ use bootcher_core::qemu::{self, Vm, VmConfig};
 
 mod common;
 use common::{
-	ADMIN_KEYS, Agent, Prereqs, SCRATCH_BASE, SSH_TIMEOUT, StoreGuard, VM_USER, find_file, keygen,
-	pub_key_path, read_pub_key,
+	ADMIN_KEYS, Agent, Prereqs, SCRATCH_BASE, SENTINEL_PATH, SSH_TIMEOUT, Ssh, StoreGuard, VM_USER,
+	keygen, pub_key_path, read_pub_key,
 };
-
-/// On-device path of the image-baked sentinel. Lives under `/usr` (atomically
-/// swapped on upgrade) so the upgrade round-trip sees the new value deterministically.
-const SENTINEL_PATH: &str = "/usr/lib/bootcher-e2e-sentinel";
 
 /// Persistent podman store for the e2e, pointed at via `XDG_DATA_HOME` — out of the
 /// user's real store so the test's images don't pollute it. Wiped on teardown by
@@ -180,14 +174,7 @@ impl Harness {
 		agent.add(&old_key);
 
 		// Throwaway project scaffolded with `bootcher init -y`, then pointed at the VM.
-		let proj = hp.join("e2e");
-		AssertCommand::cargo_bin("bootcher")
-			.unwrap()
-			.args(["init", "-y", "e2e"])
-			.current_dir(hp)
-			.env("HOME", hp)
-			.assert()
-			.success();
+		let proj = common::scaffold_project(hp, "e2e");
 
 		// Native, no config file and no PATH shim: the remote is an `ssh://` URL that
 		// carries the forwarded port, and the object form's `ssh_opts` pins known-hosts
@@ -221,15 +208,13 @@ impl Harness {
 			home,
 			_store: store,
 		};
-		h.set_sentinel("sentinel-v1");
+		common::set_sentinel(&h.proj, "sentinel-v1");
 		h
 	}
 
 	/// Write the image-baked sentinel into the project's sysroot overlay.
 	fn set_sentinel(&self, value: &str) {
-		let p = self.proj.join("sysroot/usr/lib/bootcher-e2e-sentinel");
-		std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-		std::fs::write(p, format!("{value}\n")).unwrap();
+		common::set_sentinel(&self.proj, value);
 	}
 
 	/// `bootcher provision --key <old>` → builds the container *and* its bootc
@@ -245,23 +230,8 @@ impl Harness {
 
 	/// Boot a writable overlay on the freshly built disk and return the running VM.
 	fn boot(&self, scope: &Scope) -> Vm {
-		let disk = self.built_disk();
 		// CoW overlay so boots don't mutate the image-builder output and a re-boot starts clean.
-		duct::cmd!(
-			"qemu-img",
-			"create",
-			"-q",
-			"-f",
-			"qcow2",
-			"-F",
-			"qcow2",
-			"-b",
-			&disk,
-			&self.overlay
-		)
-		.run()
-		.expect("creating boot overlay");
-
+		common::make_overlay(&self.built_disk(), &self.overlay, None);
 		Vm::spawn(
 			&VmConfig {
 				arch: self.arch,
@@ -279,101 +249,56 @@ impl Harness {
 		.expect("spawning qemu")
 	}
 
-	/// Copy the guest's serial log somewhere that survives the temp dir's cleanup
-	/// and print its tail — the only window into a boot that never answered ssh.
-	fn dump_serial(&self) {
-		let dest = PathBuf::from(SCRATCH_BASE).join("bootcher-e2e-serial.log");
-		let _ = std::fs::copy(&self.serial_log, &dest);
-		eprintln!("--- guest serial log (saved to {}) ---", dest.display());
-		if let Ok(s) = std::fs::read_to_string(&self.serial_log) {
-			let lines: Vec<&str> = s.lines().collect();
-			for line in lines.iter().rev().take(50).rev() {
-				eprintln!("{line}");
-			}
-		}
-	}
-
 	/// Wait for the guest to answer ssh as `key`; on timeout, dump the serial log
 	/// (which the temp dir would otherwise take with it) and panic with `what`.
 	fn wait_for_ssh(&self, key: &Path, scope: &Scope, what: &str) {
-		if let Err(e) = qemu::ssh(VM_USER, self.port, key).wait_until_reachable(SSH_TIMEOUT, scope)
-		{
-			self.dump_serial();
-			panic!("{what}: {e:#}");
-		}
+		common::wait_for_ssh(
+			VM_USER,
+			self.port,
+			key,
+			SSH_TIMEOUT,
+			scope,
+			&self.serial_log,
+			"vm",
+			what,
+		);
 	}
 
 	/// Locate the image-builder-produced qcow2 under `output/`.
 	fn built_disk(&self) -> PathBuf {
-		let output = self.proj.join("output");
-		find_file(&output, "disk.qcow2")
-			.unwrap_or_else(|| panic!("no disk.qcow2 under {}", output.display()))
+		common::built_disk(&self.proj)
 	}
 
 	/// A `bootcher` command rooted at the project, with the throwaway `$HOME` and the
 	/// agent socket — so its ambient ssh resolves the alias + keys.
 	fn bootcher(&self, args: &[&str]) -> AssertCommand {
-		let mut c = AssertCommand::cargo_bin("bootcher").unwrap();
-		c.args(args)
-			.current_dir(&self.proj)
-			.env("HOME", self.home.path())
-			.env("SSH_AUTH_SOCK", self.agent.sock())
-			// Point rootless podman at the e2e's own persistent store (out of /tmp and
-			// out of the user's real store), so the base is cached across runs.
-			.env("XDG_DATA_HOME", STORE_DIR);
+		let mut c =
+			common::bootcher_cmd(&self.proj, self.home.path(), STORE_DIR, Some(self.agent.sock()));
+		c.args(args);
 		c
 	}
 
-	/// A raw `ssh` to the guest authenticating with exactly `key` (the throwaway
-	/// `$HOME` and no agent, so only `-i key` is offered — the basis for the "this
-	/// key works / is rejected" assertions).
-	fn ssh(&self, key: &Path, cmd: &str) -> Command {
-		let argv = qemu::ssh(VM_USER, self.port, key).argv(&[], cmd);
-		let (program, rest) = argv.split_first().unwrap();
-		let mut c = Command::new(program);
-		c.args(rest).env("HOME", self.home.path()).env_remove("SSH_AUTH_SOCK");
-		c
+	/// An ssh view authenticating with exactly `key` (throwaway `$HOME`, no agent — so
+	/// only `-i key` is offered, the basis for the "this key works / is rejected" assertions).
+	fn ssh<'a>(&'a self, key: &'a Path) -> Ssh<'a> {
+		Ssh { home: self.home.path(), user: VM_USER, port: self.port, key, agent_sock: None }
 	}
 
 	/// `true` iff a fresh login with `key` runs `cmd` to a zero exit (single shot).
 	fn ssh_ok(&self, key: &Path, cmd: &str) -> bool {
-		self.ssh(key, cmd)
-			.stdin(Stdio::null())
-			.stdout(Stdio::null())
-			.stderr(Stdio::null())
-			.status()
-			.is_ok_and(|s| s.success())
+		self.ssh(key).ok(cmd)
 	}
 
-	/// `true` iff a login with `key` succeeds within a few seconds. The single-shot
-	/// connection can transiently fail at the *transport* layer right after a
-	/// rotation's burst of connections — `Connection timed out during banner
-	/// exchange`, the VM's sshd answering slowly over qemu's user-net (SLIRP), with
-	/// no bearing on auth (the key is already proven) — so the "should be reachable"
-	/// assertions retry through it, as bootcher's own `reachable`/`validate_login` do.
+	/// `true` iff a login with `key` succeeds within a few seconds (retrying through a
+	/// transient post-rotation transport blip — see [`Ssh::reachable`]).
 	fn reachable_with(&self, key: &Path) -> bool {
-		(0..20).any(|i| {
-			if i > 0 {
-				std::thread::sleep(Duration::from_millis(500));
-			}
-			self.ssh_ok(key, "true")
-		})
+		self.ssh(key).reachable()
 	}
 
 	/// Capture stdout of `cmd` over ssh with `key`, retrying through the same
 	/// transport blip [`reachable_with`] rides. Used for reads we expect to succeed.
 	fn ssh_out(&self, key: &Path, cmd: &str) -> Option<String> {
-		for i in 0..20 {
-			if i > 0 {
-				std::thread::sleep(Duration::from_millis(500));
-			}
-			if let Ok(out) = self.ssh(key, cmd).output()
-				&& out.status.success()
-			{
-				return Some(String::from_utf8_lossy(&out.stdout).into_owned());
-			}
-		}
-		None
+		self.ssh(key).out(cmd)
 	}
 
 	fn old_pub(&self) -> String {

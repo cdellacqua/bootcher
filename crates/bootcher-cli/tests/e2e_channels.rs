@@ -37,7 +37,6 @@
 //! container is torn down on drop.
 
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 
 use assert_cmd::Command as AssertCommand;
 use bootcher_core::context::Arch;
@@ -46,12 +45,10 @@ use bootcher_core::qemu::{self, Vm, VmConfig};
 
 mod common;
 use common::{
-	Agent, Prereqs, RegistryGuard, SCRATCH_BASE, SSH_TIMEOUT, StoreGuard, VM_USER, find_file,
-	host_primary_ip, insecure_registries_conf, keygen,
+	Agent, Prereqs, RegistryClient, RegistryGuard, SCRATCH_BASE, SENTINEL_PATH, SSH_TIMEOUT, Ssh,
+	StoreGuard, VM_USER, host_primary_ip, insecure_registries_conf, keygen,
 };
 
-/// On-device sentinel, under `/usr` so an upgrade swaps it atomically.
-const SENTINEL_PATH: &str = "/usr/lib/bootcher-e2e-sentinel";
 /// Podman store for this e2e (own dir, out of the user's real store). Wiped on
 /// teardown by default ([`StoreGuard`]); set `BOOTCHER_E2E_KEEP_STORE` to keep it.
 const STORE_DIR: &str = "/var/tmp/bootcher-e2e-chan-store";
@@ -228,23 +225,12 @@ impl Harness {
 		// A throwaway anonymous registry on the free port (real podman env → cached registry:2).
 		let reg = RegistryGuard::start(REG_NAME, reg_port);
 
-		// Tell the build host's podman the registry is plain HTTP, in the throwaway
-		// $HOME (so the user's real config is untouched).
-		let conf_dir = hp.join(".config/containers");
-		std::fs::create_dir_all(&conf_dir).unwrap();
-		std::fs::write(conf_dir.join("registries.conf"), insecure_registries_conf(&reg_addr))
-			.unwrap();
+		// Tell the build host's podman the registry is plain HTTP (throwaway $HOME).
+		common::write_host_insecure_registry(hp, &reg_addr);
 
 		// Scaffold the project, then write a registry manifest that *declares* the
 		// `stable` channel (so `--channel stable` validates) over it.
-		let proj = hp.join(&name);
-		AssertCommand::cargo_bin("bootcher")
-			.unwrap()
-			.args(["init", "-y", &name])
-			.current_dir(hp)
-			.env("HOME", hp)
-			.assert()
-			.success();
+		let proj = common::scaffold_project(hp, &name);
 		std::fs::write(proj.join("bootcher.toml"), manifest(&name, env.arch, &ns, ssh_port))
 			.unwrap();
 
@@ -267,11 +253,12 @@ impl Harness {
 
 		// Bake the guest's insecure-registry drop-in — the one image-level config a
 		// plain-HTTP registry needs. No signing files: this is a plain registry device.
-		h.write_sysroot(
+		common::write_sysroot(
+			&h.proj,
 			"etc/containers/registries.conf.d/10-bootcher-e2e.conf",
 			&insecure_registries_conf(&h.reg_addr),
 		);
-		h.set_sentinel("sentinel-v1");
+		common::set_sentinel(&h.proj, "sentinel-v1");
 		h
 	}
 
@@ -293,21 +280,7 @@ impl Harness {
 	}
 
 	fn boot(&self, scope: &Scope) -> Vm {
-		let disk = self.built_disk();
-		duct::cmd!(
-			"qemu-img",
-			"create",
-			"-q",
-			"-f",
-			"qcow2",
-			"-F",
-			"qcow2",
-			"-b",
-			&disk,
-			&self.overlay
-		)
-		.run()
-		.expect("creating boot overlay");
+		common::make_overlay(&self.built_disk(), &self.overlay, None);
 		Vm::spawn(
 			&VmConfig {
 				arch: self.arch,
@@ -335,123 +308,73 @@ impl Harness {
 		format!("{}/{}:latest", self.ns, self.name)
 	}
 
-	/// Whether `<ns>/<name>:<tag>` resolves in the registry (a manifest-only fetch, no
-	/// blobs), run under the throwaway `$HOME`/store so the insecure-registry config
-	/// applies. Used to prove a push landed under the expected tag — and that a channel
-	/// push didn't silently create the other tag.
+	/// The throwaway registry as the build host addresses it — used to prove a push
+	/// landed under the expected tag and didn't silently create the other channel's.
+	fn registry(&self) -> RegistryClient<'_> {
+		RegistryClient {
+			proj: &self.proj,
+			home: self.home.path(),
+			store: STORE_DIR,
+			ns: &self.ns,
+			name: &self.name,
+		}
+	}
+
 	fn registry_has_tag(&self, tag: &str) -> bool {
-		self.manifest_inspect(tag).is_some()
+		self.registry().has_tag(tag)
 	}
 
-	/// A content-identifying digest for `<ns>/<name>:<tag>`, or `None` if absent — so two
-	/// tags can be compared for pointing at the same (or distinct) images. The first
-	/// `sha256:<hex>` in the OCI index JSON (the first arch member's digest) is enough:
-	/// it's stable per content and applied identically to both tags, so distinct content
-	/// yields distinct values. Formatting-agnostic (pretty or compact JSON).
 	fn registry_digest(&self, tag: &str) -> Option<String> {
-		let json = self.manifest_inspect(tag)?;
-		let (_, rest) = json.split_once("sha256:")?;
-		let hex: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
-		(!hex.is_empty()).then(|| format!("sha256:{hex}"))
-	}
-
-	/// `podman manifest inspect <ns>/<name>:<tag>` against the throwaway registry,
-	/// returning its stdout on success (the OCI index JSON) or `None` when the tag is
-	/// absent / unreachable.
-	fn manifest_inspect(&self, tag: &str) -> Option<String> {
-		let reference = format!("{}/{}:{tag}", self.ns, self.name);
-		let out = duct::cmd!("podman", "manifest", "inspect", "--tls-verify=false", &reference)
-			.dir(&self.proj)
-			.env("HOME", self.home.path())
-			.env("XDG_DATA_HOME", STORE_DIR)
-			.stderr_null()
-			.unchecked()
-			.stdout_capture()
-			.run()
-			.ok()?;
-		out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
-	}
-
-	/// Write `content` to `sysroot/<rel>` in the project (created as needed).
-	fn write_sysroot(&self, rel: &str, content: &str) {
-		let p = self.proj.join("sysroot").join(rel);
-		std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-		std::fs::write(p, content).unwrap();
+		self.registry().digest(tag)
 	}
 
 	fn set_sentinel(&self, value: &str) {
-		let p = self.proj.join("sysroot/usr/lib/bootcher-e2e-sentinel");
-		std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-		std::fs::write(p, format!("{value}\n")).unwrap();
-	}
-
-	fn dump_serial(&self) {
-		let dest = PathBuf::from(SCRATCH_BASE).join("bootcher-e2e-chan-serial.log");
-		let _ = std::fs::copy(&self.serial_log, &dest);
-		eprintln!("--- guest serial log (saved to {}) ---", dest.display());
-		if let Ok(s) = std::fs::read_to_string(&self.serial_log) {
-			for line in s.lines().rev().take(50).collect::<Vec<_>>().into_iter().rev() {
-				eprintln!("{line}");
-			}
-		}
-	}
-
-	fn wait_for_ssh(&self, scope: &Scope, what: &str) {
-		if let Err(e) = qemu::ssh(VM_USER, self.ssh_port, &self.admin_key)
-			.wait_until_reachable(SSH_TIMEOUT, scope)
-		{
-			self.dump_serial();
-			panic!("{what}: {e:#}");
-		}
+		common::set_sentinel(&self.proj, value);
 	}
 
 	fn built_disk(&self) -> PathBuf {
-		let output = self.proj.join("output");
-		find_file(&output, "disk.qcow2")
-			.unwrap_or_else(|| panic!("no disk.qcow2 under {}", output.display()))
+		common::built_disk(&self.proj)
+	}
+
+	fn wait_for_ssh(&self, scope: &Scope, what: &str) {
+		common::wait_for_ssh(
+			VM_USER,
+			self.ssh_port,
+			&self.admin_key,
+			SSH_TIMEOUT,
+			scope,
+			&self.serial_log,
+			"chan",
+			what,
+		);
 	}
 
 	/// A `bootcher` command rooted at the project, with a dummy pull credential (the
 	/// registry is anonymous, so the pair only exercises the plumbing).
 	fn bootcher(&self, args: &[&str]) -> AssertCommand {
-		let mut c = AssertCommand::cargo_bin("bootcher").unwrap();
-		c.args(args)
-			.current_dir(&self.proj)
-			.env("HOME", self.home.path())
-			.env("SSH_AUTH_SOCK", self.agent.sock())
-			.env("XDG_DATA_HOME", STORE_DIR)
-			.env("BOOTCHER_PULL_USER", "puser1")
-			.env("BOOTCHER_PULL_TOKEN", "ptoken1");
+		let mut c =
+			common::bootcher_cmd(&self.proj, self.home.path(), STORE_DIR, Some(self.agent.sock()));
+		c.args(args).env("BOOTCHER_PULL_USER", "puser1").env("BOOTCHER_PULL_TOKEN", "ptoken1");
 		c
 	}
 
-	/// Raw `ssh` to the guest with the admin key (no agent), capturing output.
-	fn ssh_capture(&self, cmd: &str) -> std::process::Output {
-		let argv = qemu::ssh(VM_USER, self.ssh_port, &self.admin_key).argv(&[], cmd);
-		let (program, rest) = argv.split_first().unwrap();
-		Command::new(program)
-			.args(rest)
-			.env("HOME", self.home.path())
-			.env_remove("SSH_AUTH_SOCK")
-			.stdin(Stdio::null())
-			.output()
-			.expect("ssh")
+	/// An ssh view to the guest with the admin key (no agent — only `-i admin`).
+	fn ssh(&self) -> Ssh<'_> {
+		Ssh {
+			home: self.home.path(),
+			user: VM_USER,
+			port: self.ssh_port,
+			key: &self.admin_key,
+			agent_sock: None,
+		}
 	}
 
-	/// Capture stdout of `cmd` over ssh, retrying through a transient transport blip.
-	/// Full reboots are covered separately by [`Self::wait_for_ssh`], so this only
-	/// needs to ride out a momentary qemu user-net hiccup.
+	fn ssh_capture(&self, cmd: &str) -> std::process::Output {
+		self.ssh().capture(cmd)
+	}
+
 	fn ssh_out(&self, cmd: &str) -> Option<String> {
-		for i in 0..20 {
-			if i > 0 {
-				std::thread::sleep(std::time::Duration::from_millis(500));
-			}
-			let out = self.ssh_capture(cmd);
-			if out.status.success() {
-				return Some(String::from_utf8_lossy(&out.stdout).into_owned());
-			}
-		}
-		None
+		self.ssh().out(cmd)
 	}
 }
 

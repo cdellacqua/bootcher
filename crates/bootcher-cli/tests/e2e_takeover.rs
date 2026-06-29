@@ -31,8 +31,7 @@
 //! the `ssh://…:<port>` remote URL.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::process::Command;
 
 use assert_cmd::Command as AssertCommand;
 use bootcher_core::fetch::{self, Checksum};
@@ -41,15 +40,13 @@ use bootcher_core::qemu::{self, Vm, VmConfig};
 
 mod common;
 use common::{
-	Agent, Prereqs, SCRATCH_BASE, SSH_TIMEOUT, StoreGuard, VM_USER, keygen, read_pub_key,
+	ADMIN_KEYS, Agent, Prereqs, SCRATCH_BASE, SSH_TIMEOUT, Ssh, StoreGuard, VM_USER, keygen,
+	read_pub_key,
 };
 
 /// Stock cloud login on the Debian generic image — takeover's *initial* connection
 /// (before the image's `admin` user, [`VM_USER`], replaces it).
 const STOCK_USER: &str = "debian";
-
-/// On-device admin authorized-keys path the takeover injects (mirrors the scaffold).
-const ADMIN_KEYS: &str = "/etc/ssh/authorized_keys.d/admin";
 
 /// Pinned Debian 13 (trixie) generic amd64 cloud image — the takeover target. The
 /// sha512 is the published digest from
@@ -142,14 +139,7 @@ impl Harness {
 		// guest: the steady-state remote is `admin@` over the forwarded loopback port
 		// (in the `ssh://` URL), with `takeover_login = "debian"` for the initial
 		// connection and known-hosts pinned to /dev/null for the throwaway host key.
-		let proj = hp.join("e2e");
-		AssertCommand::cargo_bin("bootcher")
-			.unwrap()
-			.args(["init", "-y", "e2e"])
-			.current_dir(hp)
-			.env("HOME", hp)
-			.assert()
-			.success();
+		let proj = common::scaffold_project(hp, "e2e");
 
 		let port = qemu::free_port().expect("free port");
 		let manifest_path = proj.join("bootcher.toml");
@@ -186,21 +176,7 @@ impl Harness {
 		let base = ensure_debian_base(scope);
 		// CoW overlay grown to 20G so growpart + the bootc install have room (the stock
 		// cloud image is small); the base stays pristine for the next run.
-		duct::cmd!(
-			"qemu-img",
-			"create",
-			"-q",
-			"-f",
-			"qcow2",
-			"-F",
-			"qcow2",
-			"-b",
-			&base,
-			&self.overlay,
-			"20G"
-		)
-		.run()
-		.expect("creating boot overlay");
+		common::make_overlay(&base, &self.overlay, Some("20G"));
 
 		let seed = self.home.path().join("seed.img");
 		write_seed(&seed, &read_pub_contents(&self.admin_key)).expect("writing cloud-init seed");
@@ -238,64 +214,46 @@ impl Harness {
 		assert!(ok, "cloud-init did not finish cleanly on the guest");
 	}
 
-	/// Copy the guest's serial log somewhere that survives the temp dir's cleanup and
-	/// print its tail — the only window into a boot that never answered ssh.
-	fn dump_serial(&self) {
-		let dest = PathBuf::from(SCRATCH_BASE).join("bootcher-e2e-takeover-serial.log");
-		let _ = std::fs::copy(&self.serial_log, &dest);
-		eprintln!("--- guest serial log (saved to {}) ---", dest.display());
-		if let Ok(s) = std::fs::read_to_string(&self.serial_log) {
-			for line in s.lines().rev().take(50).collect::<Vec<_>>().into_iter().rev() {
-				eprintln!("{line}");
-			}
-		}
-	}
-
 	/// Wait for the guest to answer ssh as `user` with the admin key; on timeout dump
 	/// the serial log and panic with `what`.
 	fn wait_for_ssh(&self, user: &str, scope: &Scope, what: &str) {
-		if let Err(e) =
-			qemu::ssh(user, self.port, &self.admin_key).wait_until_reachable(SSH_TIMEOUT, scope)
-		{
-			self.dump_serial();
-			panic!("{what}: {e:#}");
-		}
+		common::wait_for_ssh(
+			user,
+			self.port,
+			&self.admin_key,
+			SSH_TIMEOUT,
+			scope,
+			&self.serial_log,
+			"takeover",
+			what,
+		);
 	}
 
 	/// A `bootcher` command rooted at the project, with the throwaway `$HOME`, the
 	/// agent socket, and the e2e's own persistent podman store.
 	fn bootcher(&self, args: &[&str]) -> AssertCommand {
-		let mut c = AssertCommand::cargo_bin("bootcher").unwrap();
-		c.args(args)
-			.current_dir(&self.proj)
-			.env("HOME", self.home.path())
-			.env("SSH_AUTH_SOCK", self.agent.sock())
-			.env("XDG_DATA_HOME", STORE_DIR);
+		let mut c =
+			common::bootcher_cmd(&self.proj, self.home.path(), STORE_DIR, Some(self.agent.sock()));
+		c.args(args);
 		c
 	}
 
-	/// Capture stdout of `cmd` over ssh as `user` with the admin key, retrying through
-	/// the transient post-reboot transport blips qemu's user-net can produce.
-	fn ssh_out(&self, user: &str, cmd: &str) -> Option<String> {
-		let argv = qemu::ssh(user, self.port, &self.admin_key).argv(&[], cmd);
-		let (program, rest) = argv.split_first().unwrap();
-		for i in 0..20 {
-			if i > 0 {
-				std::thread::sleep(Duration::from_millis(500));
-			}
-			let out = Command::new(program)
-				.args(rest)
-				.env("HOME", self.home.path())
-				.env("SSH_AUTH_SOCK", self.agent.sock())
-				.stderr(Stdio::null())
-				.output();
-			if let Ok(out) = out
-				&& out.status.success()
-			{
-				return Some(String::from_utf8_lossy(&out.stdout).into_owned());
-			}
+	/// An ssh view as `user` with the admin key, sharing the agent (the initial
+	/// `debian@` login the remote's `takeover_login` resolves needs it).
+	fn ssh<'a>(&'a self, user: &'a str) -> Ssh<'a> {
+		Ssh {
+			home: self.home.path(),
+			user,
+			port: self.port,
+			key: &self.admin_key,
+			agent_sock: Some(self.agent.sock()),
 		}
-		None
+	}
+
+	/// Capture stdout of `cmd` over ssh as `user`, retrying through the transient
+	/// post-reboot transport blips qemu's user-net can produce.
+	fn ssh_out(&self, user: &str, cmd: &str) -> Option<String> {
+		self.ssh(user).out(cmd)
 	}
 }
 

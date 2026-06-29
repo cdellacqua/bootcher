@@ -38,7 +38,6 @@
 //! The registry container is torn down on drop.
 
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 
 use assert_cmd::Command as AssertCommand;
 use bootcher_core::context::Arch;
@@ -47,12 +46,10 @@ use bootcher_core::qemu::{self, Vm, VmConfig};
 
 mod common;
 use common::{
-	Agent, Prereqs, RegistryGuard, SCRATCH_BASE, SSH_TIMEOUT, StoreGuard, VM_USER, find_file,
-	host_primary_ip, insecure_registries_conf, keygen,
+	Agent, Prereqs, RegistryClient, RegistryGuard, SCRATCH_BASE, SENTINEL_PATH, SSH_TIMEOUT, Ssh,
+	StoreGuard, VM_USER, host_primary_ip, insecure_registries_conf, keygen,
 };
 
-/// On-device sentinel, under `/usr` so an upgrade swaps it atomically.
-const SENTINEL_PATH: &str = "/usr/lib/bootcher-e2e-sentinel";
 /// Podman store for this e2e (own dir, out of the user's real store). Wiped on
 /// teardown by default ([`StoreGuard`]); set `BOOTCHER_E2E_KEEP_STORE` to keep it.
 const STORE_DIR: &str = "/var/tmp/bootcher-e2e-reg-store";
@@ -275,22 +272,11 @@ impl Harness {
 		// A throwaway registry on the free port (real podman env → cached registry:2).
 		let reg = RegistryGuard::start(REG_NAME, reg_port);
 
-		// Tell the build host's podman the registry is plain HTTP, in the throwaway
-		// $HOME (so the user's real config is untouched).
-		let conf_dir = hp.join(".config/containers");
-		std::fs::create_dir_all(&conf_dir).unwrap();
-		std::fs::write(conf_dir.join("registries.conf"), insecure_registries_conf(&reg_addr))
-			.unwrap();
+		// Tell the build host's podman the registry is plain HTTP (throwaway $HOME).
+		common::write_host_insecure_registry(hp, &reg_addr);
 
 		// Scaffold the project, then write a *plain* (unsigned) registry manifest over it.
-		let proj = hp.join(&name);
-		AssertCommand::cargo_bin("bootcher")
-			.unwrap()
-			.args(["init", "-y", &name])
-			.current_dir(hp)
-			.env("HOME", hp)
-			.assert()
-			.success();
+		let proj = common::scaffold_project(hp, &name);
 		std::fs::write(proj.join("bootcher.toml"), manifest(&name, env.arch, &ns, ssh_port))
 			.unwrap();
 
@@ -314,11 +300,12 @@ impl Harness {
 		// Bake only the guest's insecure-registry drop-in — the one image-level config a
 		// plain-HTTP registry needs. No signing files: this device is provisioned unsigned
 		// and only enrolls signing later, over ssh, in `phase_enroll_signing`.
-		h.write_sysroot(
+		common::write_sysroot(
+			&h.proj,
 			"etc/containers/registries.conf.d/10-bootcher-e2e.conf",
 			&insecure_registries_conf(&h.reg_addr),
 		);
-		h.set_sentinel("sentinel-v1");
+		common::set_sentinel(&h.proj, "sentinel-v1");
 		h
 	}
 
@@ -334,21 +321,7 @@ impl Harness {
 	}
 
 	fn boot(&self, scope: &Scope) -> Vm {
-		let disk = self.built_disk();
-		duct::cmd!(
-			"qemu-img",
-			"create",
-			"-q",
-			"-f",
-			"qcow2",
-			"-F",
-			"qcow2",
-			"-b",
-			&disk,
-			&self.overlay
-		)
-		.run()
-		.expect("creating boot overlay");
+		common::make_overlay(&self.built_disk(), &self.overlay, None);
 		Vm::spawn(
 			&VmConfig {
 				arch: self.arch,
@@ -366,57 +339,42 @@ impl Harness {
 		.expect("spawning qemu")
 	}
 
-	/// Push the locally-built `localhost/<name>:latest` list to the registry ref
-	/// **without** signing — the tamper case. Runs under the throwaway `$HOME`/store
-	/// (insecure-registry config + the freshly built image both live there).
+	/// Push an unsigned image to the registry ref — the tamper case the signing
+	/// enrollment phase asserts is rejected on `bootc upgrade`.
 	fn push_unsigned(&self) {
-		let reg_ref = format!("{}/{}:latest", self.ns, self.name);
-		let list = format!("localhost/{}:latest", self.name);
-		duct::cmd!("podman", "manifest", "push", "--all", &list, &reg_ref)
-			.dir(&self.proj)
-			.env("HOME", self.home.path())
-			.env("XDG_DATA_HOME", STORE_DIR)
-			.run()
-			.unwrap_or_else(|_| panic!("unsigned push to {reg_ref} failed"));
+		self.registry().push_unsigned();
 	}
 
-	/// Write `content` to `sysroot/<rel>` in the project (created as needed).
-	fn write_sysroot(&self, rel: &str, content: &str) {
-		let p = self.proj.join("sysroot").join(rel);
-		std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-		std::fs::write(p, content).unwrap();
+	/// The throwaway registry as the build host addresses it.
+	fn registry(&self) -> RegistryClient<'_> {
+		RegistryClient {
+			proj: &self.proj,
+			home: self.home.path(),
+			store: STORE_DIR,
+			ns: &self.ns,
+			name: &self.name,
+		}
 	}
 
 	fn set_sentinel(&self, value: &str) {
-		let p = self.proj.join("sysroot/usr/lib/bootcher-e2e-sentinel");
-		std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-		std::fs::write(p, format!("{value}\n")).unwrap();
-	}
-
-	fn dump_serial(&self) {
-		let dest = PathBuf::from(SCRATCH_BASE).join("bootcher-e2e-reg-serial.log");
-		let _ = std::fs::copy(&self.serial_log, &dest);
-		eprintln!("--- guest serial log (saved to {}) ---", dest.display());
-		if let Ok(s) = std::fs::read_to_string(&self.serial_log) {
-			for line in s.lines().rev().take(50).collect::<Vec<_>>().into_iter().rev() {
-				eprintln!("{line}");
-			}
-		}
-	}
-
-	fn wait_for_ssh(&self, scope: &Scope, what: &str) {
-		if let Err(e) = qemu::ssh(VM_USER, self.ssh_port, &self.admin_key)
-			.wait_until_reachable(SSH_TIMEOUT, scope)
-		{
-			self.dump_serial();
-			panic!("{what}: {e:#}");
-		}
+		common::set_sentinel(&self.proj, value);
 	}
 
 	fn built_disk(&self) -> PathBuf {
-		let output = self.proj.join("output");
-		find_file(&output, "disk.qcow2")
-			.unwrap_or_else(|| panic!("no disk.qcow2 under {}", output.display()))
+		common::built_disk(&self.proj)
+	}
+
+	fn wait_for_ssh(&self, scope: &Scope, what: &str) {
+		common::wait_for_ssh(
+			VM_USER,
+			self.ssh_port,
+			&self.admin_key,
+			SSH_TIMEOUT,
+			scope,
+			&self.serial_log,
+			"reg",
+			what,
+		);
 	}
 
 	/// A `bootcher` command rooted at the project, with the default dummy pull
@@ -429,48 +387,36 @@ impl Harness {
 	/// As [`Self::bootcher`] but with an explicit pull credential — the registry is
 	/// anonymous, so the pair is only there to exercise the `auth.json` plumbing.
 	fn bootcher_creds(&self, args: &[&str], pull_user: &str, pull_token: &str) -> AssertCommand {
-		let mut c = AssertCommand::cargo_bin("bootcher").unwrap();
+		let mut c =
+			common::bootcher_cmd(&self.proj, self.home.path(), STORE_DIR, Some(self.agent.sock()));
 		c.args(args)
-			.current_dir(&self.proj)
-			.env("HOME", self.home.path())
-			.env("SSH_AUTH_SOCK", self.agent.sock())
-			.env("XDG_DATA_HOME", STORE_DIR)
 			.env("BOOTCHER_SIGN_PASSPHRASE", SIGN_PASS)
 			.env("BOOTCHER_PULL_USER", pull_user)
 			.env("BOOTCHER_PULL_TOKEN", pull_token);
 		c
 	}
 
-	/// Raw `ssh` to the guest with the admin key (no agent), capturing output.
-	fn ssh_capture(&self, cmd: &str) -> std::process::Output {
-		let argv = qemu::ssh(VM_USER, self.ssh_port, &self.admin_key).argv(&[], cmd);
-		let (program, rest) = argv.split_first().unwrap();
-		Command::new(program)
-			.args(rest)
-			.env("HOME", self.home.path())
-			.env_remove("SSH_AUTH_SOCK")
-			.stdin(Stdio::null())
-			.output()
-			.expect("ssh")
-	}
-
-	/// `true` iff a fresh login runs `cmd` to a zero exit (single shot).
-	fn ssh_ok(&self, cmd: &str) -> bool {
-		self.ssh_capture(cmd).status.success()
-	}
-
-	/// Capture stdout of `cmd` over ssh, retrying through a transient transport blip.
-	fn ssh_out(&self, cmd: &str) -> Option<String> {
-		for i in 0..20 {
-			if i > 0 {
-				std::thread::sleep(std::time::Duration::from_millis(500));
-			}
-			let out = self.ssh_capture(cmd);
-			if out.status.success() {
-				return Some(String::from_utf8_lossy(&out.stdout).into_owned());
-			}
+	/// An ssh view to the guest with the admin key (no agent — only `-i admin`).
+	fn ssh(&self) -> Ssh<'_> {
+		Ssh {
+			home: self.home.path(),
+			user: VM_USER,
+			port: self.ssh_port,
+			key: &self.admin_key,
+			agent_sock: None,
 		}
-		None
+	}
+
+	fn ssh_capture(&self, cmd: &str) -> std::process::Output {
+		self.ssh().capture(cmd)
+	}
+
+	fn ssh_ok(&self, cmd: &str) -> bool {
+		self.ssh().ok(cmd)
+	}
+
+	fn ssh_out(&self, cmd: &str) -> Option<String> {
+		self.ssh().out(cmd)
 	}
 }
 
