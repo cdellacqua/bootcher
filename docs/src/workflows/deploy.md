@@ -63,7 +63,10 @@ credential via `BOOTCHER_PULL_USER` / `BOOTCHER_PULL_TOKEN`, and a signing
 passphrase via `BOOTCHER_SIGN_PASSPHRASE` (so a missing TTY never blocks them).
 The [`recipes/ci/`](https://github.com/cdellacqua/bootcher/tree/main/recipes/ci)
 recipe has copy-pasteable GitHub Actions and GitLab CI pipelines that wire this up
-against the registry associated with your repo.
+against the registry associated with your repo; the
+[channels variant](https://github.com/cdellacqua/bootcher/tree/main/recipes/ci/channels)
+adds a `latest`→`stable` promotion flow. See [Recipes](../recipes/index.md) for the
+full catalog.
 
 ## Multi-arch builds
 

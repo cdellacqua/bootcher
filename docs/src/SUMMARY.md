@@ -20,6 +20,10 @@
   - [Admin SSH key](workflows/rotate/admin-key.md)
   - [Signing key](workflows/rotate/sign-key.md)
 
+# Recipes
+
+- [Recipes](recipes/index.md)
+
 # Reference
 
 - [Commands](reference/commands.md)

@@ -288,6 +288,8 @@ A channel is a *pointer*, not a separate identity: the same digest a `deploy` pr
 
 > **Note** — `latest` is always a valid channel without being listed here, and is the default when `--channel` is omitted. Existing devices provisioned before channels existed track `:latest` and stay on it untouched. Don't rename `latest`; add named channels alongside it.
 
+For a complete CI pipeline that publishes `latest` from the default branch and promotes a `v*` tag to `stable`, see the [release-channels recipe](https://github.com/cdellacqua/bootcher/tree/main/recipes/ci/channels) ([Recipes](../recipes/index.md)).
+
 ---
 
 ## `[concurrency]`
