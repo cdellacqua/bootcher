@@ -93,21 +93,34 @@ stages: [build, deploy, provision]
           - .gitlab-ci.yml
 
 # --- build: one container per arch, on a native-arch runner -----------------------
-# Unchanged from the base recipe — channel-agnostic. The per-arch member it saves is the
-# same artifact whether deploy later publishes it to :latest or :stable; the channel is
-# chosen only at push time, in `deploy`.
+# Channel-agnostic: the per-arch member is the same whether deploy later publishes it to
+# :latest or :stable (the channel is chosen only at push time, in `deploy`). As in the
+# base recipe, the member is streamed to the generic Package Registry rather than saved
+# as a job artifact — GitLab.com caps artifacts at 1 GB, which a non-trivial image blows
+# past even zstd'd; the Package Registry allows 5 GB/file. `deploy` downloads it back.
 .build:
   stage: build
   rules: !reference [.image-rules, rules]
   script:
     - bootcher --manifest bootcher.ci.toml build --target "$ARCH"
+    # Save the member (podman save | zstd) to a file, then upload it to the generic
+    # Package Registry, versioned by commit + arch, where `deploy` downloads it. See
+    # ../gitlab-ci.yml for the 1 GB artifact-cap rationale and why this uploads from a
+    # FILE (Content-Length + --retry) rather than a pipe: the streamed `podman save | zstd`
+    # upload was slow enough to stall and get reset server-side. Auth is the automatic
+    # $CI_JOB_TOKEN — no push credentials.
     - |
+      if (set -o pipefail) 2>/dev/null; then set -o pipefail; fi
       img="$(podman images --format '{{.Repository}}:{{.Tag}}' | grep ":latest-${ARCH}\$" | head -n1)"
       test -n "$img" || { echo "no built image tagged :latest-${ARCH}"; exit 1; }
-      podman save "$img" | zstd -T0 -10 -q -o "image-${ARCH}.tar.zst"
-  artifacts:
-    paths: ["image-${ARCH}.tar.zst"]
-    expire_in: 1 day
+      file="image-${ARCH}.tar.zst"
+      url="$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/image/$CI_COMMIT_SHORT_SHA/$file"
+      podman save "$img" | zstd -T0 -10 -q -o "$file"
+      curl --fail-with-body --retry 3 --retry-delay 5 --retry-all-errors \
+        --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+        --upload-file "$file" "$url"
+      echo
+      echo "member published: $url"
 
 build:x86_64:
   extends: .build
@@ -127,14 +140,27 @@ build:aarch64:
 # omit the flag otherwise — letting bootcher use its built-in `latest` default.
 deploy:
   stage: deploy
-  needs: ["build:x86_64", "build:aarch64"]
+  # artifacts: false — members travel through the Package Registry now (see `.build`).
+  needs:
+    - job: "build:x86_64"
+      artifacts: false
+    - job: "build:aarch64"
+      artifacts: false
   rules: !reference [.image-rules, rules]
   # Signing? Uncomment to set the cosign key passphrase (use "" if it has none):
   # variables:
   #   BOOTCHER_SIGN_PASSPHRASE: ""
   script:
     - echo "$CI_REGISTRY_PASSWORD" | podman login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
-    - for f in image-*.tar.zst; do zstd -dc "$f" | podman load; done
+    # Download each per-arch member the build jobs published to the Package Registry and
+    # load it (same commit + package coordinates the build jobs uploaded to).
+    - |
+      if (set -o pipefail) 2>/dev/null; then set -o pipefail; fi
+      for arch in x86_64 aarch64; do
+        file="image-${arch}.tar.zst"
+        url="$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/image/$CI_COMMIT_SHORT_SHA/$file"
+        curl --fail-with-body --header "JOB-TOKEN: $CI_JOB_TOKEN" "$url" | zstd -dc | podman load
+      done
     # Signing? Fetch the cosign key from Secure Files first (see ../gitlab-ci.yml).
     # `--channel stable` on a tag pipeline; otherwise no flag → bootcher's `latest`.
     # `--skip-bootc-upgrade` leaves the rollout to each device's auto-update timer.
@@ -147,6 +173,28 @@ deploy:
         echo "deploying to default channel: latest"
         bootcher --manifest bootcher.ci.toml deploy --skip-build --skip-bootc-upgrade
       fi
+    # Cleanup: now that the members are loaded and pushed, delete EVERY version of the
+    # `image` package (this commit's plus any orphans from pipelines that uploaded but
+    # never deployed), so no scheduled cleanup is needed. Best-effort, runs last. Only the
+    # `image` package is swept — `disk` (provision outputs) is left alone. See
+    # ../gitlab-ci.yml for the permission and concurrency caveats.
+    - |
+      ids="$(curl --fail-with-body --silent \
+        --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+        "$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages?package_name=image&per_page=100" \
+        | jq -r '.[] | select(.name == "image") | .id')"
+      if [ -z "$ids" ]; then
+        echo "no 'image' package versions to clean up"
+      fi
+      for id in $ids; do
+        if curl --fail-with-body --silent --request DELETE \
+            --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+            "$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/$id"; then
+          echo "deleted member tarballs (Package Registry package $id)"
+        else
+          echo "warning: could not delete package $id (job token may lack delete rights); it remains in the Package Registry"
+        fi
+      done
 
 # --- provision: build a flashable disk that TRACKS this pipeline's channel --------
 # Same as the base recipe, but it's playable on tag pipelines too, and it bakes the

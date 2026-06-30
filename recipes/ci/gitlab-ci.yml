@@ -8,11 +8,14 @@
 #                native-arch runner. `bootcher build --target <arch>` builds just that
 #                arch's container and stops at the per-arch member tag
 #                localhost/<name>:latest-<arch> (NO multi-arch list — `deploy` makes
-#                that). The job `podman save`s the member as a compressed job artifact.
-#                These jobs need NO registry credentials.
-#   deploy     — one job. It `podman load`s both per-arch members the build jobs
-#                produced, then `bootcher deploy --skip-build` (re)assembles the
-#                multi-arch manifest list from them and pushes <registry>/<name>:latest
+#                that). The job `podman save`s the member and streams it (tar+zstd) to
+#                the generic Package Registry — NOT a job artifact, which GitLab.com caps
+#                at 1 GB (a non-trivial image blows past that even zstd'd; the Package
+#                Registry allows 5 GB/file). These jobs need no registry PUSH credentials
+#                — the upload authenticates with the automatic $CI_JOB_TOKEN.
+#   deploy     — one job. It downloads both per-arch members the build jobs published and
+#                `podman load`s them, then `bootcher deploy --skip-build` (re)assembles
+#                the multi-arch manifest list from them and pushes <registry>/<name>:latest
 #                (+ an immutable CalVer tag) to this project's Container Registry. The
 #                ONLY job that needs registry push credentials (and the signing key, if
 #                enabled). Devices self-update.
@@ -31,8 +34,8 @@
 # Why split the build per arch? A multi-arch `bootcher deploy` on a single runner would
 # build the foreign arch under qemu-user emulation — slow and occasionally fragile.
 # Building each arch on its own native runner is faster and more reliable. The members
-# are handed between jobs as artifacts: the CI owns the `podman save`/`load`, so
-# bootcher's own `build`/`deploy` on a dev box are untouched.
+# are handed between jobs through the Package Registry: the CI owns the `podman
+# save`/`load`, so bootcher's own `build`/`deploy` on a dev box are untouched.
 #
 # bootcher.toml must (1) point its registry at this project's registry and (2) list
 # BOTH arches in [targets], mapped to the disk type each should produce:
@@ -168,28 +171,41 @@ stages: [build, deploy, provision]
 # --- build: one container per arch, on a native-arch runner -----------------------
 # `build --target <arch>` builds only that arch and stops at the per-arch member tag
 # localhost/<name>:latest-<arch> (no multi-arch list — `deploy` assembles that). The
-# member is saved as a compressed job artifact `deploy` loads. No registry credentials
-# needed here — only `deploy` pushes.
+# member is streamed (tar+zstd) to the generic Package Registry, which `deploy`
+# downloads and loads. No registry PUSH credentials needed here — the Package Registry
+# upload uses the automatic $CI_JOB_TOKEN; only `deploy` pushes to the Container Registry.
 .build:
   stage: build
   # Gate on image-affecting changes (see `.image-rules` above); tags always build.
   rules: !reference [.image-rules, rules]
   script:
     - bootcher --manifest bootcher.ci.toml build --target "$ARCH"
-    # The build just produced exactly one image tagged `:latest-<arch>`. Save it; the
-    # repo:tag is restored on `podman load`, so `deploy` finds the member by name. zstd
-    # keeps the artifact small.
+    # The build produced exactly one image tagged `:latest-<arch>`. Save the member
+    # (podman save | zstd) to a file and upload it to the generic Package Registry,
+    # versioned by commit + arch, for `deploy` to download (podman load restores the
+    # repo:tag, so deploy finds it by name).
+    #
+    # Package Registry, not a job artifact: GitLab.com caps artifacts at 1 GB and a
+    # non-trivial image exceeds that even zstd'd; the Package Registry allows 5 GB/file.
+    # Auth is the automatic $CI_JOB_TOKEN — no push credentials.
+    #
+    # Upload a FILE, not a pipe: piping `podman save | zstd -10` feeds curl too slowly and
+    # the stalling upload gets reset mid-transfer. A finished file uploads at full
+    # local-read speed and, with a Content-Length, lets curl --retry a drop. Costs ~1 GB
+    # of job-dir scratch — fine here (the image lives in the separate loopback store);
+    # provision can't spare that for a whole disk, so it streams instead.
     - |
+      if (set -o pipefail) 2>/dev/null; then set -o pipefail; fi
       img="$(podman images --format '{{.Repository}}:{{.Tag}}' | grep ":latest-${ARCH}\$" | head -n1)"
       test -n "$img" || { echo "no built image tagged :latest-${ARCH}"; exit 1; }
-      podman save "$img" | zstd -T0 -10 -q -o "image-${ARCH}.tar.zst"
-  artifacts:
-    # `deploy` pulls these via `needs:`. NOTE: GitLab.com caps job artifacts at 1 GB —
-    # a heavy image (chromium-scale) may exceed that even zstd'd. If so, stream it to
-    # the generic Package Registry instead (the same pattern the provision job uses for
-    # disks, allowing 5 GB/file) and download it in `deploy`.
-    paths: ["image-${ARCH}.tar.zst"]
-    expire_in: 1 day
+      file="image-${ARCH}.tar.zst"
+      url="$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/image/$CI_COMMIT_SHORT_SHA/$file"
+      podman save "$img" | zstd -T0 -10 -q -o "$file"
+      curl --fail-with-body --retry 3 --retry-delay 5 --retry-all-errors \
+        --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+        --upload-file "$file" "$url"
+      echo
+      echo "member published: $url"
 
 build:x86_64:
   extends: .build
@@ -205,14 +221,21 @@ build:aarch64:
   tags: [saas-linux-small-arm64]
 
 # --- deploy: assemble the multi-arch image from the members and push --------------
-# Loads both per-arch members the build jobs saved, then `deploy --skip-build`
+# Downloads both per-arch members the build jobs published to the Package Registry and
+# loads them, then `deploy --skip-build`
 # (re)assembles the multi-arch manifest list from them and pushes
-# <registry>/<name>:latest (+ a CalVer tag). No container build, no disk step — the
-# only job that needs registry push credentials (and the signing key, if enabled).
+# <registry>/<name>:latest (+ a CalVer tag), then sweeps all member tarballs out of the
+# Package Registry (so no scheduled cleanup is needed). No container build, no disk step
+# — the only job that needs registry push credentials (and the signing key, if enabled).
 deploy:
   stage: deploy
-  # Pull in both build jobs' artifacts (the per-arch member tarballs) and gate on them.
-  needs: ["build:x86_64", "build:aarch64"]
+  # Sequence behind both build jobs and gate on them. artifacts: false — the members
+  # travel through the Package Registry now (see `.build`), not job artifacts.
+  needs:
+    - job: "build:x86_64"
+      artifacts: false
+    - job: "build:aarch64"
+      artifacts: false
   # Same gate as the build jobs (see `.image-rules`) so deploy is scheduled exactly
   # when its members were built — never with nothing to assemble. Tags always deploy.
   rules: !reference [.image-rules, rules]
@@ -223,9 +246,16 @@ deploy:
   #   BOOTCHER_SIGN_PASSPHRASE: ""
   script:
     - echo "$CI_REGISTRY_PASSWORD" | podman login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
-    # Load every per-arch member the build jobs produced (artifacts downloaded via
-    # `needs:`), restoring each localhost/<name>:latest-<arch> tag into local storage.
-    - for f in image-*.tar.zst; do zstd -dc "$f" | podman load; done
+    # Download each per-arch member the build jobs published to the Package Registry and
+    # `podman load` it, restoring each localhost/<name>:latest-<arch> tag into local
+    # storage. Same commit + package coordinates the build jobs uploaded to.
+    - |
+      if (set -o pipefail) 2>/dev/null; then set -o pipefail; fi
+      for arch in x86_64 aarch64; do
+        file="image-${arch}.tar.zst"
+        url="$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/image/$CI_COMMIT_SHORT_SHA/$file"
+        curl --fail-with-body --header "JOB-TOKEN: $CI_JOB_TOKEN" "$url" | zstd -dc | podman load
+      done
     # Signing? The cosign key `[deploy] registry.key` points at is git-ignored, so fetch
     # it from GitLab Secure Files (uploaded as cosign.key) before deploy signs the push.
     # The installer downloads every secure file into ./.secure_files/; copy the key to
@@ -239,6 +269,46 @@ deploy:
     # auto-update timer (keeps the admin SSH key out of CI and doesn't assume the runner
     # can reach the fleet). Drop the flag (and wire an SSH key) to roll immediately.
     - bootcher --manifest bootcher.ci.toml deploy --skip-build --skip-bootc-upgrade
+    # Cleanup: the per-arch member tarballs in the Package Registry were only a handoff
+    # to this job. Now that they're loaded and the multi-arch image is pushed to the
+    # Container Registry, they're garbage. Delete EVERY version of the `image` package,
+    # not just this commit's — that also sweeps up orphans a pipeline left behind when it
+    # built+uploaded but never reached a successful deploy, so no scheduled cleanup policy
+    # is needed. Only the `image` package is touched; the `disk` package (provision
+    # outputs, deliberately retained) is left alone — the name filter is narrowed
+    # server-side and re-checked exactly in jq (the API's package_name is a substring
+    # match). provision pulls members back from the Container Registry, not here, so
+    # deleting these is safe.
+    #
+    # This runs last, only after the push above succeeded: had deploy failed earlier
+    # GitLab would have stopped before this, leaving the members in place for a re-run.
+    # Best-effort — a failed delete (e.g. the job token lacks delete rights, which need
+    # the triggering user at Maintainer+) only warns; the real work is already done, so
+    # it must not fail the job.
+    #
+    # Concurrency caveat: a sweep also removes members of OTHER in-flight pipelines. If
+    # two deploys can overlap (merge trains, rapid default-branch pushes), one may delete
+    # a sibling's not-yet-loaded members and fail that sibling's download — recoverable by
+    # re-running its build. If that's a real risk, mark these jobs `interruptible` (newer
+    # cancels older), or narrow the filter back to this commit's $CI_COMMIT_SHORT_SHA and
+    # add a registry cleanup policy for the orphans.
+    - |
+      ids="$(curl --fail-with-body --silent \
+        --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+        "$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages?package_name=image&per_page=100" \
+        | jq -r '.[] | select(.name == "image") | .id')"
+      if [ -z "$ids" ]; then
+        echo "no 'image' package versions to clean up"
+      fi
+      for id in $ids; do
+        if curl --fail-with-body --silent --request DELETE \
+            --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+            "$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/$id"; then
+          echo "deleted member tarballs (Package Registry package $id)"
+        else
+          echo "warning: could not delete package $id (job token may lack delete rights); it remains in the Package Registry"
+        fi
+      done
 
 # --- provision: build a flashable disk per arch, natively -------------------------
 # Manual. `provision --target <arch> --disk <type> --skip-build` pulls that arch's
@@ -286,24 +356,15 @@ deploy:
     # ($BOOTCHER_PULL_USER/$BOOTCHER_PULL_TOKEN, read from the environment). For a public
     # registry, append `--anonymous` instead.
     - bootcher --manifest bootcher.ci.toml provision --ssh-key admin_key --target "$ARCH" --disk "$DISK" --skip-build
-    # Stream output/ straight to the generic Package Registry: tar+zstd into curl's stdin
-    # so the compressed tarball never lands on the runner's disk — it was the extra
-    # space-occupying file the disk couldn't spare. --sparse keeps the raw disk's
-    # unallocated zeros from being read out; -T0 uses every core; -10 is a good
-    # size/speed balance. JOB-TOKEN authenticates as this pipeline; the (chunked) PUT
-    # both creates the package version and stores the streamed body, versioned by commit
-    # and arch.
-    #
-    # Trade-offs of streaming vs. writing the file first:
-    #   - No `--retry`: curl can't rewind a pipe, so a flaky upload fails the job — just
-    #     re-run it. (Retrying would mean re-tarring the whole disk anyway.)
-    #   - pipefail (enabled below when the shell supports it) makes a tar/zstd failure
-    #     mid-pipe fail the job too, so a truncated stream can't be published as a
-    #     "successful" upload. On a strict-POSIX sh without pipefail we fall through
-    #     without it; --fail-with-body still catches a server-side rejection.
-    #   - Needs the registry to accept a chunked PUT (no Content-Length); GitLab's
-    #     generic registry does. If a future GitLab rejects it, fall back to writing the
-    #     file and uploading with --upload-file "$file" --retry 3.
+    # Stream output/ (tar --sparse | zstd) straight into curl, versioned by commit + arch.
+    # Unlike the build member, the disk tarball is streamed, not written to a file first:
+    # the runner can't spare the disk for it (that scratch was the very space the disk
+    # build needed). --sparse skips the raw disk's unallocated zeros; the chunked PUT
+    # (no Content-Length) creates the package version and stores the body in one request.
+    # The streaming cost: curl can't rewind a pipe, so a dropped upload fails the job —
+    # just re-run it (no --retry; the build job gets that by writing a file). pipefail
+    # makes a mid-pipe tar/zstd failure fail the job too, so a truncated stream is never
+    # published as a "success".
     - |
       if (set -o pipefail) 2>/dev/null; then set -o pipefail; fi
       file="bootcher-output-${ARCH}.tar.zst"
