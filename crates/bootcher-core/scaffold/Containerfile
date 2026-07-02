@@ -13,6 +13,12 @@ RUN dnf install -y jq fish
 # concerns, not dependencies of the userdb derivation that script runs.
 RUN dnf install -y firewalld fail2ban chrony
 
+# SELinux troubleshooting tools. setools-console provides sesearch/seinfo for
+# querying the loaded policy; audit provides auditd + ausearch/audit2allow for
+# reading AVC denials and generating candidate policy modules. Baked in so a
+# device running enforcing can be debugged in place without layering.
+RUN dnf install -y setools-console audit
+
 # Enable the security services + bootc's auto-update timer.
 #   - chronyd: keep system time accurate so cert validation and journal
 #     timestamps don't drift on power-cycled SBCs without an RTC.
