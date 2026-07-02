@@ -124,9 +124,11 @@ jobs:
           tag="disk-$short"
           api="https://api.github.com/repos/$GITHUB_REPOSITORY"
           auth="Authorization: Bearer $GH_TOKEN"
-          # Pack this arch's output/ tree into one zstd tarball. --sparse skips the raw
-          # disk's unallocated zeros; -T0 uses every core; -10 is a good size/speed balance.
-          tar --sparse -cf - output | zstd -10 -T0 -q -o "$file"
+          # Pack this arch's output/ tree into one zstd tarball. No `tar --sparse`: its
+          # sparse map is mis-decoded by some extractors (gnome-autoar/Nautilus drops the
+          # holes → corrupt image), so tar writes the zeros literally and zstd crushes them
+          # to the same size. -T0 uses every core; -10 is a good size/speed balance.
+          tar -cf - output | zstd -10 -T0 -q -o "$file"
           # Resolve the per-commit release, creating it if absent. The two arch jobs run
           # in parallel and share one release tag, so the create races: GET first, and if
           # we have to create, ignore a failure (the sibling won) and GET again.

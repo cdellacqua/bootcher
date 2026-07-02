@@ -113,7 +113,9 @@ jobs:
           tag="disk-${CHANNEL}-$short"
           api="https://api.github.com/repos/$GITHUB_REPOSITORY"
           auth="Authorization: Bearer $GH_TOKEN"
-          tar --sparse -cf - output | zstd -10 -T0 -q -o "$file"
+          # No `tar --sparse`: some extractors (gnome-autoar/Nautilus) mis-decode its sparse
+          # map into a corrupt image; tar writes the zeros literally and zstd crushes them.
+          tar -cf - output | zstd -10 -T0 -q -o "$file"
           get_id() { curl -sf -H "$auth" "$api/releases/tags/$tag" 2>/dev/null | jq -r '.id // empty' || true; }
           id=$(get_id)
           if [ -z "$id" ]; then

@@ -356,11 +356,14 @@ deploy:
     # ($BOOTCHER_PULL_USER/$BOOTCHER_PULL_TOKEN, read from the environment). For a public
     # registry, append `--anonymous` instead.
     - bootcher --manifest bootcher.ci.toml provision --ssh-key admin_key --target "$ARCH" --disk "$DISK" --skip-build
-    # Stream output/ (tar --sparse | zstd) straight into curl, versioned by commit + arch.
+    # Stream output/ (tar | zstd) straight into curl, versioned by commit + arch.
     # Unlike the build member, the disk tarball is streamed, not written to a file first:
     # the runner can't spare the disk for it (that scratch was the very space the disk
-    # build needed). --sparse skips the raw disk's unallocated zeros; the chunked PUT
-    # (no Content-Length) creates the package version and stores the body in one request.
+    # build needed). No `tar --sparse`: its sparse map is mis-decoded by some extractors
+    # (notably gnome-autoar/Nautilus, which drops the holes and yields a corrupt image), so
+    # tar emits the zeros literally and zstd crushes them to the same size instead. The
+    # chunked PUT (no Content-Length) creates the package version and stores the body in one
+    # request.
     # The streaming cost: curl can't rewind a pipe, so a dropped upload fails the job —
     # just re-run it (no --retry; the build job gets that by writing a file). pipefail
     # makes a mid-pipe tar/zstd failure fail the job too, so a truncated stream is never
@@ -369,7 +372,7 @@ deploy:
       if (set -o pipefail) 2>/dev/null; then set -o pipefail; fi
       file="bootcher-output-${ARCH}.tar.zst"
       url="$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/$PKG_NAME/$CI_COMMIT_SHORT_SHA/$file"
-      tar --sparse -cf - output | zstd -10 -T0 -q | \
+      tar -cf - output | zstd -10 -T0 -q | \
         curl --fail-with-body \
           --header "JOB-TOKEN: $CI_JOB_TOKEN" \
           --upload-file - "$url"
