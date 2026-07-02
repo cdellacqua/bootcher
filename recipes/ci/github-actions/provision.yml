@@ -1,0 +1,154 @@
+# bootcher CI for GitHub Actions — PROVISION half, multi-arch (x86_64 + aarch64).
+#
+# Copy this to your bootcher project as `.github/workflows/bootcher-provision.yml`. Its
+# sibling, `deploy.yml`, is the build→deploy half — read that file (and ../README.md)
+# for the store relocation, the per-arch split rationale, and the registry setup; this
+# header only covers what's specific to the disk build.
+#
+# WHY THIS IS A SEPARATE WORKFLOW. A disk build should fire only when you actually want
+# to flash a device, not on every push — it needs a MANUAL gate. The base recipe used to
+# do that with a job `environment:` + a required reviewer, but Environment protection
+# rules are public-repo-only on GitHub Free, so on a private Free repo that gate silently
+# does nothing and the job provisions on every push. `workflow_dispatch` is the gate that
+# works on every plan: this workflow never runs on its own — you launch it from the
+# Actions tab (the "Run workflow" button) when you want a disk. No Environment setup.
+#
+# WHAT IMAGE IT BUILDS FROM. Because it's decoupled from a specific deploy run, provision
+# does NOT rebuild the container: `--skip-build` pulls the per-arch member out of the
+# CURRENT <registry>/<name>:latest that deploy.yml last pushed, and builds the disk from
+# that. So the disk is byte-for-byte what devices are auto-updating to right now. Dispatch
+# it after the build→deploy run for the commit you want has finished publishing :latest.
+#
+# WHAT IT DOES. A matrix (x86_64 → qcow2, aarch64 → raw), each on a native-arch runner.
+# `bootcher provision --target <arch> --disk <type> --skip-build` builds the disk natively
+# and publishes output/ (tar+zstd) as an asset on a per-commit GitHub Release to download
+# and flash. A release asset (up to 2 GB) holds the disk where a run artifact would be slow
+# and eat the storage quota.
+#
+# Repository secrets & variables (Settings → Secrets and variables → Actions):
+#   ADMIN_SSH_PUBKEY the admin SSH PUBLIC key (the `.pub` line) baked into the disk as the
+#                    `admin` login. Not secret — provision reads only the public half, so
+#                    add it under the *Variables* tab, not Secrets. Generate the pair with
+#                    `ssh-keygen -t ed25519` and keep the private key wherever you SSH to
+#                    devices from.
+#   PULL_USER /      (registry mode) a LONG-LIVED read-only registry credential baked into
+#   PULL_TOKEN       the disk so the device can pull updates. Use a personal access token
+#                    with `read:packages` — NOT the ephemeral GITHUB_TOKEN, which dies with
+#                    the run. For a public package, drop these and add `--anonymous` to the
+#                    provision step.
+
+name: bootcher provision
+
+on:
+  # Manual only — this is the approval gate. Launch it from the Actions tab when you want
+  # a disk; it builds from whatever <registry>/<name>:latest currently points at.
+  workflow_dispatch: {}
+
+jobs:
+  # --- provision: build a flashable disk per arch, natively -------------------------
+  # A matrix (x86_64 → qcow2, aarch64 → raw), each on a native-arch runner.
+  # `provision --target <arch> --disk <type> --skip-build` pulls that arch's member from
+  # GHCR (deploy.yml pushed it) and builds the disk natively, then publishes it as an
+  # asset on a per-commit GitHub Release.
+  provision:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, disk: qcow2, runner: ubuntu-24.04 }
+          - { arch: aarch64, disk: raw, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write # create the Release + upload the disk as an asset
+      packages: read # pull the deploy-built image back from GHCR for --skip-build
+    container:
+      image: ghcr.io/cdellacqua/bootcher:latest
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+      # Real-fs container store (see deploy.yml's header note): a loopback ext4 so podman
+      # does one kernel overlay instead of fuse-overlayfs-on-overlay. Self-skips when the
+      # store is already on a real fs.
+      - name: Prepare container store
+        run: |
+          set -eu
+          if [ "$(stat -f -c %T / 2>/dev/null)" = "overlayfs" ]; then
+            : "${BOOTCHER_STORE_SIZE:=20G}"
+            img=/bootcher-store.img
+            truncate -s "$BOOTCHER_STORE_SIZE" "$img"
+            mkfs.ext4 -q -F "$img"
+            mkdir -p /var/lib/containers/storage
+            mount -o loop "$img" /var/lib/containers/storage
+            echo "relocated podman store onto loopback ext4 (${BOOTCHER_STORE_SIZE} ceiling)"
+          else
+            echo "container store already on a real fs; skipping loopback store"
+          fi
+          podman info --format 'podman store: {{.Store.GraphDriverName}} @ {{.Store.GraphRoot}}'
+      # `--skip-build` pulls the deploy-built image back from GHCR, so this job needs
+      # read access to the package. The workflow GITHUB_TOKEN has it for a package in
+      # this repo. Public package? Drop this login (the pull is anonymous) and add
+      # `--anonymous` below.
+      - name: Log in to GHCR
+        run: echo "$GITHUB_TOKEN" | podman login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Write admin public key
+        # provision reads only the `.pub` sibling of `--ssh-key`, so the public key is
+        # all CI needs — `admin_key` itself never has to exist. Keeping the private key
+        # out of CI is safe: these jobs never SSH to a device.
+        run: printf '%s\n' "$ADMIN_SSH_PUBKEY" > admin_key.pub
+        env:
+          ADMIN_SSH_PUBKEY: ${{ vars.ADMIN_SSH_PUBKEY }}
+      - name: Provision ${{ matrix.arch }} (${{ matrix.disk }})
+        # Build just this runner's arch + disk type. `--skip-build` pulls that arch's
+        # member out of <registry>/<name>:latest (deploy pushed it) and builds the disk
+        # natively. The disk bakes the admin pubkey and, in registry mode, the pull token
+        # so the device can fetch updates. Public registry? Drop the PULL_* env and
+        # append `--anonymous` instead.
+        run: bootcher --manifest bootcher.ci.toml provision --ssh-key admin_key --target "${{ matrix.arch }}" --disk "${{ matrix.disk }}" --skip-build
+        env:
+          BOOTCHER_PULL_USER: ${{ secrets.PULL_USER }}
+          BOOTCHER_PULL_TOKEN: ${{ secrets.PULL_TOKEN }}
+      # Publish the disk to a per-commit GitHub Release (one release per commit; each arch
+      # uploads its own asset). A bootc raw disk is a large sparse file; tar+zstd crushes
+      # its unallocated zeros, and a release asset (up to 2 GB) holds it where a run
+      # artifact would be slow and eat the storage quota.
+      - name: Publish disk image to a GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          # No install step: the bootcher image bundles curl, jq, tar and zstd.
+          file="bootcher-output-${{ matrix.arch }}.tar.zst"
+          short=$(printf '%s' "$GITHUB_SHA" | cut -c1-12)
+          tag="disk-$short"
+          api="https://api.github.com/repos/$GITHUB_REPOSITORY"
+          auth="Authorization: Bearer $GH_TOKEN"
+          # Pack this arch's output/ tree into one zstd tarball. --sparse skips the raw
+          # disk's unallocated zeros; -T0 uses every core; -10 is a good size/speed balance.
+          tar --sparse -cf - output | zstd -10 -T0 -q -o "$file"
+          # Resolve the per-commit release, creating it if absent. The two arch jobs run
+          # in parallel and share one release tag, so the create races: GET first, and if
+          # we have to create, ignore a failure (the sibling won) and GET again.
+          get_id() { curl -sf -H "$auth" "$api/releases/tags/$tag" 2>/dev/null | jq -r '.id // empty' || true; }
+          id=$(get_id)
+          if [ -z "$id" ]; then
+            curl -sf -X POST -H "$auth" "$api/releases" \
+              -d "$(jq -n --arg t "$tag" --arg c "$GITHUB_SHA" \
+                    '{tag_name:$t, target_commitish:$c, name:$t, body:"bootcher provision disks for \($c)"}')" \
+              >/dev/null 2>&1 || true
+            id=$(get_id)
+          fi
+          test -n "$id" || { echo "could not get or create release $tag"; exit 1; }
+          # Replace this arch's asset from an earlier provision of this commit, then
+          # upload (the asset endpoint lives on the uploads host, not api.github.com).
+          # Asset names are per-arch, so the two jobs never collide.
+          old=$(curl -sf -H "$auth" "$api/releases/$id/assets" | jq -r --arg n "$file" '.[] | select(.name==$n) | .id')
+          [ -n "$old" ] && curl -sf -X DELETE -H "$auth" "$api/releases/assets/$old"
+          curl -s --fail-with-body -X POST \
+            -H "$auth" -H "Content-Type: application/zstd" \
+            --data-binary @"$file" \
+            "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$id/assets?name=$file"
+          echo
+          echo "disk published to release: $tag (asset $file)"
+          echo "download from the repo's Releases page, then unpack: zstd -d < $file | tar -xf -"

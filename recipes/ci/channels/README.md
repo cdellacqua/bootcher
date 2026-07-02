@@ -57,7 +57,8 @@ builder networking; `channels` is inherited from `bootcher.toml` via `extend`).
 
 | Platform | File | Copy it to |
 |---|---|---|
-| GitHub Actions | [`github-actions.yml`](github-actions.yml) | `.github/workflows/bootcher.yml` |
+| GitHub Actions (deploy) | [`github-actions/deploy.yml`](github-actions/deploy.yml) | `.github/workflows/bootcher-deploy.yml` |
+| GitHub Actions (provision) | [`github-actions/provision.yml`](github-actions/provision.yml) | `.github/workflows/bootcher-provision.yml` |
 | GitLab CI | [`gitlab-ci.yml`](gitlab-ci.yml) | `.gitlab-ci.yml` (repo root) |
 | Both | [`../bootcher.ci.toml`](../bootcher.ci.toml) | `bootcher.ci.toml` (repo root, beside `bootcher.toml`) |
 
@@ -71,15 +72,20 @@ bootcher provision --ssh-key admin_key --channel stable   # device follows :stab
 bootcher provision --ssh-key admin_key                    # device follows :latest (default)
 ```
 
-The `provision` job in each pipeline bakes whichever channel matches its trigger, so a
-**tag** pipeline produces stable-tracking disks and a **default-branch** pipeline
-latest-tracking ones. The published disk artifacts are namespaced by channel (e.g. a
-`disk-stable-<sha>` GitHub Release / a `stable-<sha>` Package Registry path) so the two
-audiences' disks never overwrite each other.
+The CI `provision` step bakes the channel into the disk, but you select it differently
+per platform: on **GitLab** the trigger picks it (a **tag** pipeline produces
+stable-tracking disks, a **default-branch** pipeline latest-tracking ones), while on
+**GitHub** provision is a manual `workflow_dispatch` workflow with a **`channel` input**
+you choose when you launch it (`latest` or `stable`). Either way the published disk
+artifacts are namespaced by channel (e.g. a `disk-stable-<sha>` GitHub Release / a
+`stable-<sha>` Package Registry path) so the two audiences' disks never overwrite each
+other.
 
 ## Adding more channels
 
 `stable` is just the example. Add `next`, `testing`, etc. to `[deploy] channels` and map
 them to triggers however you like — e.g. a `next` channel published from a `next` branch,
 or a `testing` channel from `pre-release` tags. The pattern is the same: resolve a
-`CHANNEL` value from the trigger and pass it to `deploy`/`provision`.
+`CHANNEL` value (from the trigger for `deploy`, or the `workflow_dispatch` input on
+GitHub `provision`) and pass it through — and add each new channel to the provision
+input's `options:` list so you can pick it.

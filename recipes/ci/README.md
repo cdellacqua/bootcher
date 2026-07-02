@@ -28,12 +28,17 @@ aarch64 on native runners** (no cross-arch emulation), in three stages:
   device. `--skip-build` **reuses the image `deploy` pushed** — it pulls that arch's
   member out of `<registry>/<name>:latest` instead of rebuilding the container — so
   the job skips the multi-minute container build and the flashed disk is byte-for-byte
-  what devices auto-update to (a rebuild from source could drift). To guarantee it
-  reuses *this commit's* image rather than a stale `:latest`, provision is **chained
-  behind deploy in the same run** (`needs`), gated manually so it only fires when you
-  want a disk: on GitLab a `when: manual` play button, on GitHub a job `environment`
-  with a required reviewer (a one-time Environment setup — see the `provision:` job in
-  the workflow file). The job logs in to the registry to pull (read access is enough);
+  what devices auto-update to (a rebuild from source could drift). Because a disk build
+  should fire only when you want to flash a device, it's **manually gated** — but the
+  gate differs by platform, because GitHub Free can't pause a job inside a push pipeline
+  (Environment "Required reviewers" is public-repo-only on Free). On **GitLab** provision
+  stays in the pipeline, **chained behind deploy** (`needs`) with a `when: manual` play
+  button, so it reuses *this pipeline's* freshly built image. On **GitHub** provision is
+  its **own `workflow_dispatch` workflow** (`provision.yml`) you launch by hand from the
+  Actions tab — the "Run workflow" button is the gate, on every plan — and, decoupled from
+  a single run, it builds from the **current** `<registry>/<name>:<channel>` tip, so
+  dispatch it once the build→deploy run for the image you want has finished. The job logs
+  in to the registry to pull (read access is enough);
   for a **public** registry, drop that login — the pull is anonymous — and separately
   pass `--anonymous` to `bootcher provision` so it bakes no pull credential into the
   disk either (the device pulls updates anonymously too).
@@ -45,7 +50,8 @@ Drop one arch from the matrix (GitHub) / delete the second `build:`/`provision:`
 
 | Platform | File | Copy it to |
 |---|---|---|
-| GitHub Actions | [`github-actions.yml`](github-actions.yml) | `.github/workflows/bootcher.yml` |
+| GitHub Actions (deploy) | [`github-actions/deploy.yml`](github-actions/deploy.yml) | `.github/workflows/bootcher-deploy.yml` |
+| GitHub Actions (provision) | [`github-actions/provision.yml`](github-actions/provision.yml) | `.github/workflows/bootcher-provision.yml` |
 | GitLab CI | [`gitlab-ci.yml`](gitlab-ci.yml) | `.gitlab-ci.yml` (repo root) |
 | Both | [`bootcher.ci.toml`](bootcher.ci.toml) | `bootcher.ci.toml` (repo root, beside `bootcher.toml`) |
 
@@ -192,10 +198,11 @@ deploy. The build context is the **entire project root**, so the gate is an
 **A `v*` tag always builds**, path filter or not — a tag is a deliberate release.
 
 The gate is applied consistently across stages so the `needs` chain never breaks:
-`build` and `deploy` share it, and `provision` inherits it transitively (it `needs`
-deploy, so when deploy is filtered out provision drops too — a disk build has nothing
-new to pull anyway; replay provision from the pipeline that built the image if you need
-a disk for an already-published one).
+`build` and `deploy` share it. On **GitLab**, `provision` inherits it transitively (it
+`needs` deploy, so when deploy is filtered out provision drops too — a disk build has
+nothing new to pull anyway). On **GitHub**, `provision` is a separate manual
+`workflow_dispatch` workflow, so the gate doesn't apply to it at all — you launch it only
+when you actually want a disk, and it builds from whatever image is already published.
 
 **Tune the allowlist to your project.** If your `Containerfile` `COPY`s other paths, or
 a `[hooks]` script lives outside `sysroot/`, add those paths — anything in the build
