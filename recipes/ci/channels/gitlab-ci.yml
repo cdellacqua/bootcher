@@ -205,7 +205,14 @@ deploy:
 # stable and latest disks for a commit don't overwrite each other.
 .provision:
   stage: provision
-  needs: ["deploy"]
+  # `needs: []` fully decouples provision, matching the GitHub recipe
+  # (channels/github-actions/provision.yml). The empty array is load-bearing: with no
+  # `needs` at all, GitLab falls back to stage ordering and the manual job would wait on
+  # every prior stage; `[]` lets you play it standalone without running them.
+  # `--skip-build --channel <c>` pulls whatever the chosen channel tag currently points
+  # at — so it always provisions from the last image deploy published to that channel.
+  # Play it after the build→deploy for the commit you want has finished.
+  needs: []
   rules:
     # Manual on BOTH a tag and the default branch (the base recipe is default-branch
     # only). `when: manual` must live inside the rule, and `allow_failure: true` keeps

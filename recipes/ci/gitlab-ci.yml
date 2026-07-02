@@ -316,14 +316,15 @@ deploy:
 # emulation), then streams output/ to the generic Package Registry to download + flash.
 .provision:
   stage: provision
-  # Chain behind deploy so the disk is built from *this* pipeline's freshly pushed
-  # image, never a stale one: `--skip-build` pulls <registry>/<name>:latest, which must
-  # exist first. `needs: ["deploy"]` makes the manual job playable only once deploy
-  # succeeds. This also carries the image-change gate transitively: a push that didn't
-  # touch an image input filters deploy out (see `.image-rules`), so provision drops
-  # with it — there'd be no new image to pull anyway. Want a disk for an
-  # already-published image? Replay this manual job from the pipeline that built it.
-  needs: ["deploy"]
+  # `needs: []` fully decouples provision, matching the GitHub recipe
+  # (github-actions/provision.yml), where it's a standalone `workflow_dispatch`. The
+  # empty array is load-bearing: with no `needs` at all, GitLab falls back to stage
+  # ordering and the manual job would wait on every prior stage; `[]` lets you play it
+  # standalone without running them. `--skip-build` pulls whatever <registry>/<name>:latest
+  # currently is — so it always provisions from the last image deploy published, not
+  # necessarily this pipeline's. Play it after the build→deploy for the commit you want
+  # has finished publishing :latest.
+  needs: []
   rules:
     # Manual must live INSIDE the rule: a job-level `when: manual` is ignored once
     # `rules` is present (a matched rule with no `when` defaults to on_success), so it
