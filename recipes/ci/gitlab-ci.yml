@@ -335,12 +335,12 @@ deploy:
   variables:
     # Generic Package Registry coordinates: versioned by commit so every provision is an
     # immutable, retrievable build. A bootc disk is a large sparse file that won't fit a
-    # job artifact (GitLab.com caps those at 1 GB); tar+zstd crushes its unallocated
-    # zeros, and the Package Registry allows 5 GB/file.
+    # job artifact (GitLab.com caps those at 1 GB); zstd crushes it to a fraction of its
+    # size, and the Package Registry allows 5 GB/file.
     PKG_NAME: disk
   script:
     # No dependency install: the bootcher image bundles everything these steps need —
-    # sudo (image-builder disk step), tar + zstd (pack/compress the disk), curl (upload).
+    # sudo (image-builder disk step), zstd + zip (compress + pack the disk), curl (upload).
     # `--skip-build` pulls the deploy-pushed image back, so this job needs read access.
     # The job token is read+write on this project's registry and lives only for the
     # pipeline — fine for a pull. Public registry? Drop this login (the pull is
@@ -356,29 +356,30 @@ deploy:
     # ($BOOTCHER_PULL_USER/$BOOTCHER_PULL_TOKEN, read from the environment). For a public
     # registry, append `--anonymous` instead.
     - bootcher --manifest bootcher.ci.toml provision --ssh-key admin_key --target "$ARCH" --disk "$DISK" --skip-build
-    # Stream output/ (tar | zstd) straight into curl, versioned by commit + arch.
-    # Unlike the build member, the disk tarball is streamed, not written to a file first:
-    # the runner can't spare the disk for it (that scratch was the very space the disk
-    # build needed). No `tar --sparse`: its sparse map is mis-decoded by some extractors
-    # (notably gnome-autoar/Nautilus, which drops the holes and yields a corrupt image), so
-    # tar emits the zeros literally and zstd crushes them to the same size instead. The
-    # chunked PUT (no Content-Length) creates the package version and stores the body in one
-    # request.
-    # The streaming cost: curl can't rewind a pipe, so a dropped upload fails the job —
-    # just re-run it (no --retry; the build job gets that by writing a file). pipefail
-    # makes a mid-pipe tar/zstd failure fail the job too, so a truncated stream is never
-    # published as a "success".
+    # Pack output/ into ONE published artifact per run: compress the disk in place (zstd
+    # --rm frees the raw as it goes) and STORE it in a .zip (`-0`, no re-compression — the
+    # member is already zstd; the `! -name '*.tar.*'` skips an already-compressed gce
+    # `disk.tar.gz`, which is just stored as-is). One file keeps each provision from cluttering the registry;
+    # the .zip extracts natively everywhere (Windows Explorer included), and the disk.*.zst
+    # inside feeds straight into rpi-imager / balenaEtcher, which decompress zstd on the fly.
+    # No `tar --sparse` anywhere: its sparse map is mis-decoded by gnome-autoar/Nautilus
+    # into a corrupt image (holes dropped), so we never rely on tar's sparse encoding.
+    #
+    # The compressed disk is a fraction of the raw, so — unlike a full tar — it fits the
+    # post-build scratch and is written to a file, which lets curl --retry a dropped PUT (a
+    # pipe couldn't rewind). pipefail still fails the job on a truncated pack.
     - |
       if (set -o pipefail) 2>/dev/null; then set -o pipefail; fi
-      file="bootcher-output-${ARCH}.tar.zst"
+      file="bootcher-output-${ARCH}.zip"
       url="$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/$PKG_NAME/$CI_COMMIT_SHORT_SHA/$file"
-      tar -cf - output | zstd -10 -T0 -q | \
-        curl --fail-with-body \
-          --header "JOB-TOKEN: $CI_JOB_TOKEN" \
-          --upload-file - "$url"
+      find output -type f -name 'disk.*' ! -name '*.tar.*' -exec zstd -10 -T0 -q --rm {} +
+      zip -0 -q -r "$file" output
+      curl --fail-with-body --retry 3 \
+        --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+        --upload-file "$file" "$url"
       echo
       echo "disk published: $url"
-      echo "download + unpack with: curl --header \"PRIVATE-TOKEN: <token>\" \"$url\" | zstd -d | tar -xf -"
+      echo "download + unpack with: curl --header \"PRIVATE-TOKEN: <token>\" \"$url\" -o out.zip && unzip out.zip"
 
 provision:x86_64:
   extends: .provision

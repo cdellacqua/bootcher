@@ -21,7 +21,8 @@
 #
 # WHAT IT DOES. A matrix (x86_64 → qcow2, aarch64 → raw), each on a native-arch runner.
 # `bootcher provision --target <arch> --disk <type> --skip-build` builds the disk natively
-# and publishes output/ (tar+zstd) as an asset on a per-commit GitHub Release to download
+# and publishes output/ as a single .zip (the disk zstd-compressed inside) as an asset on a
+# per-commit GitHub Release to download
 # and flash. A release asset (up to 2 GB) holds the disk where a run artifact would be slow
 # and eat the storage quota.
 #
@@ -110,8 +111,8 @@ jobs:
           BOOTCHER_PULL_USER: ${{ secrets.PULL_USER }}
           BOOTCHER_PULL_TOKEN: ${{ secrets.PULL_TOKEN }}
       # Publish the disk to a per-commit GitHub Release (one release per commit; each arch
-      # uploads its own asset). A bootc raw disk is a large sparse file; tar+zstd crushes
-      # its unallocated zeros, and a release asset (up to 2 GB) holds it where a run
+      # uploads its own asset). A bootc raw disk is a large sparse file; zstd crushes it to
+      # a fraction of its size, and a release asset (up to 2 GB) holds it where a run
       # artifact would be slow and eat the storage quota.
       - name: Publish disk image to a GitHub Release
         env:
@@ -119,16 +120,20 @@ jobs:
         run: |
           set -eu
           # No install step: the bootcher image bundles curl, jq, tar and zstd.
-          file="bootcher-output-${{ matrix.arch }}.tar.zst"
+          file="bootcher-output-${{ matrix.arch }}.zip"
           short=$(printf '%s' "$GITHUB_SHA" | cut -c1-12)
           tag="disk-$short"
           api="https://api.github.com/repos/$GITHUB_REPOSITORY"
           auth="Authorization: Bearer $GH_TOKEN"
-          # Pack this arch's output/ tree into one zstd tarball. No `tar --sparse`: its
-          # sparse map is mis-decoded by some extractors (gnome-autoar/Nautilus drops the
-          # holes → corrupt image), so tar writes the zeros literally and zstd crushes them
-          # to the same size. -T0 uses every core; -10 is a good size/speed balance.
-          tar -cf - output | zstd -10 -T0 -q -o "$file"
+          # One published artifact per arch: compress the disk in place (zstd --rm frees the
+          # raw as it goes) and STORE it in a .zip (`-0`, no re-compression — already zstd).
+          # The .zip extracts natively everywhere (Windows Explorer included); the disk.*.zst
+          # inside feeds straight into rpi-imager / balenaEtcher, which read zstd directly.
+          # No `tar --sparse` (gnome-autoar/Nautilus mis-decode its map into a corrupt image).
+          # -T0 uses every core; -10 is a good size/speed balance. `! -name '*.tar.*'` skips
+          # an already-compressed gce `disk.tar.gz` (stored in the zip as-is).
+          find output -type f -name 'disk.*' ! -name '*.tar.*' -exec zstd -10 -T0 -q --rm {} +
+          zip -0 -q -r "$file" output
           # Resolve the per-commit release, creating it if absent. The two arch jobs run
           # in parallel and share one release tag, so the create races: GET first, and if
           # we have to create, ignore a failure (the sibling won) and GET again.
@@ -148,9 +153,10 @@ jobs:
           old=$(curl -sf -H "$auth" "$api/releases/$id/assets" | jq -r --arg n "$file" '.[] | select(.name==$n) | .id')
           [ -n "$old" ] && curl -sf -X DELETE -H "$auth" "$api/releases/assets/$old"
           curl -s --fail-with-body -X POST \
-            -H "$auth" -H "Content-Type: application/zstd" \
+            -H "$auth" -H "Content-Type: application/zip" \
             --data-binary @"$file" \
             "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$id/assets?name=$file"
           echo
           echo "disk published to release: $tag (asset $file)"
-          echo "download from the repo's Releases page, then unpack: zstd -d < $file | tar -xf -"
+          echo "download from the repo's Releases page, extract natively (or: unzip $file),"
+          echo "then flash the disk.*.zst with rpi-imager / balenaEtcher, or 'zstd -d' it first."

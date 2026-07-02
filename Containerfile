@@ -34,9 +34,11 @@ RUN cargo build --release --locked -p bootcher-cli
 # containerized entry point can run them: hooks execute with `sh -c` in this
 # image. The raspi4 disk.post recipe needs all three.
 #
-# zstd: the CI recipes (recipes/ci/*) compress the built disk before uploading it
-# to a release/package registry. Baked in here so the pipelines need no `dnf
-# install` step — the published image is self-sufficient for the recipes it ships.
+# zstd + zip: the CI recipes (recipes/ci/*) compress each built disk (zstd) and
+# pack it into a single, natively-extractable .zip (store mode — the member is
+# already compressed) before uploading it to a release/package registry. Baked in
+# here so the pipelines need no `dnf install` step — the published image is
+# self-sufficient for the recipes it ships.
 FROM quay.io/fedora/fedora:44
 RUN dnf install -y --setopt=install_weak_deps=False \
       podman \
@@ -58,6 +60,7 @@ RUN dnf install -y --setopt=install_weak_deps=False \
       systemd-libs \
       jq \
       unzip \
+      zip \
       python3 \
  && dnf clean all
 

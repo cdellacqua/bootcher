@@ -19,8 +19,10 @@ aarch64 on native runners** (no cross-arch emulation), in three stages:
   from there.
 - **provision** — one job per arch (e.g. a qcow2 for x86_64, a raw for aarch64).
   `bootcher provision --target <arch> --disk <type> --skip-build` builds the disk
-  natively and publishes `output/` (packed as a single `tar`+`zstd` file) for you to
-  download and flash — to a **per-commit GitHub Release asset** on GitHub, or the
+  natively and publishes `output/` as a single **`.zip`** (the disk `zstd`-compressed
+  inside) for you to download and flash — extract natively (Windows Explorer included),
+  then hand the `disk.*.zst` straight to rpi-imager / balenaEtcher, which read `zstd`
+  directly. Lands on a **per-commit GitHub Release asset** on GitHub, or the
   project's **generic Package Registry** on GitLab. Both sidestep the run-artifact
   size limits (GitLab.com caps job artifacts at 1 GB; a sparse bootc disk easily
   exceeds that), give a stable versioned download, and don't expire the way an
