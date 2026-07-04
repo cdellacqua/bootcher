@@ -27,6 +27,21 @@ of that JSON with `jq`, then loop-mounts its ESP and overlays the firmware — s
 recipe never has to know bootcher's output layout, and is inert for a project that
 doesn't build such a target.
 
+Before overlaying, it also pre-seeds pftf's (empty) UEFI variable store inside
+`RPI_EFI.fd` with saner defaults for a Pi 4 running Linux: Devicetree instead of
+ACPI (so the BCM2711 clock/thermal drivers load and cpufreq works) and the full
+RAM instead of pftf's 3 GB cap. Both are otherwise only reachable from the UEFI
+setup menu — there's no `config.txt` knob — so seeding them keeps a freshly
+flashed card from booting slow and RAM-starved. The variable names, GUID, and
+encodings come from pftf's [upstream settings reference][pftf-settings].
+
+pftf caps RAM at 3 GB on purpose: the xHCI USB3 (front) ports have >3 GB DMA
+constraints that can break under Linux. If you need those ports, run the hook
+with `BOOTCHER_RASPI_KEEP_3GB_CAP=1` to leave the cap in place (Devicetree is
+still seeded).
+
+[pftf-settings]: https://github.com/tianocore/edk2-platforms/blob/master/Platform/RaspberryPi/RPi4/Readme.md
+
 ## Wire it in
 
 Add to your project's `bootcher.toml`:
@@ -50,5 +65,7 @@ Then `bootcher disk` (or `bootcher provision`) builds the image and runs the hoo
 ## Customising
 
 - Pin a different firmware build by editing `FIRMWARE_URL` in the script.
+- Keep pftf's 3 GB RAM cap (for working xHCI USB3 under Linux) by running with
+  `BOOTCHER_RASPI_KEEP_3GB_CAP=1`.
 - Targeting another board? Copy this directory, adjust the `select(...)` filter for
   the arch/disk_type you build, and swap the firmware steps.
