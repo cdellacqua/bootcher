@@ -30,9 +30,10 @@ RUN cargo build --release --locked -p bootcher-cli
 # never calls it directly on the deploy path.
 #
 # jq/unzip/python3 aren't used by the bootcher binary itself — they're the
-# interpreters the first-party hook recipes (recipes/*) shell out to, so the
-# containerized entry point can run them: hooks execute with `sh -c` in this
-# image. The raspi4 disk.post recipe needs all three.
+# interpreters the first-party recipes (recipes/*) shell out to, so the
+# containerized entry point can run them. The raspi4 disk.post hook needs all three;
+# python3 additionally runs the CI deploy recipe's package-cleanup step (recipes/ci/*),
+# which prunes old published image versions via the GitHub API using only the stdlib.
 #
 # zstd + zip: the CI recipes (recipes/ci/*) compress each built disk (zstd) and
 # pack it into a single, natively-extractable .zip (store mode — the member is

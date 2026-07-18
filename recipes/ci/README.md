@@ -22,8 +22,18 @@ aarch64 on native runners** (no cross-arch emulation), in three stages:
   tag) to the **registry associated with your repo** (GHCR for GitHub, the project
   Container Registry for GitLab). It also holds the signing key, if enabled. The scratch
   tags are left in place — they dedupe against `:latest` and are overwritten next run, so
-  no cleanup job is needed. Runs automatically on the default branch and on tags; devices
+  they need no cleanup. Runs automatically on the default branch and on tags; devices
   self-update from there.
+- **cleanup** (GitHub) — after a successful deploy, prunes old published versions,
+  keeping `:latest` + the newest `KEEP_PREVIOUS` immutable CalVer releases (a knob at
+  the top of the workflow). It's **multi-arch-safe**: GHCR stores each arch's child
+  manifest as its own version, so the job deletes by **digest** — building the set of
+  digests to keep (the kept releases, plus the `latest`/channel/`ci-<arch>` tags) and
+  extending it with the arch children those kept lists reference, then deleting only
+  what's outside it. A naive "keep N, delete the rest" would delete the members of the
+  release you're keeping and corrupt it. On **GitLab** this is a job you don't write:
+  turn on the project's built-in **Container Registry cleanup policy** instead (see
+  below).
 - **provision** — one job per arch (e.g. a qcow2 for x86_64, a raw for aarch64).
   `bootcher provision --target <arch> --disk <type> --skip-build` builds the disk
   natively and publishes `output/` as a single **`.zip`** (the disk `zstd`-compressed
@@ -96,6 +106,15 @@ registry = "registry.gitlab.com/<group>/<project>"
 CI authenticates separately with `podman login` (GHCR via `GITHUB_TOKEN`, GitLab
 via the job's `CI_REGISTRY_*`), so the URL above carries no credential.
 
+**No image ref to configure.** The templates don't ask you to restate `<registry>/<name>`
+anywhere: each job derives it at runtime with `bootcher info --format '{{ .Image }}'`
+(and the member name from `{{ .Name }}`), which resolves the same ref `deploy` publishes.
+Doing it in the tool — not with a hand-written `IMAGE:` var or a `sed` over `bootcher.toml`
+— means the pipeline follows the `extend` chain and the inline-table `[deploy] registry`
+(signing) form, so the value CI tags scratch members and prunes packages by can't drift
+from the one bootcher pushes. `bootcher info` prints the whole resolved project as JSON
+by default; pass a `--format` template to pull one field.
+
 These templates are multi-arch, so `bootcher.toml` must also list **both** arches in
 `[targets]`, mapped to the disk type each should produce — the `build`/`provision`
 jobs scope to one arch with `--target`:
@@ -167,6 +186,37 @@ operator machine that can reach the devices.
 (LAN mode — no `registry` in the manifest — can't be driven from CI at all: it
 tunnels the image to devices over SSH from the operator's machine. These recipes
 assume registry mode.)
+
+## Pruning old published images
+
+Every push publishes a new `:latest` list and a fresh immutable `:<CalVer>` tag, so the
+package accrues one release per deploy. Left alone it grows without bound.
+
+**GitHub** — the `deploy.yml` `cleanup` job (runs after a successful deploy) keeps
+`:latest` + the newest `KEEP_PREVIOUS` CalVer releases and deletes the rest. Tune
+`KEEP_PREVIOUS` (an `env` at the top of the workflow; `0` keeps only `:latest`). The
+prune is **multi-arch-safe** — the footgun it sidesteps: GHCR stores each arch's child
+manifest as its own package *version*, usually untagged, so the obvious "keep the N most
+recent versions, delete the rest" deletes the arch members of the release you meant to
+keep and leaves a `:latest` that won't pull. The job instead deletes by **digest**: it
+computes the digests to keep (the kept releases, plus any version tagged with a channel —
+`latest` and your `[deploy] channels` — or a `ci-<arch>` scratch tag), extends that set
+with the child manifests those kept lists reference (read from the registry), and deletes
+only versions outside it. It refuses to run if that would delete everything.
+
+- **Token** — it deletes with the built-in `GITHUB_TOKEN` (`packages: write`), which
+  works for a package **linked to this repo**. If the package is org-owned and the token
+  is refused (403), set a `CLEANUP_TOKEN` secret (a PAT / GitHub App token with
+  `delete:packages`) and swap it into the job's `GH_TOKEN`.
+- **Dry run** — flip the job's `DRY_RUN` to `"true"` to log the exact keep/delete split
+  without deleting, confirm it on a first run, then set it back.
+
+**GitLab** — don't write a job for this; use the project's built-in **Container Registry
+cleanup policy** (*Settings → Packages and registries → Clean up image tags*). Keep the N
+most recent tags, match the immutable `CalVer` tags for removal, and add `latest`, your
+channel names, and `ci-.*` to *Keep tags matching* so the mutable pointers and scratch
+members are never swept. GitLab's own registry garbage collection then reclaims the
+unreferenced layers safely — it won't drop a manifest a kept tag still points at.
 
 ## Architecture
 

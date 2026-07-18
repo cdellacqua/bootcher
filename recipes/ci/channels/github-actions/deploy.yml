@@ -1,11 +1,13 @@
 # bootcher CI with RELEASE CHANNELS — GitHub Actions BUILD + DEPLOY half, multi-arch.
 #
 # A channels-aware variant of ../../github-actions/deploy.yml. The job *shape* is
-# identical — build (per-arch, native runners) → deploy (assemble + push) — plus the
-# loopback container store and the `changes` path gate, so this header only covers what's
+# identical — build (per-arch, native runners) → deploy (assemble + push) → cleanup (prune
+# old versions) — plus the loopback container store, the `changes` path gate, and the
+# runtime `bootcher info` image-ref derivation, so this header only covers what's
 # DIFFERENT: which channel each trigger publishes to. For the store relocation, the
-# per-arch split rationale, and the secrets, read ../../github-actions/deploy.yml and
-# ../../README.md; nothing there changes. The disk build is the sibling provision.yml.
+# per-arch split rationale, the cleanup mechanics, and the secrets, read
+# ../../github-actions/deploy.yml and ../../README.md; nothing there changes. The disk
+# build is the sibling provision.yml.
 #
 #   push to main  → deploy to the default `latest` channel  (rolling / canary fleet)
 #   push a v* tag → deploy to the `stable` channel          (production fleet)
@@ -53,15 +55,15 @@ on:
     branches: [main]
     tags: ["v*"]
 
-# TODO: set IMAGE to your OS image ref — <registry>/<name>, the same ghcr.io/<owner>/<name>
-# your bootcher.toml `[deploy] registry` + project name resolve to (lowercase). `build`
-# pushes each per-arch member here under a scratch :ci-<arch> tag and `deploy` pulls it
-# (see ../../github-actions/deploy.yml for why the registry, not a run artifact). Uncomment
-# and fill it in: the build/deploy scripts guard on it and fail loudly until you do.
-# Channel-agnostic: the scratch tag is CI-internal handoff, unrelated to the :latest /
+# No image ref to configure: each job derives it from bootcher.toml at runtime with
+# `bootcher info` (see the "Resolve image ref" steps), same as the base recipe. The scratch
+# tag it builds is channel-agnostic — a CI-internal handoff unrelated to the :latest /
 # :stable channel tags `deploy` publishes.
-# env:
-#   IMAGE: ghcr.io/<owner>/<name>
+env:
+  # cleanup keeps :latest/:stable + this many previous immutable CalVer releases; older
+  # ones (and the per-arch layers only they referenced) are pruned after a successful
+  # deploy. CalVer tags are shared across channels, so one knob covers both fleets.
+  KEEP_PREVIOUS: "5"
 
 jobs:
   # --- changes: did anything that affects the image actually change? ----------------
@@ -127,12 +129,16 @@ jobs:
             echo "container store already on a real fs; skipping loopback store"
           fi
           podman info --format 'podman store: {{.Store.GraphDriverName}} @ {{.Store.GraphRoot}}'
-      - name: Build ${{ matrix.arch }}
-        # Guard IMAGE now (see the TODO up top) so a misconfigured run fails here, before
-        # the multi-minute build, instead of later at the push step.
+      - name: Resolve image ref
+        # Derive the ref from bootcher.toml (see ../../github-actions/deploy.yml): IMAGE is
+        # the base for the :ci-<arch> scratch tags. Empty ⇒ LAN mode; registry-mode only.
         run: |
-          test -n "${IMAGE:-}" || { echo "IMAGE is unset — uncomment it at the top of this workflow and set your <registry>/<name> ref (see the TODO)"; exit 1; }
-          bootcher --manifest bootcher.ci.toml build --target "${{ matrix.arch }}"
+          set -eu
+          image="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')"
+          test -n "$image" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see README)"; exit 1; }
+          echo "IMAGE=$image" >> "$GITHUB_ENV"
+      - name: Build ${{ matrix.arch }}
+        run: bootcher --manifest bootcher.ci.toml build --target "${{ matrix.arch }}"
       - name: Log in to GHCR
         run: echo "$GITHUB_TOKEN" | podman login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
         env:
@@ -186,18 +192,28 @@ jobs:
         run: echo "$GITHUB_TOKEN" | podman login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Resolve image ref
+        # Same derivation as the build jobs. IMAGE is the scratch-tag base; NAME the local
+        # member basename `deploy --skip-build` retags to.
+        run: |
+          set -eu
+          image="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')"
+          test -n "$image" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see README)"; exit 1; }
+          {
+            echo "IMAGE=$image"
+            echo "NAME=$(bootcher --manifest bootcher.ci.toml info --format '{{ .Name }}')"
+          } >> "$GITHUB_ENV"
       # Pull each per-arch member `build` pushed under its scratch tag and retag it to the
-      # local name `deploy --skip-build` expects — localhost/<name>:latest-<arch>, <name>
-      # = $IMAGE's basename — so the list is assembled from them as before, just sourced
-      # from the registry, not a run artifact. Keep this arch list in sync with the matrix.
+      # local name `deploy --skip-build` expects — localhost/<name>:latest-<arch> — so the
+      # list is assembled from them as before, just sourced from the registry, not a run
+      # artifact. Keep this arch list in sync with the matrix.
       - name: Pull image members from the registry
         run: |
           set -eu
-          test -n "${IMAGE:-}" || { echo "IMAGE is unset — uncomment it at the top of this workflow and set your <registry>/<name> ref (see the TODO)"; exit 1; }
           for arch in x86_64 aarch64; do
             scratch="$IMAGE:ci-$arch"
             podman pull "$scratch"
-            podman tag "$scratch" "localhost/${IMAGE##*/}:latest-$arch"
+            podman tag "$scratch" "localhost/$NAME:latest-$arch"
           done
       # Signing? Materialise the cosign key `[deploy] registry.key` points at:
       # - run: printf '%s' "$SIGN_KEY" > cosign.key
@@ -220,3 +236,119 @@ jobs:
           # tag (refs/tags/v*) → stable; main push → empty → bootcher's default `latest`.
           CHANNEL: ${{ startsWith(github.ref, 'refs/tags/v') && 'stable' || '' }}
           BOOTCHER_SIGN_PASSPHRASE: ${{ secrets.SIGN_PASSPHRASE }}
+
+  # --- cleanup: prune old published image versions ----------------------------------
+  # Identical to the base recipe's `cleanup` (see ../../github-actions/deploy.yml for the
+  # full multi-arch-safety and token rationale). Channels need no special handling: the
+  # protected-tag set comes from `bootcher info --format '{{ .Channels }}'`, which reports
+  # every declared channel (`latest` + `stable`), so a live channel pointer is never pruned
+  # by age. The CalVer tags it keeps N of are shared across channels, so one KEEP_PREVIOUS
+  # covers both the latest and stable fleets.
+  cleanup:
+    needs: [deploy]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write # delete old package versions
+    container:
+      image: ghcr.io/cdellacqua/bootcher:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prune old image versions
+        shell: python3 {0} # stdlib only (urllib/json) — the bootcher image bundles python3
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # org-owned package refused? use a CLEANUP_TOKEN PAT
+          DRY_RUN: "false" # "true" = log the plan without deleting (validate a first run)
+        run: |
+          # Identical to the base recipe's cleanup (see ../../github-actions/deploy.yml).
+          # Channels need no special handling: `channels` comes from `bootcher info`, which
+          # reports every declared channel, so a live channel pointer is a protected tag.
+          import base64, json, os, subprocess, sys, urllib.error, urllib.request
+
+          keep = int(os.environ.get("KEEP_PREVIOUS", "5"))
+          dry_run = os.environ.get("DRY_RUN", "false") == "true"
+          token = os.environ["GH_TOKEN"]
+          owner = os.environ["GITHUB_REPOSITORY"].split("/")[0].lower()
+
+          def project_info():
+              argv = ["bootcher", "--manifest", "bootcher.ci.toml", "info", "--format", "json"]
+              return json.loads(subprocess.run(argv, capture_output=True, text=True, check=True).stdout)
+
+          info = project_info()
+          name, channels = info["name"], set(info["channels"])
+          print(f"cleanup: {owner}/{name} — keeping :latest + {keep} previous release(s) (dry-run={dry_run})")
+
+          def fetch(url, headers, method="GET"):
+              with urllib.request.urlopen(urllib.request.Request(url, headers=headers, method=method)) as r:
+                  body = r.read()
+              return json.loads(body) if body else None
+
+          api = "https://api.github.com"
+          gh_headers = {
+              "Authorization": f"Bearer {token}",
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+          }
+          gh = lambda url, method="GET": fetch(url, gh_headers, method)
+
+          # The package-versions endpoint differs for a user vs an org owner — detect once.
+          kind = "orgs" if gh(f"{api}/users/{owner}")["type"] == "Organization" else "users"
+          base = f"{api}/{kind}/{owner}/packages/container/{name}"
+
+          versions, page = [], 1
+          while (batch := gh(f"{base}/versions?per_page=100&page={page}")):
+              versions += batch
+              page += 1
+          print(f"cleanup: {len(versions)} version(s) currently published")
+          if not versions:
+              print("cleanup: nothing to do")
+              sys.exit(0)
+
+          tags = lambda v: v["metadata"]["container"]["tags"]
+          # Protected = a channel pointer (latest + [deploy] channels) or a ci-<arch> scratch
+          # tag; those are mutable and never pruned by age.
+          protected = lambda v: any(t in channels or t.startswith("ci-") for t in tags(v))
+
+          releases = sorted((v for v in versions if tags(v) and not protected(v)),
+                            key=lambda v: v["created_at"], reverse=True)
+          keep_lists = {v["name"] for v in versions if protected(v)} | {v["name"] for v in releases[:keep]}
+
+          # Extend the keep-set with the arch children the kept lists reference (registry
+          # pull token), so a multi-arch image we keep never loses a member.
+          basic = base64.b64encode(f"{owner}:{token}".encode()).decode()
+          reg = fetch(f"https://ghcr.io/token?service=ghcr.io&scope=repository:{owner}/{name}:pull",
+                      {"Authorization": f"Basic {basic}"})["token"]
+          accept = ",".join([
+              "application/vnd.oci.image.index.v1+json",
+              "application/vnd.docker.distribution.manifest.list.v2+json",
+              "application/vnd.oci.image.manifest.v1+json",
+              "application/vnd.docker.distribution.manifest.v2+json",
+          ])
+          children = set()
+          for digest in keep_lists:
+              manifest = fetch(f"https://ghcr.io/v2/{owner}/{name}/manifests/{digest}",
+                               {"Authorization": f"Bearer {reg}", "Accept": accept})
+              children |= {m["digest"] for m in manifest.get("manifests", [])}
+
+          keep_all = keep_lists | children
+          doomed = [v for v in versions if v["name"] not in keep_all]
+          # Guard: never proceed if that would leave nothing — a bug upstream shouldn't wipe
+          # the package.
+          if not keep_all or len(doomed) >= len(versions):
+              sys.exit(f"cleanup: refusing to delete all {len(versions)} version(s) (keep-set empty) — aborting")
+          print(f"cleanup: keeping {len(versions) - len(doomed)} version(s), deleting {len(doomed)}")
+
+          for v in doomed:
+              label = f"{v['name']} tags=[{','.join(tags(v))}]"
+              if dry_run:
+                  print(f"  would delete: {v['id']} {label}")
+                  continue
+              try:
+                  gh(f"{base}/versions/{v['id']}", method="DELETE")
+              except urllib.error.HTTPError as e:
+                  if e.code == 403:
+                      sys.exit("cleanup: GITHUB_TOKEN refused (403) — for an org-owned package set a "
+                               "CLEANUP_TOKEN PAT with delete:packages and use it as GH_TOKEN.")
+                  raise
+              print(f"  deleted: {v['id']} {label}")
+          print("cleanup: done")

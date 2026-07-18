@@ -146,13 +146,12 @@ default:
       # and the rpmdb coherence bug is back.
       podman info --format 'podman store: {{.Store.GraphDriverName}} @ {{.Store.GraphRoot}}'
 
-# TODO: set IMAGE to your OS image ref — <registry>/<name>: bootcher.toml's `[deploy]
-# registry` (== $CI_REGISTRY_IMAGE) plus your project name. `build` pushes each per-arch
-# member here under a scratch :ci-<arch> tag and `deploy` pulls it (deriving the local
-# member name from its basename). Uncomment and replace <name> with your bootcher
-# `[general] name` — the build/deploy scripts guard on it and fail loudly until you do.
-# variables:
-#   IMAGE: "$CI_REGISTRY_IMAGE/<name>"
+# No image ref to configure: the build/deploy jobs derive it from bootcher.toml at runtime
+# with `bootcher info --format '{{ .Image }}'` — the same resolved <registry>/<name> deploy
+# publishes (bootcher.toml's `[deploy] registry`, which you point at $CI_REGISTRY_IMAGE,
+# plus the project name). Resolving it in the tool follows the `extend` chain and the
+# inline-table `registry` (signing) form that a shell parse would trip over, so the value
+# CI tags scratch members by can't drift from the one bootcher pushes.
 
 stages: [build, deploy, provision]
 
@@ -197,9 +196,11 @@ stages: [build, deploy, provision]
   # Gate on image-affecting changes (see `.image-rules` above); tags always build.
   rules: !reference [.image-rules, rules]
   script:
-    # Fail fast (before the multi-minute build) if IMAGE wasn't configured — see the TODO
-    # at the top of this file. Cheap guard, no dedicated job.
-    - test -n "$IMAGE" || { echo "IMAGE is unset — uncomment it at the top of this file and set your <registry>/<name> ref (see the TODO)"; exit 1; }
+    # Derive the image ref from bootcher.toml (see the header): IMAGE is the base for the
+    # :ci-<arch> scratch tag. Empty ⇒ LAN mode (no `[deploy] registry`); registry-mode only,
+    # so fail fast before the multi-minute build.
+    - IMAGE="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')"
+    - test -n "$IMAGE" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see README)"; exit 1; }
     - bootcher --manifest bootcher.ci.toml build --target "$ARCH"
     # The build produced exactly one image tagged `:latest-<arch>`. Log in with the job
     # token and push it under a scratch tag ($IMAGE:ci-<arch>) that `deploy` pulls — the
@@ -232,9 +233,11 @@ build:aarch64:
 # --- deploy: assemble the multi-arch image from the members and push --------------
 # Pulls both per-arch members the build jobs pushed to their scratch tags, retags them,
 # then `deploy --skip-build` (re)assembles the multi-arch manifest list from them and
-# pushes <registry>/<name>:latest (+ a CalVer tag). No container build, no disk step, and
-# no cleanup: the scratch tags share layers with :latest and are overwritten each run, so
-# they're left in place (see the header). The signing key is fetched here if enabled.
+# pushes <registry>/<name>:latest (+ a CalVer tag). No container build, no disk step. The
+# scratch tags need no cleanup (they share layers with :latest and are overwritten each
+# run). To prune OLD CalVer releases as they accumulate, don't add a job — turn on the
+# project's built-in Container Registry cleanup policy (see the README's "Pruning old
+# published images"). The signing key is fetched here if enabled.
 deploy:
   stage: deploy
   # Sequence behind both build jobs and gate on them. artifacts: false — the members
@@ -253,18 +256,21 @@ deploy:
   # variables:
   #   BOOTCHER_SIGN_PASSPHRASE: ""
   script:
-    # Fail fast with a helpful pointer if IMAGE wasn't configured (see the TODO up top).
-    - test -n "$IMAGE" || { echo "IMAGE is unset — uncomment it at the top of this file and set your <registry>/<name> ref (see the TODO)"; exit 1; }
+    # Derive the refs from bootcher.toml (see the header). IMAGE is the scratch-tag base;
+    # NAME the local member basename `deploy --skip-build` retags to.
+    - IMAGE="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')"
+    - NAME="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Name }}')"
+    - test -n "$IMAGE" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see README)"; exit 1; }
     - echo "$CI_REGISTRY_PASSWORD" | podman login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
     # Pull each per-arch member `build` pushed under its scratch tag and retag it to the
-    # local name `deploy --skip-build` expects — localhost/<name>:latest-<arch>, where
-    # <name> is $IMAGE's basename — so the list is assembled from them as before, just
-    # sourced from the Container Registry. Keep this arch list in sync with the build jobs.
+    # local name `deploy --skip-build` expects — localhost/<name>:latest-<arch> — so the
+    # list is assembled from them as before, just sourced from the Container Registry. Keep
+    # this arch list in sync with the build jobs.
     - |
       for arch in x86_64 aarch64; do
         scratch="$IMAGE:ci-${arch}"
         podman pull "$scratch"
-        podman tag "$scratch" "localhost/${IMAGE##*/}:latest-${arch}"
+        podman tag "$scratch" "localhost/${NAME}:latest-${arch}"
       done
     # Signing? The cosign key `[deploy] registry.key` points at is git-ignored, so fetch
     # it from GitLab Secure Files (uploaded as cosign.key) before deploy signs the push.

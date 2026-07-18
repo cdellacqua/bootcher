@@ -74,14 +74,10 @@ default:
       fi
       podman info --format 'podman store: {{.Store.GraphDriverName}} @ {{.Store.GraphRoot}}'
 
-# TODO: set IMAGE to your OS image ref — <registry>/<name>: bootcher.toml's `[deploy]
-# registry` (== $CI_REGISTRY_IMAGE) plus your project name. `build` pushes each per-arch
-# member here under a scratch :ci-<arch> tag and `deploy` pulls it (deriving the local
-# member name from its basename). Uncomment and replace <name> with your bootcher
-# `[general] name` — the build/deploy scripts guard on it and fail loudly until you do.
-# Channel-agnostic: the scratch tag is CI-internal handoff, unrelated to :latest/:stable.
-# variables:
-#   IMAGE: "$CI_REGISTRY_IMAGE/<name>"
+# No image ref to configure: the build/deploy jobs derive it from bootcher.toml at runtime
+# with `bootcher info --format '{{ .Image }}'` (see ../gitlab-ci.yml). Channel-agnostic:
+# the scratch tag it builds is a CI-internal handoff, unrelated to the :latest/:stable
+# channel tags `deploy` publishes.
 
 stages: [build, deploy, provision]
 
@@ -111,9 +107,10 @@ stages: [build, deploy, provision]
   stage: build
   rules: !reference [.image-rules, rules]
   script:
-    # Fail fast (before the multi-minute build) if IMAGE wasn't configured — see the TODO
-    # at the top of this file. Cheap guard, no dedicated job.
-    - test -n "$IMAGE" || { echo "IMAGE is unset — uncomment it at the top of this file and set your <registry>/<name> ref (see the TODO)"; exit 1; }
+    # Derive the image ref from bootcher.toml (see ../gitlab-ci.yml): IMAGE is the base for
+    # the :ci-<arch> scratch tag. Empty ⇒ LAN mode; registry-mode only, so fail fast.
+    - IMAGE="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')"
+    - test -n "$IMAGE" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see README)"; exit 1; }
     - bootcher --manifest bootcher.ci.toml build --target "$ARCH"
     # Log in with the job token and push the just-built member under a scratch tag
     # ($IMAGE:ci-<arch>) that `deploy` pulls. The scratch tag shares layers with the
@@ -158,17 +155,20 @@ deploy:
   # variables:
   #   BOOTCHER_SIGN_PASSPHRASE: ""
   script:
-    # Fail fast with a helpful pointer if IMAGE wasn't configured (see the TODO up top).
-    - test -n "$IMAGE" || { echo "IMAGE is unset — uncomment it at the top of this file and set your <registry>/<name> ref (see the TODO)"; exit 1; }
+    # Derive the refs from bootcher.toml (see ../gitlab-ci.yml). IMAGE is the scratch-tag
+    # base; NAME the local member basename `deploy --skip-build` retags to.
+    - IMAGE="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')"
+    - NAME="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Name }}')"
+    - test -n "$IMAGE" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see README)"; exit 1; }
     - echo "$CI_REGISTRY_PASSWORD" | podman login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
     # Pull each per-arch member `build` pushed under its scratch tag and retag it to the
-    # local name `deploy --skip-build` expects (localhost/<name>:latest-<arch>, <name> =
-    # $IMAGE's basename). Keep this arch list in sync with the build jobs.
+    # local name `deploy --skip-build` expects (localhost/<name>:latest-<arch>). Keep this
+    # arch list in sync with the build jobs.
     - |
       for arch in x86_64 aarch64; do
         scratch="$IMAGE:ci-${arch}"
         podman pull "$scratch"
-        podman tag "$scratch" "localhost/${IMAGE##*/}:latest-${arch}"
+        podman tag "$scratch" "localhost/${NAME}:latest-${arch}"
       done
     # Signing? Fetch the cosign key from Secure Files first (see ../gitlab-ci.yml).
     # `--channel stable` on a tag pipeline; otherwise no flag → bootcher's `latest`.
