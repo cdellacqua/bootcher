@@ -169,7 +169,7 @@ dependencies = [
 
 [[package]]
 name = "bootcher-cli"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -183,7 +183,7 @@ dependencies = [
 
 [[package]]
 name = "bootcher-core"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "anyhow",
  "base64",
