@@ -42,6 +42,36 @@ Build the container image (the `podman build` step) and assemble the per-arch re
 
 ---
 
+## `bootcher info [--format <template>]`
+
+Print the project's resolved facts from `bootcher.toml` — name, mode (`registry`/`lan`), the `<registry>/<name>` image ref, the local member ref, declared channels, whether signing is on, and the per-arch targets. Read-only; it resolves the `extend` chain and the inline-table `[deploy] registry` form, so the values match what `deploy` actually publishes. Handy in scripts and CI to read one fact instead of re-parsing the manifest (the CI recipes derive their image ref this way).
+
+With no `--format`, prints the whole document as pretty JSON. `--format` takes a `podman info`-style Go-template subset that extracts one value:
+
+```console
+$ bootcher info --format '{{ .Image }}'
+ghcr.io/acme/kiosk
+$ bootcher info --format '{{ .Name }}'
+kiosk
+$ bootcher info --format json          # the whole document as JSON
+```
+
+| Field | Meaning |
+|---|---|
+| `{{ .Name }}` | Image/project name (`[general] name`) |
+| `{{ .Mode }}` | `registry` (a `[deploy] registry` is set) or `lan` |
+| `{{ .Registry }}` | Registry namespace, or empty in LAN mode |
+| `{{ .Image }}` | Suffix-free `<registry>/<name>` ref, or empty in LAN mode |
+| `{{ .LocalImage }}` | `localhost/<name>:latest` — the local manifest list the build assembles |
+| `{{ .Channels }}` | Declared release channels (`latest` first) |
+| `{{ .Signing }}` | Whether image signing is configured |
+| `{{ .Arches }}` | Target arches |
+| `{{ .Targets.x86_64 }}` | Disk types for an arch |
+
+Fields match case-insensitively (`{{ .Image }}` = `{{ .image }}`); a composite field renders as compact JSON, and `json .Field` forces JSON encoding. An unknown field is an error, not a blank.
+
+---
+
 ## `bootcher takeover [--ssh-key <path>] [--login <user>] [--skip-pull-check] [--anonymous] [-y] [--skip-build]`
 
 **Destructively** convert each live `[deploy] remotes` host into a bootc system in place: build the container → per-host `bootc install to-existing-root`. Irreversibly wipes the target's current OS; back it up first. Each host must already have `podman` and `sudo` installed. After it succeeds the host is an ordinary bootc device, so `deploy`/`rotate` take over. See [Takeover](../workflows/takeover.md).

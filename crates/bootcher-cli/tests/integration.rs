@@ -327,6 +327,71 @@ fn extend_cycle_is_rejected() {
 		.stderr(predicate::str::contains("cycle"));
 }
 
+// ---------------------------------------------------------------- info
+
+#[test]
+fn info_extracts_the_image_ref_a_pipeline_consumes() {
+	// The CI recipes derive the scratch-tag base from `bootcher info` instead of
+	// hardcoding it. A registry-mode project's `{{ .Image }}` is the suffix-free
+	// `<registry>/<name>` — exactly what CI appends `:ci-<arch>` / `:latest` to.
+	let (tmp, proj) = project("demo");
+	// The scaffold ships a `[deploy]` table (with `remotes = []`); add a registry to it
+	// rather than a second table (duplicate tables are a TOML error).
+	let manifest = read(&proj, "bootcher.toml")
+		.replace("[deploy]\n", "[deploy]\nregistry = \"ghcr.io/acme\"\n");
+	fs::write(proj.join("bootcher.toml"), manifest).unwrap();
+
+	bootcher_in(tmp.path(), &proj)
+		.args(["info", "--format", "{{ .Image }}"])
+		.assert()
+		.success()
+		.stdout("ghcr.io/acme/demo\n");
+	// Field lookup is case-insensitive (podman-style), and `.Name` is the member basename.
+	bootcher_in(tmp.path(), &proj)
+		.args(["info", "--format", "{{ .name }}"])
+		.assert()
+		.success()
+		.stdout("demo\n");
+}
+
+#[test]
+fn info_reads_the_registry_through_the_extend_chain() {
+	// The recipes run `info` with `--manifest bootcher.ci.toml`; the registry it reports
+	// must come from the merged manifest, not just the file named — the whole reason CI
+	// derives it here instead of parsing TOML in shell (which can't follow `extend`).
+	let (tmp, proj) = project("demo");
+	let ci = extending_manifest(&proj, "[deploy]\nregistry = \"ghcr.io/acme\"");
+	bootcher_in(tmp.path(), &proj)
+		.args(["--manifest", ci, "info", "--format", "{{ .Image }}"])
+		.assert()
+		.success()
+		.stdout("ghcr.io/acme/demo\n");
+}
+
+#[test]
+fn info_reports_lan_mode_with_no_image_ref() {
+	// A freshly-scaffolded project is LAN mode (no `[deploy] registry`), so it has no
+	// registry image ref: `{{ .Image }}` is empty and the recipes' guard fires.
+	let (tmp, proj) = project("demo");
+	bootcher_in(tmp.path(), &proj)
+		.args(["info", "--format", "mode={{ .Mode }} image=[{{ .Image }}]"])
+		.assert()
+		.success()
+		.stdout("mode=lan image=[]\n");
+}
+
+#[test]
+fn info_rejects_an_unknown_format_field() {
+	// A misspelled `--format` field is a loud error (naming the valid fields), not a
+	// silent blank that a pipeline would treat as an empty image ref.
+	let (tmp, proj) = project("demo");
+	bootcher_in(tmp.path(), &proj)
+		.args(["info", "--format", "{{ .Nope }}"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("no such field `Nope`"));
+}
+
 // ---------------------------------------------------------------- hooks
 
 /// Append a raw `[hooks.<phase>]` table (the caller writes the whole block) to a

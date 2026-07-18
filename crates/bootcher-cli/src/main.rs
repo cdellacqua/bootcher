@@ -186,6 +186,19 @@ enum Cmd {
 	/// the on-device secret replaced. See `rotate`.
 	#[command(subcommand)]
 	Rotate(RotateCmd),
+	/// Print the project's resolved facts (name, mode, the `<registry>/<name>` image
+	/// ref, channels, targets) from `bootcher.toml`. Like `podman info`: prints the
+	/// whole document by default (or with `--format json`), or extracts one value with
+	/// a `--format '{{ .Field }}'` template — so a script or CI pipeline reads a single
+	/// fact (e.g. the image ref for a scratch tag) instead of re-parsing the manifest.
+	Info {
+		/// Extract a value with a `podman info`-style Go-template subset
+		/// (`{{ .Image }}`, `{{ .Name }}`, `{{ .Targets.x86_64 }}`; fields match
+		/// case-insensitively), or pass `json` for the whole document as JSON. Omit
+		/// for the full document as pretty JSON.
+		#[arg(long = "format")]
+		format: Option<String>,
+	},
 	/// Delete the bootcher cache (`~/.cache/bootcher`): the cross-arch builder VM
 	/// images.
 	Clean,
@@ -383,6 +396,12 @@ fn run() -> Result<()> {
 		}
 		Cmd::Sign(cmd) => run_sign(cmd, manifest_path),
 		Cmd::Rotate(cmd) => run_rotate(cmd, manifest_path),
+		Cmd::Info { format } => {
+			let manifest = Manifest::load(manifest_path)?;
+			let info = jobs::info::Info::from_manifest(&manifest);
+			println!("{}", jobs::info::render(&info, format.as_deref())?);
+			Ok(())
+		}
 		Cmd::Clean => cache::clean(),
 	}
 }
