@@ -1,5 +1,17 @@
 # Development
 
+## Before you commit (required)
+
+**Run `just ci` locally and make sure it's green before every commit.** This is a
+mandatory pre-commit step, not a suggestion — the same checks run in
+[ci.yml](.github/workflows/ci.yml), and a red `just ci` locally means a red
+pipeline. Skipping it is how broken commits reach `main`.
+
+```sh
+just ci    # fmt check + clippy + doc + test — must pass before you commit
+just fix   # auto-fix fmt and clippy warnings, then re-run `just ci`
+```
+
 ## Dependencies
 
 ### Rust toolchain

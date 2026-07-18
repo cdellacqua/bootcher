@@ -72,7 +72,7 @@ impl Info {
 
 /// Render an [`Info`] for `bootcher info`:
 /// - `None` or `Some("json")` → the whole document as pretty JSON.
-/// - `Some("{{ .Field }}")` → the [`render_template`] subset, extracting one value.
+/// - `Some("{{ .Field }}")` → a Go-template-style subset, extracting one value.
 ///
 /// # Errors
 ///
