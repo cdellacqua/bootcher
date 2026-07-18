@@ -5,18 +5,25 @@ aarch64 on native runners** (no cross-arch emulation), in three stages:
 
 - **build** — one job per arch, in parallel on a native-arch runner each. `bootcher
   build --target <arch>` builds just that arch's container and stops at the per-arch
-  member tag `<name>:latest-<arch>` (no multi-arch list yet), which the job `podman
-  save`s and hands to **deploy** as an artifact (a run artifact on GitHub, a job
-  artifact on GitLab). These jobs need **no registry credentials**. Why split per
-  arch? A single-runner multi-arch build would emulate the foreign arch under
-  qemu-user — slow and occasionally fragile; native runners are faster and sounder.
-- **deploy** — `podman load`s both per-arch members and `bootcher deploy
-  --skip-build` **assembles the multi-arch manifest list from them** and pushes
-  `<registry>/<name>:latest` (+ an immutable CalVer tag) to the **registry associated
-  with your repo** (GHCR for GitHub, the project Container Registry for GitLab). The
-  **only** job that needs registry push credentials (and the signing key, if
-  enabled). Runs automatically on the default branch and on tags; devices self-update
-  from there.
+  member tag `<name>:latest-<arch>` (no multi-arch list yet), which the job **pushes to
+  the registry under a scratch tag `<image>:ci-<arch>`** that **deploy** pulls. Why the
+  registry, not a CI artifact? A full OS-image member is large (easily >1 GB) and blows
+  the free-tier artifact caps — GitHub's Actions artifact storage (~500 MB, and a single
+  member can exceed it outright) and GitLab.com's 1 GB job-artifact cap. The scratch tag
+  sidesteps that pool entirely and shares layers with the `:latest` list deploy publishes,
+  so it costs ~no extra registry storage and is overwritten each run. The push
+  authenticates with your repo's **automatic** token (`GITHUB_TOKEN` with `packages:
+  write` / GitLab's `$CI_JOB_TOKEN`), so no manual secret is needed. Why split per arch?
+  A single-runner multi-arch build would emulate the foreign arch under qemu-user — slow
+  and occasionally fragile; native runners are faster and sounder.
+- **deploy** — pulls both per-arch members from their scratch tags, retags them to the
+  local member name, and `bootcher deploy --skip-build` **assembles the multi-arch
+  manifest list from them** and pushes `<registry>/<name>:latest` (+ an immutable CalVer
+  tag) to the **registry associated with your repo** (GHCR for GitHub, the project
+  Container Registry for GitLab). It also holds the signing key, if enabled. The scratch
+  tags are left in place — they dedupe against `:latest` and are overwritten next run, so
+  no cleanup job is needed. Runs automatically on the default branch and on tags; devices
+  self-update from there.
 - **provision** — one job per arch (e.g. a qcow2 for x86_64, a raw for aarch64).
   `bootcher provision --target <arch> --disk <type> --skip-build` builds the disk
   natively and publishes `output/` as a single **`.zip`** (the disk `zstd`-compressed
@@ -45,8 +52,9 @@ aarch64 on native runners** (no cross-arch emulation), in three stages:
   pass `--anonymous` to `bootcher provision` so it bakes no pull credential into the
   disk either (the device pulls updates anonymously too).
 
-The CI owns the `podman save`/`load` that moves the per-arch members between jobs, so
-bootcher's own `build`/`deploy` on a dev box are unchanged. Single-arch project?
+The per-arch members move between jobs through the registry (the `<image>:ci-<arch>`
+scratch tags), a CI-only handoff, so bootcher's own `build`/`deploy` on a dev box are
+unchanged. Single-arch project?
 Drop one arch from the matrix (GitHub) / delete the second `build:`/`provision:` job
 (GitLab), and list only that arch in `[targets]`.
 
@@ -173,10 +181,11 @@ Each `build`/`provision` job scopes bootcher to its runner's arch with `--target
 `bootcher.toml`** — no per-arch manifest.
 
 The split exists because building a foreign arch on a single runner means qemu-user
-emulation: slow and occasionally fragile. The per-arch members are handed between
-jobs via the CI's artifact store (`podman save`/`load`), so the registry only ever
-receives the final assembled `:latest`, and the build jobs need no registry
-credentials. (If you'd rather not fan out — e.g. you only have x86_64 runners — point
+emulation: slow and occasionally fragile. The per-arch members are handed between jobs
+through the registry (each build pushes a `<image>:ci-<arch>` scratch tag deploy pulls),
+which dodges the free-tier CI artifact caps and dedupes against the final `:latest`; the
+push uses the repo's automatic CI token, so no manual credential is needed. (If you'd
+rather not fan out — e.g. you only have x86_64 runners — point
 the aarch64 `[builder]` at a `vm`/remote and build everything in one job; expect the
 emulation cost.)
 

@@ -14,13 +14,14 @@
 #                runner (ubuntu-24.04 / ubuntu-24.04-arm). `bootcher build --target
 #                <arch>` builds just that arch's container and stops at the per-arch
 #                member tag localhost/<name>:latest-<arch> (NO multi-arch list —
-#                `deploy` makes that). The job `podman save`s the member and uploads it
-#                as a run artifact. These jobs need NO registry credentials.
-#   deploy     — downloads both per-arch members, `podman load`s them, then `bootcher
-#                deploy --skip-build` (re)assembles the multi-arch manifest list from
-#                them and pushes <registry>/<name>:latest (+ an immutable CalVer tag) to
-#                GHCR (this repo's registry). The ONLY job that needs `packages: write`
-#                (and the signing key, if enabled). Devices self-update.
+#                `deploy` makes that). The job PUSHES the member to the registry under a
+#                scratch tag (<image>:ci-<arch>) that `deploy` pulls — so it needs
+#                `packages: write`. (See "Why the registry, not a run artifact" below.)
+#   deploy     — pulls both per-arch members from their scratch tags, retags them to the
+#                local member name, then `bootcher deploy --skip-build` (re)assembles the
+#                multi-arch manifest list from them and pushes <registry>/<name>:latest
+#                (+ an immutable CalVer tag) to GHCR (this repo's registry). Also needs
+#                `packages: write` (and the signing key, if enabled). Devices self-update.
 #
 # A `changes` pre-job path-filters the run: build/deploy fire only when an image input
 # changed (Containerfile, sysroot/, the manifests, this workflow), so a docs-only push
@@ -28,9 +29,20 @@
 #
 # Why split the build per arch? A multi-arch `bootcher deploy` on a single runner would
 # build the foreign arch under qemu-user emulation — slow and occasionally fragile.
-# Building each arch on its own native runner is faster and more reliable. The members
-# are handed between jobs as run artifacts: the CI owns the `podman save`/`load`, so
-# bootcher's own `build`/`deploy` on a dev box are untouched.
+# Building each arch on its own native runner is faster and more reliable.
+#
+# Why the registry, not a run artifact? The per-arch members are handed between jobs
+# through the registry: `build` pushes each to a scratch tag (<image>:ci-<arch>) and
+# `deploy` pulls it. A full OS-image member is large (easily >1GB), and a single such run
+# artifact can blow the Free plan's ~500MB Actions artifact storage quota on its own —
+# after which `upload-artifact` just fails (and expired artifacts aren't GC'd promptly).
+# The scratch tags dodge that pool entirely; they share blobs with the :latest list
+# `deploy` publishes (identical digests), so they cost ~no extra registry storage and are
+# overwritten every run. Tradeoff: `build` now needs `packages: write` (it previously
+# needed no registry credentials). This is CI-only — the scratch tags and login live in
+# the workflow, so `bootcher build`/`deploy` on a dev box are untouched. NOTE: the stable
+# <image>:ci-<arch> tag assumes serial pushes; two overlapping runs could clobber each
+# other's member — fine for a low-traffic repo, otherwise scope the tag with the run id.
 #
 # Both jobs run inside the published bootcher image (ghcr.io/cdellacqua/bootcher —
 # multi-arch, bundles podman + qemu), so there's nothing to install; they need a
@@ -77,6 +89,14 @@ on:
     branches: [main]
     tags: ["v*"]
 
+# TODO: set IMAGE to your OS image ref — <registry>/<name>, i.e. the same
+# ghcr.io/<owner>/<name> your bootcher.toml `[deploy] registry` + project name resolve to
+# (lowercase). `build` pushes each per-arch member here under a scratch :ci-<arch> tag and
+# `deploy` pulls it (deriving the local member name from its basename). Uncomment and fill
+# it in: the build/deploy scripts guard on it and fail loudly with this pointer until you do.
+# env:
+#   IMAGE: ghcr.io/<owner>/<name>
+
 jobs:
   # --- changes: did anything that affects the image actually change? --------------
   # The build context is the whole project root, so this is an ALLOWLIST of the inputs
@@ -117,8 +137,9 @@ jobs:
   # --- build: one container per arch, on a native-arch runner ---------------------
   # `build --target <arch>` builds only that arch and stops at the per-arch member tag
   # localhost/<name>:latest-<arch> (no multi-arch list — `deploy` assembles that). The
-  # member is uploaded as a run artifact `deploy` downloads. No registry credentials
-  # needed here — only `deploy` pushes.
+  # member is pushed to the registry under a scratch tag (<image>:ci-<arch>) that
+  # `deploy` pulls, so this job needs `packages: write` (see the header for why it's not
+  # a run artifact).
   build:
     # Gate on the change filter (see the `changes` job); a `v*` tag always builds.
     # deploy needs this job, so a skip here cascades and skips it too.
@@ -133,6 +154,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
+      packages: write # push each per-arch member to the registry (was artifact-only)
     container:
       image: ghcr.io/cdellacqua/bootcher:latest
       options: --privileged # podman builds the container image (nested)
@@ -159,28 +181,33 @@ jobs:
           # means the store slipped back onto overlay-on-overlay (rpmdb bug returns).
           podman info --format 'podman store: {{.Store.GraphDriverName}} @ {{.Store.GraphRoot}}'
       - name: Build ${{ matrix.arch }}
-        run: bootcher --manifest bootcher.ci.toml build --target "${{ matrix.arch }}"
-      - name: Save image member
-        # The build just produced exactly one image tagged `:latest-<arch>`. Save it;
-        # the repo:tag is restored on `podman load`, so `deploy` finds the member by
-        # name. zstd keeps the artifact small.
+        # Guard IMAGE now (see the TODO up top) so a misconfigured run fails here, before
+        # the multi-minute build, instead of later at the push step.
+        run: |
+          test -n "${IMAGE:-}" || { echo "IMAGE is unset — uncomment it at the top of this workflow and set your <registry>/<name> ref (see the TODO)"; exit 1; }
+          bootcher --manifest bootcher.ci.toml build --target "${{ matrix.arch }}"
+      - name: Log in to GHCR
+        run: echo "$GITHUB_TOKEN" | podman login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push image member to the registry
+        # The build just produced exactly one image tagged `:latest-<arch>`. Push it under
+        # a scratch tag ($IMAGE:ci-<arch>) that `deploy` pulls — the build→deploy handoff
+        # goes through the registry, not a run artifact (see the header for why). Unsigned:
+        # a CI-internal intermediate no device pulls; only :latest is signed (in deploy).
         run: |
           set -eu
           img="$(podman images --format '{{.Repository}}:{{.Tag}}' | grep ":latest-${{ matrix.arch }}\$" | head -n1)"
           test -n "$img" || { echo "no built image tagged :latest-${{ matrix.arch }}"; exit 1; }
-          podman save "$img" | zstd -T0 -10 -q -o "image-${{ matrix.arch }}.tar.zst"
-      - name: Upload image member
-        uses: actions/upload-artifact@v4
-        with:
-          name: image-${{ matrix.arch }}
-          path: image-${{ matrix.arch }}.tar.zst
-          retention-days: 1
+          scratch="$IMAGE:ci-${{ matrix.arch }}"
+          podman tag "$img" "$scratch"
+          podman push "$scratch"
 
   # --- deploy: assemble the multi-arch image from the members and push --------------
-  # Downloads both per-arch members the build matrix produced, `podman load`s them, then
-  # `deploy --skip-build` (re)assembles the multi-arch manifest list and pushes
-  # <registry>/<name>:latest (+ a CalVer tag). No container build, no disk step — the
-  # only job with `packages: write` (and the signing key, if enabled).
+  # Pulls both per-arch members the build matrix pushed to their scratch tags, retags
+  # them, then `deploy --skip-build` (re)assembles the multi-arch manifest list and pushes
+  # <registry>/<name>:latest (+ a CalVer tag). No container build, no disk step. Needs
+  # `packages: write` (and the signing key, if enabled) to push :latest.
   deploy:
     needs: [build] # waits for every matrix arch
     runs-on: ubuntu-24.04
@@ -210,28 +237,34 @@ jobs:
             echo "container store already on a real fs; skipping loopback store"
           fi
           podman info --format 'podman store: {{.Store.GraphDriverName}} @ {{.Store.GraphRoot}}'
-      # `needs:` doesn't auto-download artifacts on GitHub (unlike GitLab), so fetch
-      # every per-arch member into the workspace (flattened) explicitly.
-      - name: Download image members
-        uses: actions/download-artifact@v4
-        with:
-          pattern: image-*
-          merge-multiple: true
       - name: Log in to GHCR
         run: echo "$GITHUB_TOKEN" | podman login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Pull each per-arch member `build` pushed under its scratch tag and retag it to the
+      # local name `deploy --skip-build` expects — localhost/<name>:latest-<arch>, where
+      # <name> is $IMAGE's basename — so the list is assembled from them exactly as before,
+      # just sourced from the registry, not a run artifact. Keep this arch list in sync
+      # with the build matrix above.
+      - name: Pull image members from the registry
+        run: |
+          set -eu
+          test -n "${IMAGE:-}" || { echo "IMAGE is unset — uncomment it at the top of this workflow and set your <registry>/<name> ref (see the TODO)"; exit 1; }
+          for arch in x86_64 aarch64; do
+            scratch="$IMAGE:ci-$arch"
+            podman pull "$scratch"
+            podman tag "$scratch" "localhost/${IMAGE##*/}:latest-$arch"
+          done
       # Signing? Materialise the cosign key `[deploy] registry.key` points at:
       # - run: printf '%s' "$SIGN_KEY" > cosign.key
       #   env: { SIGN_KEY: "${{ secrets.SIGN_KEY }}" }
-      - name: Load members + deploy
-        # Load every per-arch member (restoring its localhost/<name>:latest-<arch> tag),
-        # then `--skip-build` (re)assembles the multi-arch list from them and pushes it.
+      - name: Deploy
+        # The members were pulled + retagged to localhost/<name>:latest-<arch> above, so
+        # `--skip-build` (re)assembles the multi-arch list from them and pushes it.
         # `--skip-bootc-upgrade` leaves the rollout to each device's auto-update timer
         # (keeps the admin SSH key out of CI and doesn't assume the runner can reach the
         # fleet). Drop the flag (and add the key) to roll immediately.
         run: |
-          for f in image-*.tar.zst; do zstd -dc "$f" | podman load; done
           bootcher --manifest bootcher.ci.toml deploy --skip-build --skip-bootc-upgrade
         env:
           BOOTCHER_SIGN_PASSPHRASE: ${{ secrets.SIGN_PASSPHRASE }}
