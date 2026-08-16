@@ -2,14 +2,14 @@
 
 ## Before you commit (required)
 
-**Run `just ci` locally and make sure it's green before every commit.** This is a
-mandatory pre-commit step, not a suggestion — the same checks run in
-[ci.yml](.github/workflows/ci.yml), and a red `just ci` locally means a red
-pipeline. Skipping it is how broken commits reach `main`.
+**Run `cargo xtask ci` locally and make sure it's green before every commit.**
+This is a mandatory pre-commit step, not a suggestion — the same checks run in
+[ci.yml](.github/workflows/ci.yml), and a red `cargo xtask ci` locally means a
+red pipeline. Skipping it is how broken commits reach `main`.
 
 ```sh
-just ci    # fmt check + clippy + doc + test — must pass before you commit
-just fix   # auto-fix fmt and clippy warnings, then re-run `just ci`
+cargo xtask ci    # fmt check + clippy + doc + test — must pass before you commit
+cargo xtask fix   # auto-fix fmt and clippy warnings, then re-run `cargo xtask ci`
 ```
 
 ## Dependencies
@@ -20,20 +20,23 @@ bootcher is pinned to a specific Rust version via `rust-toolchain.toml`. The too
 
 The pinned channel and required components (`rustfmt`, `clippy`) are declared in [rust-toolchain.toml](rust-toolchain.toml). `rustup` provisions them without any extra steps.
 
-### just
+### Task runner
 
-The `just` task runner is used to run the development workflows (`just ci`, `just run`, `just test`, …).
-
-```sh
-cargo install just --locked
-```
+There isn't one to install. The development workflows live in
+[`crates/xtask/`](crates/xtask/), a dev-only workspace member reached through the
+`cargo xtask` alias in [.cargo/config.toml](.cargo/config.toml) — so `cargo xtask
+ci`, `cargo xtask run`, `cargo xtask test`, … work with nothing beyond the
+toolchain. `cargo xtask --help` lists every task.
 
 ### mdbook
 
 The documentation site under [`docs/`](docs/) is built with [mdBook](https://rust-lang.github.io/mdBook/).
 The GitHub Pages landing page (animated hero + links) lives in [`docs/landing/`](docs/landing/);
-`just docs` assembles it together with the book into `docs/site/` (landing at the
+`cargo xtask docs` assembles it together with the book into `docs/site/` (landing at the
 root, the book under `book/`, rustdoc under `book/api/`) — that's what CI publishes.
+
+mdBook is the one dev tool that still needs installing — it does something no
+cargo task can:
 
 ```sh
 cargo install mdbook --locked
@@ -43,16 +46,17 @@ cargo install mdbook-mermaid --locked
 Build the site locally with:
 
 ```sh
-just docs        # assemble docs/site/ (landing + book + embedded rustdoc)
-just docs-serve  # prose live-reload at http://localhost:3000 (book only, rustdoc not embedded)
+cargo xtask docs        # assemble docs/site/ (landing + book + embedded rustdoc)
+cargo xtask site-serve  # build the site and serve it at http://localhost:3000
+cargo xtask docs-watch  # prose live-reload at http://localhost:3000 (book only, rustdoc not embedded)
 ```
 
-To preview the landing page, open `docs/site/index.html` in a browser after `just docs`.
+To preview the landing page, open `docs/site/index.html` in a browser after `cargo xtask docs`.
 
-### Runtime tools (for `just run`)
+### Runtime tools (for `cargo xtask run`)
 
 Building this repo needs only the Rust toolchain above, but actually *running* the
-binary against a project (`just run build` / `disk` / `deploy` …) shells out to
+binary against a project (`cargo xtask run build` / `disk` / `deploy` …) shells out to
 `podman`, `ssh`, `sudo`, and — for the `vm` builder — `qemu`. The full matrix
 (which tool each subcommand needs, and the install hints) lives in the user-facing
 [Installation › Runtime dependencies](docs/src/installation.md#runtime-dependencies)
@@ -63,12 +67,24 @@ and fails up front naming any that are missing (see
 ## Common tasks
 
 ```sh
-just run <args>   # run a dev build of the binary
-just test         # cargo test
-just ci           # fmt check + clippy + doc + test (what CI runs)
-just fix          # auto-fix fmt and clippy warnings
-just install      # cargo install --path crates/bootcher-cli
+cargo xtask run <args>   # run a dev build of the binary (in the current directory)
+cargo xtask test         # cargo test
+cargo xtask ci           # fmt check + clippy + doc + test (what CI runs)
+cargo xtask fix          # auto-fix fmt and clippy warnings
+cargo xtask install      # cargo install --path crates/bootcher-cli
+cargo xtask --help       # the full list
 ```
+
+`cargo xtask run` is the one task that keeps the directory you invoked it from
+rather than the repo root, since bootcher reads `./bootcher.toml`. The alias
+itself is found by walking up from the working directory, so it only reaches
+projects nested under this repo — for a project elsewhere on disk, `cargo xtask
+install` and use the real `bootcher` binary.
+
+Every task that shells out to cargo splices in `$BOOTCHER_CARGO_FLAGS`
+(whitespace-separated). It's empty for local dev; CI sets it to `--frozen` to pin
+`Cargo.lock` for the nested invocations, alongside `CARGO_NET_OFFLINE=true` for
+the outer build of xtask itself.
 
 ## Cutting a release
 
@@ -79,23 +95,30 @@ does not re-run the test suite: the tagged commit already passed
 [ci.yml](.github/workflows/ci.yml) when it landed on `main`, so only tag commits
 that are green on `main`.
 
-`just release` does the whole dance from a clean `main` — bump the workspace
-version, commit, tag, push:
+`cargo xtask release` does the whole dance from a clean `main` — bump the
+workspace version, commit, tag, push:
 
 ```sh
-just release         # patch bump (default): 0.0.1 -> 0.0.2
-just release minor   # 0.0.1 -> 0.1.0
-just release major   # 0.0.1 -> 1.0.0
-just release 1.2.3   # set an explicit version
+cargo xtask release         # patch bump (default): 0.0.1 -> 0.0.2
+cargo xtask release minor   # 0.0.1 -> 0.1.0
+cargo xtask release major   # 0.0.1 -> 1.0.0
+cargo xtask release 1.2.3   # set an explicit version
 ```
 
-The version bump is done by the dev-only [`housekeeper`](crates/housekeeper/)
-binary (a [cargo-xtask](https://github.com/matklad/cargo-xtask)-style helper) so
-the workflow needs no external tooling like `cargo-edit`/`cargo-release` — it
+The version bump lives in [`crates/xtask/src/release.rs`](crates/xtask/src/release.rs),
+so the workflow needs no external tooling like `cargo-edit`/`cargo-release` — it
 edits `[workspace.package].version` in [Cargo.toml](Cargo.toml) in place with
-`toml_edit` (preserving comments) and `semver`, and prints the new version for
-the recipe to tag. Both member crates inherit the version via
-`version.workspace = true`, so that one field is the single source of truth.
+`toml_edit` (preserving comments) and `semver`. Both member crates inherit the
+version via `version.workspace = true`, so that one field is the single source of
+truth.
+
+Every guard — clean tree, on `main`, the version parses, the tag doesn't already
+exist — runs *before* the manifest is touched, so a release rejected by one of
+them leaves the tree exactly as it found it. Past that point the steps are
+sequential and are not rolled back: if `git push` fails, the bump is already
+committed and the tag already created locally, and a re-run stops at `tag vX.Y.Z
+already exists` — finish that release with `git push origin main vX.Y.Z` rather
+than starting a new one.
 
 ## End-to-end tests
 
@@ -105,7 +128,7 @@ prerequisites rather than skipping — a missing tool fails the run with the
 reason, so only enable them on a runner that can actually host a VM. They come
 in two gated suites.
 
-### Same-arch VM + registry (`just e2e`)
+### Same-arch VM + registry (`cargo xtask e2e`)
 
 Builds and boots disks for the **host** architecture, KVM-accelerated. Covers
 the LAN rotate + upgrade lifecycle, the registry lifecycle + pull-token rotation
@@ -120,12 +143,12 @@ signing. Prerequisites:
 - **passwordless `sudo sh`** — the image-builder step runs under one `sudo sh` root session, and there is no TTY for a password prompt while it runs
 
 ```sh
-just e2e
+cargo xtask e2e
 # or, combined with the standard CI checks:
-just ci e2e=1
+cargo xtask ci --e2e
 ```
 
-### Cross-arch builder (`just e2e-cross`)
+### Cross-arch builder (`cargo xtask e2e-cross`)
 
 Builds a **foreign-arch** bootc disk (image-builder inside a Fedora Cloud builder VM) and
 boots it — both under full CPU emulation (qemu TCG, no KVM). Gated apart behind
@@ -137,18 +160,18 @@ the `e2e_cross` feature because its prerequisites differ:
 - **No** `/dev/kvm` or host `sudo` needed — everything foreign is emulated, and the privileged image-builder step runs inside the builder VM, not in-process
 
 ```sh
-just e2e-cross
+cargo xtask e2e-cross
 # or, combined with the standard CI checks:
-just ci e2e_cross=1
+cargo xtask ci --e2e-cross
 ```
 
 > **Cross-arch is slow.** Because everything runs under TCG emulation rather than
 > KVM, the cross-arch run can take **~2 hours or more** depending on hardware —
-> far longer than the KVM-accelerated `just e2e` suite.
+> far longer than the KVM-accelerated `cargo xtask e2e` suite.
 
 ## Project layout
 
 - [`crates/bootcher-core/`](crates/bootcher-core/) — library: builders, jobs, pipelines, LAN registry, lifecycle hooks
 - [`crates/bootcher-core/scaffold/`](crates/bootcher-core/scaffold/) — embedded project template stamped out by `bootcher init`
 - [`crates/bootcher-cli/`](crates/bootcher-cli/) — the `bootcher` binary
-- [`crates/housekeeper/`](crates/housekeeper/) — dev-only release helper (version bumps for `just release`); never published
+- [`crates/xtask/`](crates/xtask/) — dev-only task runner ([cargo-xtask](https://github.com/matklad/cargo-xtask) pattern) behind the `cargo xtask` alias; never published

@@ -1,11 +1,11 @@
 name: Verify
 
-# Reusable verify job: format, lint, doc, and test via `just ci` on a single
-# Linux host (bootcher is Linux-only — Podman is native Linux — so there's no
-# cross-OS matrix). Called by ci.yml (on push/PR to main) and as the gate in
+# Reusable verify job: format, lint, doc, and test via `cargo xtask ci` on a
+# single Linux host (bootcher is Linux-only — Podman is native Linux — so there's
+# no cross-OS matrix). Called by ci.yml (on push/PR to main) and as the gate in
 # release.yml (before anything is built or published). Living here as a single
-# workflow_call workflow keeps the two callers from drifting: both the `just ci`
-# recipe *and* the surrounding scaffolding (checkout/cache/fetch) exist once.
+# workflow_call workflow keeps the two callers from drifting: both the `xtask ci`
+# task *and* the surrounding scaffolding (checkout/cache/fetch) exist once.
 on:
   workflow_call:
 
@@ -23,14 +23,10 @@ jobs:
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           # Cache the registry index/cache and git db (not the regenerable
-          # extracted ~/.cargo/registry/src), plus the build artifacts. The
-          # .crates.toml/.crates2.json ledger lives at the root of ~/.cargo
-          # (not under bin/); without it `cargo install` can't tell a tool is
-          # already present and rebuilds it even on a cache hit.
+          # extracted ~/.cargo/registry/src), plus the build artifacts. This job
+          # `cargo install`s nothing — xtask is a workspace member and comes out
+          # of target/ — so there's no ~/.cargo/bin ledger to preserve here.
           path: |
-            ~/.cargo/bin/
-            ~/.cargo/.crates.toml
-            ~/.cargo/.crates2.json
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
@@ -42,14 +38,19 @@ jobs:
       # Fetch with --locked (needs network, verifies the lockfile is current),
       # then build/test with --frozen so the rest of the run is offline and
       # can't mutate Cargo.lock or pull anything unexpected.
-      # Install the `just` task runner so CI runs the exact same recipe a
-      # developer runs locally (`just ci`), keeping the two from drifting; lands
-      # in the cached ~/.cargo/bin/.
-      - name: Install just
-        run: cargo install just --locked
       - name: Fetch dependencies
         run: cargo fetch --locked
-      # cargo_flags=--frozen keeps the run offline and pins Cargo.lock; locally
-      # the recipe defaults to no extra flags.
-      - name: Verify (just ci)
-        run: just cargo_flags=--frozen ci
+      # The exact task a developer runs locally (`cargo xtask ci`), so the two
+      # can't drift. No task runner to install — xtask is a workspace member,
+      # built from the cache above.
+      #
+      # Pinning applies at two levels: CARGO_NET_OFFLINE keeps the outer build of
+      # xtask itself offline, and BOOTCHER_CARGO_FLAGS is what xtask splices into
+      # the cargo commands it shells out to. `--locked` has no config-key/env
+      # equivalent, which is why the inner half is threaded through xtask rather
+      # than set here alone. Locally both are unset and xtask adds no flags.
+      - name: Verify (cargo xtask ci)
+        env:
+          CARGO_NET_OFFLINE: "true"
+          BOOTCHER_CARGO_FLAGS: --frozen
+        run: cargo xtask ci

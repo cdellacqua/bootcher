@@ -15,7 +15,7 @@
 //! gated behind its **own** feature, `e2e_cross`, separate from `e2e`:
 //!
 //! - plain `cargo test` and `--features e2e` both skip it (`#[ignore]`),
-//! - `--features e2e_cross` un-ignores it (`just e2e-cross`).
+//! - `--features e2e_cross` un-ignores it (`cargo xtask e2e-cross`).
 //!
 //! Scope is deliberately just provision → boot → verify: a LAN `deploy` round-trip
 //! would mean a *second* cross-arch build + a foreign pull and roughly double an

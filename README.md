@@ -240,9 +240,9 @@ See [DEVELOPMENT.md](DEVELOPMENT.md) for build prerequisites and common workflow
   project template stamped out by `bootcher init`.
 - [`crates/bootcher-cli/`](crates/bootcher-cli/) — the `bootcher` binary.
 
-`just ci` runs the full check set (`cargo fmt --check`, `cargo clippy -D
+`cargo xtask ci` runs the full check set (`cargo fmt --check`, `cargo clippy -D
 warnings`, `cargo test`). The CLI integration tests
 ([`crates/bootcher-cli/tests/integration.rs`](crates/bootcher-cli/tests/integration.rs))
 scaffold throwaway projects with `bootcher init` and assert the project plumbing
-(no podman needed). `just run <args>` runs a dev build of the binary; `just
-install` puts it on `PATH`.
+(no podman needed). `cargo xtask run <args>` runs a dev build of the binary;
+`cargo xtask install` puts it on `PATH`.

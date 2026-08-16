@@ -1,0 +1,8 @@
+# `cargo xtask <task>` — the repo's development tasks (see crates/xtask/).
+#
+# Deliberately carries no `--locked`/`--frozen`: those would apply to the build
+# of xtask itself and break local iteration whenever a dependency changes. CI
+# pins the nested cargo invocations with $BOOTCHER_CARGO_FLAGS instead, and
+# keeps the outer build offline with CARGO_NET_OFFLINE.
+[alias]
+xtask = "run --package xtask --"

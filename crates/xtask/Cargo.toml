@@ -1,0 +1,29 @@
+[package]
+name = "xtask"
+# Standalone, never inherited: this dev-only task runner bumps the *workspace*
+# version during `release`, so it must not carry `version.workspace = true` (it
+# would rewrite its own version every time it runs). Pinned at 0.0.0 and never
+# released.
+version = "0.0.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.102"
+# clap, anyhow, semver and toml_edit are already in the workspace lockfile
+# (directly or transitively), so this crate adds only xshell to the build graph.
+clap = { version = "4.6.1", features = ["derive"] }
+semver = "1"
+toml_edit = "0.25"
+# Shell-ish ergonomics for the many one-line cargo/git/podman invocations these
+# tasks are made of; `cmd!` keeps them readable as the shell lines they replaced.
+xshell = "0.2.7"
+
+[lints]
+workspace = true

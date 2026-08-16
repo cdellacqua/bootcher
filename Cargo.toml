@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/bootcher-core", "crates/bootcher-cli", "crates/housekeeper"]
+members = ["crates/bootcher-core", "crates/bootcher-cli", "crates/xtask"]
 resolver = "2"
 
 [workspace.package]

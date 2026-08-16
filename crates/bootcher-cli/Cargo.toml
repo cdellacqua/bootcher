@@ -23,12 +23,12 @@ clap = { version = "4.6.1", features = ["derive"] }
 # Opt-in for the slow VM end-to-end tests (tests/e2e_vm.rs, e2e_registry.rs,
 # e2e_lan_to_registry.rs, e2e_registry_sign.rs): with it off, those tests are
 # `#[ignore]`d (but still compiled); enabling it un-ignores them. Run via
-# `cargo test -p bootcher-cli --features e2e` (or `just e2e`).
+# `cargo test -p bootcher-cli --features e2e` (or `cargo xtask e2e`).
 e2e = []
 # Opt-in for the *cross-arch* builder e2e (tests/e2e_cross_arch.rs) — a separate,
 # far slower test (foreign-arch build + boot entirely under TCG emulation) with
 # different prerequisites (foreign qemu + firmware + qemu-user binfmt; no KVM/sudo),
-# so it's gated apart from `e2e`. Run via `just e2e-cross`.
+# so it's gated apart from `e2e`. Run via `cargo xtask e2e-cross`.
 e2e_cross = []
 
 [dev-dependencies]

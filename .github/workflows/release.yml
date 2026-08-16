@@ -1,9 +1,9 @@
 name: Release
 
 # Tags only. The version-bump commit and its v* tag are pushed together by
-# `just release`, so the tagged commit is brand-new and was never verified on
-# main first (ci.yml even skips bump commits). The `verify` gate below therefore
-# runs the full `just ci` suite on the exact tagged commit, and every build/
+# `cargo xtask release`, so the tagged commit is brand-new and was never verified
+# on main first (ci.yml even skips bump commits). The `verify` gate below therefore
+# runs the full `xtask ci` suite on the exact tagged commit, and every build/
 # publish job `needs` it — so nothing ships if the tagged commit is red.
 on:
   push:
