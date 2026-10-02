@@ -55,24 +55,26 @@ cargo install --path crates/bootcher-cli
 Since the native binary is Linux-only, a multi-arch image is available at
 [ghcr.io/cdellacqua/bootcher](https://ghcr.io/cdellacqua/bootcher) (tags: `vX.Y.Z` and `latest`). It runs privileged with the host's container storage
 mounted in, which lets it work from the Podman/Docker machine VM on macOS and
-Windows. Run it from inside your project directory:
+Windows. Run it with `sudo` from inside your project directory. The process
+inside is root and writes every image it builds into the mounted store, so that
+store is the rootful one at `/var/lib/containers/storage`: `sudo podman` owns it,
 
 ```sh
-podman run --rm -it --privileged \
+sudo podman run --rm -it --privileged \
     --security-opt label=type:unconfined_t \
     -v "$PWD:/project" -w /project \
     -v /var/lib/containers/storage:/var/lib/containers/storage \
     ghcr.io/cdellacqua/bootcher:latest <command>
 ```
 
-The image includes QEMU and UEFI firmware, so the `vm` builder (`[builder] = "vm"` in `bootcher.toml`) works inside the container: `--privileged` exposes `/dev/kvm` for same-arch guests, and the cross-arch builder uses TCG (pure userspace emulation) which needs no host devices at all. If you use the `vm` builder, add a cache mount so the Fedora Cloud base image is not re-downloaded on every run:
+The image includes QEMU and UEFI firmware, so the `vm` builder (`[builder] = "vm"` in `bootcher.toml`) works inside the container: `--privileged` exposes `/dev/kvm` for same-arch guests, and the cross-arch builder uses TCG (pure userspace emulation) which needs no host devices at all. If you use the `vm` builder, add a cache mount so the Fedora Cloud base image is not re-downloaded on every run. Put that cache on a root-owned path too (`/var/cache/bootcher`), so it doesn't land in your home directory owned by root:
 
 ```sh
-podman run --rm -it --privileged \
+sudo podman run --rm -it --privileged \
     --security-opt label=type:unconfined_t \
     -v "$PWD:/project" -w /project \
     -v /var/lib/containers/storage:/var/lib/containers/storage \
-    -v "$HOME/.cache/bootcher:/root/.cache/bootcher" \
+    -v /var/cache/bootcher:/root/.cache/bootcher \
     ghcr.io/cdellacqua/bootcher:latest <command>
 ```
 
