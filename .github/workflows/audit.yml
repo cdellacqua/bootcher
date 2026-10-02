@@ -1,0 +1,73 @@
+name: Audit
+
+# Dependency advisories are *monitoring*, not a publish gate.
+#
+# A RUSTSEC entry usually lands in a transitive crate, on someone else's fix
+# timeline. Gating release.yml on it would mean a third party's unpatched
+# advisory blocks a release that fixes something critical of our own — trading a
+# known, assessable risk for an unbounded one. So this workflow only reports:
+# nothing here is a `needs` of any build or publish job, and a red run never
+# stops a release.
+#
+# It runs on a schedule to catch advisories disclosed against a lockfile that
+# hasn't changed (the usual case — the code is untouched and the advisory DB
+# moves), on a push that touches the lockfile for immediate feedback when a
+# dependency is added or bumped, and on demand.
+#
+# Deliberately not on `pull_request`: a red check nobody can fix is noise on a
+# PR, and merging is not the risky step — shipping is, and that call is the
+# maintainer's.
+#
+# The signal is simply the run going red — a failing audit on the Actions tab is
+# what tells the maintainer to go look. The job writes nothing anywhere and
+# notifies no one: read-only token, no issues, comments, or messages of its own.
+on:
+  schedule:
+    # Mondays, 06:00 UTC. GitHub disables scheduled workflows in a repository
+    # with no activity for 60 days, so a long-quiet project stops being
+    # monitored silently — re-enable from the Actions tab (or push something) if
+    # this ever goes quiet.
+    - cron: "0 6 * * 1"
+  push:
+    branches: [main]
+    paths:
+      - "**/Cargo.lock"
+      - ".github/workflows/audit.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Scan dependencies against the RUSTSEC advisory database. Reads only
+  # Cargo.lock, so it needs no system deps and never builds the crate.
+  audit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      # Cache ~/.cargo/bin/ so the compiled cargo-audit binary is restored
+      # across runs; the install step below then becomes a fast no-op. The
+      # .crates.toml/.crates2.json ledger is required for `cargo install` to
+      # recognize the tool as already installed and skip rebuilding it. No
+      # target/ here — this job only runs cargo-audit, it doesn't build the
+      # crate. Keyed on Cargo.lock so a dependency change re-resolves the tool.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-audit-${{ hashFiles('**/Cargo.lock') }}
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      # The report is the step log. A finding exits non-zero, which fails the run
+      # and is what notifies the maintainer; `cargo update -p <crate>` is the fix
+      # once a patched version exists upstream.
+      - name: Audit
+        run: cargo audit

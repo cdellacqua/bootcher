@@ -21,17 +21,19 @@ jobs:
   # `v*` tag, and it gates publishing on its own call to verify.yml.
   #
   # `cargo xtask release` pushes the version-bump commit to main and the tag in
-  # the same `git push`, so the main push would otherwise run a full verify/audit on a
+  # the same `git push`, so the main push would otherwise run a full verify on a
   # commit that only edits version strings in Cargo.toml/Cargo.lock — redundant
   # work that always passes, racing the release run. We skip it: the `if` below
   # short-circuits CI for those bump commits (matched by their "release v…"
   # message). The tagged commit is still verified — release.yml runs verify.yml
   # as its publish gate — so skipping here costs no safety. `[skip ci]` can't do
   # this: it'd skip the tag's release run too, since the tag points at the same
-  # commit. audit `needs` verify, so it skips along with it. pages still publishes
-  # on that push: its `if` treats a skipped verify/audit as success, so the
-  # release commit that tips `main` doesn't leave the site unpublished. A failed
-  # verify or audit still blocks it.
+  # commit. pages still publishes on that push: its `if` treats a skipped verify
+  # as success, so the release commit that tips `main` doesn't leave the site
+  # unpublished. A failed verify still blocks it.
+  #
+  # Dependency advisories are not checked here: `cargo audit` is monitoring, not
+  # a gate, and lives in audit.yml on a schedule. See the comment there.
   #
   # The guard only matches push events (head_commit is null on pull_request), so
   # PRs and manual dispatches always run the full suite.
@@ -44,19 +46,18 @@ jobs:
   # at the root, the mdBook under book/, and rustdoc under book/api/. Requires GitHub
   # Pages to be configured with source "GitHub Actions" in the repository settings.
   pages:
-    needs: [verify, audit]
-    # Publish on a push to main once verify and audit have passed. A release
-    # bump skips those two (see the verify job); `always()` keeps this job from
-    # being skipped with them, and the result check still refuses a real failure.
-    # `always()` is what lets a skipped dependency through — without it GitHub
-    # skips this job before the `if` is considered.
+    needs: [verify]
+    # Publish on a push to main once verify has passed. A release bump skips
+    # verify (see that job); `always()` keeps this job from being skipped with
+    # it, and the result check still refuses a real failure. `always()` is what
+    # lets a skipped dependency through — without it GitHub skips this job
+    # before the `if` is considered.
     if: |
       always() &&
       !cancelled() &&
       github.ref == 'refs/heads/main' &&
       github.event_name == 'push' &&
-      (needs.verify.result == 'success' || needs.verify.result == 'skipped') &&
-      (needs.audit.result == 'success' || needs.audit.result == 'skipped')
+      (needs.verify.result == 'success' || needs.verify.result == 'skipped')
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -108,31 +109,3 @@ jobs:
           path: docs/site/
       - id: deploy
         uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
-
-  # Scan dependencies against the RUSTSEC advisory database. Reads only
-  # Cargo.lock, so it needs no system deps.
-  audit:
-    needs: [verify]
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      # Cache ~/.cargo/bin/ so the compiled cargo-audit binary is restored
-      # across runs; the install step below then becomes a fast no-op. The
-      # .crates.toml/.crates2.json ledger is required for `cargo install` to
-      # recognize the tool as already installed and skip rebuilding it. No
-      # target/ here — this job only runs cargo-audit, it doesn't build the
-      # crate. Keyed on Cargo.lock so a dependency change re-resolves the tool.
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/.crates.toml
-            ~/.cargo/.crates2.json
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-audit-${{ hashFiles('**/Cargo.lock') }}
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
-      - name: Audit
-        run: cargo audit
