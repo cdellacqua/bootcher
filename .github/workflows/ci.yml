@@ -28,7 +28,10 @@ jobs:
   # message). The tagged commit is still verified — release.yml runs verify.yml
   # as its publish gate — so skipping here costs no safety. `[skip ci]` can't do
   # this: it'd skip the tag's release run too, since the tag points at the same
-  # commit. audit `needs` verify, so it skips along with it; pages is disabled.
+  # commit. audit `needs` verify, so it skips along with it. pages still publishes
+  # on that push: its `if` treats a skipped verify/audit as success, so the
+  # release commit that tips `main` doesn't leave the site unpublished. A failed
+  # verify or audit still blocks it.
   #
   # The guard only matches push events (head_commit is null on pull_request), so
   # PRs and manual dispatches always run the full suite.
@@ -42,10 +45,18 @@ jobs:
   # Pages to be configured with source "GitHub Actions" in the repository settings.
   pages:
     needs: [verify, audit]
-    # Temporarily disabled: GitHub Pages can't be published from a private repo
-    # on the Free plan. Re-enable (drop the `false &&`) once the repo is public
-    # or the account is on Pro/Team/Enterprise.
-    if: false && github.ref == 'refs/heads/main' && github.event_name == 'push'
+    # Publish on a push to main once verify and audit have passed. A release
+    # bump skips those two (see the verify job); `always()` keeps this job from
+    # being skipped with them, and the result check still refuses a real failure.
+    # `always()` is what lets a skipped dependency through — without it GitHub
+    # skips this job before the `if` is considered.
+    if: |
+      always() &&
+      !cancelled() &&
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'push' &&
+      (needs.verify.result == 'success' || needs.verify.result == 'skipped') &&
+      (needs.audit.result == 'success' || needs.audit.result == 'skipped')
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -67,7 +78,7 @@ jobs:
       # The corollary is that mdbook can't be cached: an exact key hit means
       # actions/cache skips the post-job save, so anything this job installs into
       # ~/.cargo/bin/ is discarded. Listing those paths here would be a lie, so we
-      # don't — `cargo install mdbook` pays a cold build every run, which is the
+      # don't — `cargo install` of mdbook and mdbook-mermaid pays a cold build every run, which is the
       # price of the warm target/ and cheaper than the alternative.
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -78,7 +89,11 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
       - name: Install mdbook
-        run: cargo install mdbook --locked
+        # mdbook-mermaid is required: docs/book.toml runs it as a preprocessor,
+        # and the book has no `optional = true`, so a missing binary fails the build.
+        run: |
+          cargo install mdbook --locked
+          cargo install mdbook-mermaid --locked
       - name: Fetch dependencies
         run: cargo fetch --locked
       # See verify.yml for why the offline/locked pinning is split across these
