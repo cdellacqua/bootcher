@@ -20,6 +20,14 @@ The tool is image-agnostic: it carries the scaffold as an embedded template and
 otherwise knows nothing about what you build on top. Your project is yours to
 edit.
 
+## Documentation
+
+**[cdellacqua.github.io/bootcher](https://cdellacqua.github.io/bootcher/)** — the
+full documentation: concepts, workflows, recipes, and the complete
+[`bootcher.toml` reference](https://cdellacqua.github.io/bootcher/book/reference/bootcher-toml.html),
+plus [rustdoc](https://cdellacqua.github.io/bootcher/book/api/bootcher_core/) for
+`bootcher-core`. The rest of this README is a summary.
+
 ## Runtime dependencies
 
 bootcher is **Linux-only** (Podman is a native Linux tool; use the container image on macOS/Windows — see [Install](#install)).
