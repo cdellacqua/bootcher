@@ -38,6 +38,12 @@ cargo install --git https://github.com/cdellacqua/bootcher bootcher-cli
 cargo install --path crates/bootcher-cli
 ```
 
+Both forms build the binary on your own machine, which is also the answer if you need to know exactly what you are running: you compile a revision you can read first. Note that a bare `--git` install tracks the default branch and `--tag` resolves whatever the tag points at *when you run it* — and a tag can be moved after it is published. Pin the commit to remove that ambiguity:
+
+```sh
+cargo install --git https://github.com/cdellacqua/bootcher --rev <sha> bootcher-cli
+```
+
 ## Container image
 
 Since the native binary is Linux-only, a multi-arch image is available at
@@ -65,3 +71,9 @@ sudo podman run --rm -it --privileged \
     -v /var/cache/bootcher:/root/.cache/bootcher \
     ghcr.io/cdellacqua/bootcher:latest <command>
 ```
+
+## Supply chain
+
+`Cargo.lock` is committed and release builds run with `--frozen`, so a build resolves exactly the dependency versions the lockfile names and fails rather than silently updating one. CI scans those dependencies against the [RUSTSEC](https://rustsec.org/) advisory database with `cargo-audit`.
+
+The pins extend to the build and runtime inputs: GitHub Actions are pinned by commit SHA, the `Containerfile`'s Rust base image is pinned to the toolchain in `rust-toolchain.toml`, and the image-builder container bootcher pulls at runtime is pinned by **digest** rather than by a rolling tag. Nothing in the chain moves under you between two runs of the same version.
