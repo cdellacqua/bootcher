@@ -95,33 +95,34 @@
 
   <!-- ============================ pipeline ============================ -->
   <!-- connector init -> provision -> deploy -->
-  <line class="wire" x1="255" y1="90" x2="383" y2="90" marker-end="url(#ah)" opacity=".6"/>
-  <line class="wire" x1="535" y1="90" x2="663" y2="90" marker-end="url(#ah)" opacity=".6"/>
+  <line class="wire" x1="275" y1="90" x2="403" y2="90" marker-end="url(#ah)" opacity=".6"/>
+  <line class="wire" x1="555" y1="90" x2="683" y2="90" marker-end="url(#ah)" opacity=".6"/>
 
-  <!-- nodes (centres: init 180, provision 460, deploy 740) -->
+  <!-- nodes (centres: init 200, provision 480, deploy 760 — the canvas centre
+       is 480, so provision sits directly above the persistent centre device) -->
   <g>
-    <rect class="node" x="105" y="62" width="150" height="56" rx="12"/>
-    <rect class="p0" x="105" y="62" width="150" height="56" rx="12" fill="none" stroke="var(--cyan)" stroke-width="2.5"/>
-    <text class="label" x="180" y="96">init</text>
+    <rect class="node" x="125" y="62" width="150" height="56" rx="12"/>
+    <rect class="p0" x="125" y="62" width="150" height="56" rx="12" fill="none" stroke="var(--cyan)" stroke-width="2.5"/>
+    <text class="label" x="200" y="96">init</text>
   </g>
   <g>
-    <rect class="node" x="385" y="62" width="150" height="56" rx="12"/>
-    <rect class="p1" x="385" y="62" width="150" height="56" rx="12" fill="none" stroke="var(--cyan)" stroke-width="2.5"/>
-    <text class="label" x="460" y="86">provision</text>
-    <text class="sub"   x="460" y="104">build + disk</text>
+    <rect class="node" x="405" y="62" width="150" height="56" rx="12"/>
+    <rect class="p1" x="405" y="62" width="150" height="56" rx="12" fill="none" stroke="var(--cyan)" stroke-width="2.5"/>
+    <text class="label" x="480" y="86">provision</text>
+    <text class="sub"   x="480" y="104">build + disk</text>
   </g>
   <g>
-    <rect class="node" x="665" y="62" width="150" height="56" rx="12"/>
-    <rect class="p23" x="665" y="62" width="150" height="56" rx="12" fill="none" stroke="var(--ok)" stroke-width="2.5"/>
-    <text class="label" x="740" y="86">deploy</text>
-    <text class="sub"   x="740" y="104">build + push</text>
+    <rect class="node" x="685" y="62" width="150" height="56" rx="12"/>
+    <rect class="p23" x="685" y="62" width="150" height="56" rx="12" fill="none" stroke="var(--ok)" stroke-width="2.5"/>
+    <text class="label" x="760" y="86">deploy</text>
+    <text class="sub"   x="760" y="104">build + push</text>
   </g>
 
   <!-- deploy self-loop ("next release"), frame 3. The loop circle and the moving
        dot share this exact path so the dot rides on the stroke. -->
-  <path class="p3" d="M740 54 A22 22 0 0 0 740 10 A22 22 0 0 0 740 54" fill="none" stroke="var(--pur)" stroke-width="2" stroke-dasharray="4 4"/>
-  <path class="p3" d="M733 10 l10 -5 l0 10 z" fill="var(--pur)"/>
-  <text class="loopt p3" x="740" y="-12">next release</text>
+  <path class="p3" d="M760 54 A22 22 0 0 0 760 10 A22 22 0 0 0 760 54" fill="none" stroke="var(--pur)" stroke-width="2" stroke-dasharray="4 4"/>
+  <path class="p3" d="M753 10 l10 -5 l0 10 z" fill="var(--pur)"/>
+  <text class="loopt p3" x="760" y="-12">next release</text>
 
   <!-- ===================== the fleet (4 extra devices) ===================== -->
   <g class="p3">
@@ -150,19 +151,19 @@
   <!-- ===================== travelling packet (3 phases) =================== -->
   <circle class="dot" r="6" fill="var(--cyan)">
     <animateMotion dur="12s" repeatCount="indefinite" calcMode="linear"
-      path="M180 90 L460 90" keyPoints="0;1;1" keyTimes="0;0.12;1"/>
+      path="M200 90 L480 90" keyPoints="0;1;1" keyTimes="0;0.12;1"/>
     <animate attributeName="opacity" dur="12s" repeatCount="indefinite"
       values="1;1;0;0" keyTimes="0;0.32;0.33;1"/>
   </circle>
   <circle class="dot" r="6" fill="var(--cyan)">
     <animateMotion dur="12s" repeatCount="indefinite" calcMode="linear"
-      path="M460 90 L740 90" keyPoints="0;0;1;1" keyTimes="0;0.33;0.45;1"/>
+      path="M480 90 L760 90" keyPoints="0;0;1;1" keyTimes="0;0.33;0.45;1"/>
     <animate attributeName="opacity" dur="12s" repeatCount="indefinite"
       values="0;0;1;1;0;0" keyTimes="0;0.32;0.33;0.65;0.66;1"/>
   </circle>
   <circle class="dot" r="6" fill="var(--pur)">
     <animateMotion dur="12s" repeatCount="indefinite" calcMode="linear"
-      path="M740 54 A22 22 0 0 0 740 10 A22 22 0 0 0 740 54" keyPoints="0;0;1" keyTimes="0;0.66;1"/>
+      path="M760 54 A22 22 0 0 0 760 10 A22 22 0 0 0 760 54" keyPoints="0;0;1" keyTimes="0;0.66;1"/>
     <animate attributeName="opacity" dur="12s" repeatCount="indefinite"
       values="0;0;1;1;0" keyTimes="0;0.655;0.66;0.99;1"/>
   </circle>
