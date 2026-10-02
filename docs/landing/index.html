@@ -82,10 +82,21 @@
         width: 26px;
         height: 26px;
       }
+      nav {
+        /* Cancels the trailing link's padding below, so the row still ends flush
+           with the container's right edge. */
+        margin-right: -8px;
+      }
       nav a {
         color: var(--muted);
-        margin-left: 22px;
         font-size: 15px;
+        /* Pads the hit area to ~44px on both axes (WCAG 2.5.5) without moving
+           anything: inline-block makes the vertical padding count, and the
+           negative margins give back exactly what the padding adds — so the
+           header's height and the 22px gaps between links are unchanged. */
+        display: inline-block;
+        padding: 11px 8px;
+        margin: -11px 0 -11px 6px;
       }
       nav a:hover {
         color: var(--ink);
@@ -176,6 +187,14 @@
         grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
         gap: 18px;
         margin: 46px 0;
+      }
+      .features h2 {
+        /* The section is a grid, so the heading has to span every column —
+           otherwise it lands in the first track as a fourth card. */
+        grid-column: 1 / -1;
+        text-align: center;
+        font-size: 24px;
+        margin: 0;
       }
       .card {
         background: var(--card);
@@ -307,6 +326,7 @@
       </figure>
 
       <section class="features">
+        <h2>The three steps</h2>
         <div class="card">
           <h3><span class="dot">●</span> Scaffold</h3>
           <p>
