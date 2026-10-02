@@ -62,7 +62,8 @@ jobs:
 
   # Single writer to the GitHub release. `needs: release` plus fail-fast means
   # this only runs once BOTH arch tarballs exist, so the release object is created
-  # exactly once, with every asset in hand — no create race, no empty release.
+  # exactly once, with every asset in hand — no create race, no empty release. A
+  # non-final tag is marked as a prerelease (see the classify step).
   release-publish:
     needs: release
     runs-on: ubuntu-24.04
@@ -75,10 +76,30 @@ jobs:
           pattern: bootcher-*
           path: dist
           merge-multiple: true
+      # Same definition of "final release" as image-manifest's `latest` gate: a
+      # plain vX.Y.Z tag. Anything else (v1.2.3-rc1, a throwaway test tag) is
+      # published as a GitHub prerelease, so it doesn't become the release page's
+      # "Latest release" — matching the fact that it doesn't move the image's
+      # `latest` tag either. The test lives in a step because Actions expressions
+      # have no regex; the tag goes through the env rather than being interpolated
+      # into the script.
+      - name: Classify the tag
+        id: tag
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$TAG is not a final release — publishing it as a GitHub prerelease"
+          fi
       - name: Publish release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: dist/*.tar.gz
+          prerelease: ${{ steps.tag.outputs.prerelease }}
 
   # Build the per-arch container images and push each to ghcr under an arch-suffixed
   # tag (vX.Y.Z-amd64 / -arm64). The image wraps the Linux-only binary so bootcher
@@ -124,10 +145,10 @@ jobs:
 
   # Assembles the multi-arch manifest lists. `needs: image` plus fail-fast means
   # this runs only once both arch tags exist in ghcr. It stitches vX.Y.Z-amd64 and
-  # vX.Y.Z-arm64 into the lists tagged `vX.Y.Z` and `latest`, so `podman pull
-  # ghcr.io/<owner>/bootcher` resolves to the puller's architecture. Members are
-  # pulled straight from ghcr by reference, so nothing round-trips through a
-  # workflow artifact.
+  # vX.Y.Z-arm64 into a list tagged `vX.Y.Z` — plus `latest` when the tag is a
+  # final release (see the gate below) — so `podman pull ghcr.io/<owner>/bootcher`
+  # resolves to the puller's architecture. Members are pulled straight from ghcr by
+  # reference, so nothing round-trips through a workflow artifact.
   image-manifest:
     needs: image
     runs-on: ubuntu-24.04
@@ -144,9 +165,21 @@ jobs:
       # `push --all` then uploads the list and re-references its per-arch members by
       # digest.
       - name: Create and push manifests
+        shell: bash
         run: |
           version="${{ github.ref_name }}"
-          for tag in "$version" latest; do
+          # Every v* tag runs this workflow, so `latest` must be gated on the tag
+          # being a final release: a prerelease or throwaway test tag (v1.2.3-rc1,
+          # v1.2.3-test1) would otherwise repoint `latest` at a build nobody should
+          # get by default, and `podman pull ghcr.io/<owner>/bootcher` has no way to
+          # know it happened. The version tag is always published.
+          tags=("$version")
+          if [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            tags+=(latest)
+          else
+            echo "::notice::$version is not a final release — publishing the version tag only, leaving latest untouched"
+          fi
+          for tag in "${tags[@]}"; do
             podman manifest create "$IMAGE:$tag"
             podman manifest add "$IMAGE:$tag" "docker://$IMAGE:$version-amd64"
             podman manifest add "$IMAGE:$tag" "docker://$IMAGE:$version-arm64"
