@@ -25,6 +25,8 @@ If signing was opted into, `bootcher init` prints a `bootcher sign enroll` remin
 
 Edit the `Containerfile` freely — add `dnf install` steps, copy in assets, or replace baseline components. Edit `bootcher.toml` afterward if you need to adjust anything the questionnaire collected.
 
+The security baseline the scaffold brings — key-only SSH for `admin`, `firewalld`, `fail2ban`, `chrony`, automatic updates — is a **starting point, not a finished posture**. It is what a generic appliance can reasonably assume; it knows nothing about the ports your workload opens, the data it holds, or the network it lands on. Review it against your own threat model before a fleet leaves the bench, and treat everything in `sysroot/` as yours to tighten.
+
 ## 2. Provision
 
 ```sh

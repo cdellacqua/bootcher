@@ -272,6 +272,20 @@ The object form accepts these per-target keys:
 | `ssh_opts` | Extra `ssh` args prepended to every connection (identity file, port, host-key policy, …) |
 | `takeover_login` | The stock cloud login (`debian`/`ubuntu`/`cloud-user`/`root`) [`bootcher takeover`](../workflows/takeover.md) uses for its *initial* connection, before the image's `admin` user replaces it. Per-host override of `--login`. Unused outside takeover — the steady-state identity stays `admin@`, so after takeover this is an ordinary remote |
 
+#### Host-key verification
+
+bootcher connects with `-o StrictHostKeyChecking=accept-new`, because a device that was just provisioned has no entry in `known_hosts` yet and a strict policy would refuse the first deploy outright. This is **trust on first use**: the first connection to a given host accepts whatever key it presents and pins it, and every later connection is verified against that pin. A mismatch afterwards fails loudly.
+
+The exposure is therefore limited to that first connection — but on a network where someone could be impersonating the device, that is enough to hand them the session. If you provision over a network you don't control, pin the key yourself instead: read it off the device locally (`ssh-keyscan` on the bench, or the host key printed in the console log), add it to `known_hosts`, and set a strict policy for that remote:
+
+```toml
+remotes = [
+  { remote = "admin@vps.example.com", ssh_opts = ["-o", "StrictHostKeyChecking=yes"] },
+]
+```
+
+`ssh_opts` is prepended to every connection bootcher makes to that host, so the override covers `deploy`, `upgrade`, `rotate`, and `takeover` alike.
+
 ### `channels`
 
 The named release channels this project publishes, **beyond** the implicit `latest` every project always has. A channel is a mutable registry tag a subset of devices tracks (`<registry>/<name>:<channel>`); `deploy --channel <name>` pushes the multi-arch list under that tag instead of `:latest`, and `provision`/`takeover --channel <name>` set a device's bootc origin to it so the device follows that channel from then on.
@@ -313,6 +327,8 @@ Each value must be ≥ 1. Setting a cap only ever lowers the pool — it is boun
 ## `[hooks.<phase>]`
 
 Pre/post shell commands wrapping a build phase. Each hook is run with `sh -c` from the project root; a non-zero exit aborts the run.
+
+Because of this, **a `bootcher.toml` is executable content**, not inert configuration: a hook runs with the privileges of the phase it brackets, and `[hooks.disk]` brackets a step that runs under `sudo`. Treat a manifest from somewhere else — a recipe you copied, a colleague's project, a repository you just cloned — exactly as you would treat their `Makefile`, and read its hooks before the first run.
 
 | Phase | Wraps |
 |---|---|

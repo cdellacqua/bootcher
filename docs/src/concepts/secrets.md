@@ -12,6 +12,8 @@ The public key placed in `/etc/ssh/authorized_keys.d/admin` on the device. This 
 
 Stored in `/etc/ostree/auth.json` on the device. Used by `bootc upgrade` to pull the project image from the registry. It should be a least-privilege, read-only credential, separate from the push auth managed on the builder.
 
+This token is the one secret that necessarily lives on every device you ship, which makes physical access to any one of them equivalent to holding it: the file is `0600`, but root on the device — or the disk in someone else's hands — reads it. Scope it read-only so that what leaks is the ability to *pull* your image and nothing more, and treat a device that leaves your control as a token to replace with [`bootcher rotate pull-token`](../workflows/rotate/pull-token.md).
+
 ## When and how they are collected
 
 Both secrets are collected by `bootcher provision` (and `bootcher takeover`) before anything is built. Collection order:

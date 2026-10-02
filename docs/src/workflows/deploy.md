@@ -18,6 +18,8 @@ bootcher deploy
 
 In registry mode with no `[deploy] remotes` configured, the push to the registry is the whole operation. Devices self-update on their `bootc-fetch-apply-updates.timer` schedule.
 
+Every device connection uses trust-on-first-use host-key checking; on an untrusted network, pin the host key instead — see [Host-key verification](../reference/bootcher-toml.md#host-key-verification).
+
 Both tags carry the git commit they were built from as OCI labels, and you can read either tag or label back from a workstation or a running device — see [Image identity & provenance](../concepts/image-identity.md).
 
 ## Skipping the build
