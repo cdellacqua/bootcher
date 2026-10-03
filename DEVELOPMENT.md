@@ -132,8 +132,11 @@ in two gated suites.
 
 Builds and boots disks for the **host** architecture, KVM-accelerated. Covers
 the LAN rotate + upgrade lifecycle, the registry lifecycle + pull-token rotation
-+ signing enrollment, the LAN→registry origin switch, and registry-mode image
-signing. Prerequisites:
++ signing enrollment, the LAN→registry origin switch, registry-mode image
+signing, release channels (a device tracks its channel, not `:latest`), and (on
+x86-64 hosts) `bootcher takeover` of a stock Debian cloud VM
+under both UEFI and legacy BIOS — the Debian image is downloaded once and cached
+under `/var/tmp`. Prerequisites:
 
 - **podman** — to build and push container images
 - **qemu-system-\*** and **qemu-img** — to run bootc disk images in a VM (`qemu-system-x86_64` or `qemu-system-aarch64` depending on host arch)

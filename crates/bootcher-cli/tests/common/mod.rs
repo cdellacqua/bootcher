@@ -1,7 +1,9 @@
 //! Shared scaffolding for the VM end-to-end tests — the LAN lifecycle
 //! (`e2e_vm.rs`), the registry-mode signing path (`e2e_registry_sign.rs`), the
-//! plain registry lifecycle + signing enrollment (`e2e_registry.rs`), and the
-//! LAN→registry origin switch (`e2e_lan_to_registry.rs`). Holds the environment
+//! plain registry lifecycle + signing enrollment (`e2e_registry.rs`), the
+//! LAN→registry origin switch (`e2e_lan_to_registry.rs`), release channels
+//! (`e2e_channels.rs`), the live-host takeover (`e2e_takeover.rs`), and the
+//! cross-arch builder (`e2e_cross_arch.rs`). Holds the environment
 //! probe, the ssh-agent wrapper, keypair generation, the throwaway-registry guard,
 //! and the small filesystem/process helpers the harnesses share; each test keeps
 //! its own `Harness` (the flows differ).

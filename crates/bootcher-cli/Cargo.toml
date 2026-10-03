@@ -21,7 +21,8 @@ clap = { version = "4.6.1", features = ["derive"] }
 
 [features]
 # Opt-in for the slow VM end-to-end tests (tests/e2e_vm.rs, e2e_registry.rs,
-# e2e_lan_to_registry.rs, e2e_registry_sign.rs): with it off, those tests are
+# e2e_lan_to_registry.rs, e2e_registry_sign.rs, e2e_channels.rs,
+# e2e_takeover.rs): with it off, those tests are
 # `#[ignore]`d (but still compiled); enabling it un-ignores them. Run via
 # `cargo test -p bootcher-cli --features e2e` (or `cargo xtask e2e`).
 e2e = []

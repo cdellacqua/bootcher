@@ -90,8 +90,10 @@ enum Cmd {
 	/// Slow VM end-to-end: boot real bootc disks and exercise the LAN rotate +
 	/// upgrade lifecycle (`e2e_vm`), the plain registry lifecycle + pull-token
 	/// rotation + signing enrollment (`e2e_registry`), the LAN→registry origin
-	/// switch (`e2e_lan_to_registry`), and registry-mode image signing
-	/// (`e2e_registry_sign`).
+	/// switch (`e2e_lan_to_registry`), registry-mode image signing
+	/// (`e2e_registry_sign`), release-channel isolation (`e2e_channels`), and
+	/// the in-place takeover of a stock Debian host under UEFI and legacy BIOS
+	/// (`e2e_takeover`, x86-64 hosts only).
 	///
 	/// Opt-in everywhere because it needs podman, qemu+KVM, UEFI firmware, and
 	/// passwordless `sudo sh`; it hard-fails when those are missing (it asserts
@@ -248,7 +250,13 @@ fn test(sh: &Shell, cargo: &Path, flags: &[OsString]) -> Result<()> {
 }
 
 fn e2e(sh: &Shell, cargo: &Path, flags: &[OsString]) -> Result<()> {
-	for suite in ["e2e_vm", "e2e_registry", "e2e_lan_to_registry", "e2e_registry_sign"] {
+	let mut suites =
+		vec!["e2e_vm", "e2e_registry", "e2e_lan_to_registry", "e2e_registry_sign", "e2e_channels"];
+	// The takeover guest is a pinned amd64 Debian image, booted under KVM.
+	if cfg!(target_arch = "x86_64") {
+		suites.push("e2e_takeover");
+	}
+	for suite in suites {
 		cmd!(
 			sh,
 			"{cargo} test {flags...} -p bootcher-cli --features=e2e --test {suite} -- --nocapture"
