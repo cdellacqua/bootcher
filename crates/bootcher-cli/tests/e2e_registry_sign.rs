@@ -32,8 +32,8 @@ use bootcher_core::qemu::{self, Vm, VmConfig};
 
 mod common;
 use common::{
-	Agent, Prereqs, RegistryClient, RegistryGuard, SCRATCH_BASE, SENTINEL_PATH, SSH_TIMEOUT, Ssh,
-	StoreGuard, VM_USER, host_primary_ip, insecure_registries_conf, keygen,
+	Agent, Prereqs, RegistryClient, RegistryGuard, SENTINEL_PATH, SSH_TIMEOUT, Ssh, StoreGuard,
+	VM_USER, host_primary_ip, insecure_registries_conf, keygen,
 };
 
 /// Podman store for this e2e (own dir, out of the user's real store). Wiped on
@@ -47,7 +47,8 @@ const SIGN_PASS: &str = "e2e-signing-pass";
 #[test]
 #[cfg_attr(not(feature = "e2e"), ignore = "slow VM e2e; opt in with --feature=e2e")]
 fn registry_signing_enforced_signed_accepted_unsigned_rejected() {
-	let env = Prereqs::probe().expect("prerequisites not satisfied by the current environment");
+	let env = Prereqs::probe_disk_build()
+		.expect("prerequisites not satisfied by the current environment");
 	let scope = Scope::standalone();
 
 	let h = Harness::setup(&env);
@@ -190,10 +191,7 @@ struct Harness {
 
 impl Harness {
 	fn setup(env: &Prereqs) -> Self {
-		let home = tempfile::Builder::new()
-			.prefix("bootcher-e2e-sign-")
-			.tempdir_in(SCRATCH_BASE)
-			.expect("tempdir under /var/tmp");
+		let home = common::run_dir("bootcher-e2e-sign-");
 		let store = StoreGuard::new(STORE_DIR);
 		let hp = home.path();
 		let name = "e2esign".to_owned();

@@ -33,8 +33,7 @@ use bootcher_core::qemu::{self, Vm, VmConfig};
 
 mod common;
 use common::{
-	ADMIN_KEYS, CrossPrereqs, SCRATCH_BASE, SENTINEL_PATH, Ssh, StoreGuard, VM_USER, keygen,
-	read_pub_key,
+	ADMIN_KEYS, CrossPrereqs, SENTINEL_PATH, Ssh, StoreGuard, VM_USER, keygen, read_pub_key,
 };
 
 /// Podman store for this e2e (own dir, out of the user's real store). Wiped on
@@ -104,10 +103,7 @@ struct Harness {
 
 impl Harness {
 	fn setup(env: &CrossPrereqs) -> Self {
-		let home = tempfile::Builder::new()
-			.prefix("bootcher-e2e-cross-")
-			.tempdir_in(SCRATCH_BASE)
-			.expect("tempdir under /var/tmp");
+		let home = common::run_dir("bootcher-e2e-cross-");
 		let store = StoreGuard::new(STORE_DIR);
 		std::fs::create_dir_all(CACHE_DIR).expect("create builder cache dir");
 		let hp = home.path();

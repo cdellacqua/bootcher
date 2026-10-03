@@ -34,8 +34,8 @@ use bootcher_core::qemu::{self, Vm, VmConfig};
 
 mod common;
 use common::{
-	ADMIN_KEYS, Agent, Prereqs, SCRATCH_BASE, SENTINEL_PATH, SSH_TIMEOUT, Ssh, StoreGuard, VM_USER,
-	keygen, pub_key_path, read_pub_key,
+	ADMIN_KEYS, Agent, Prereqs, SENTINEL_PATH, SSH_TIMEOUT, Ssh, StoreGuard, VM_USER, keygen,
+	pub_key_path, read_pub_key,
 };
 
 /// Persistent podman store for the e2e, pointed at via `XDG_DATA_HOME` — out of the
@@ -47,7 +47,8 @@ const STORE_DIR: &str = "/var/tmp/bootcher-e2e-store";
 #[test]
 #[cfg_attr(not(feature = "e2e"), ignore = "slow VM e2e; opt in with --feature=e2e")]
 fn lan_lifecycle_build_boot_rotate_upgrade() {
-	let env = Prereqs::probe().expect("prerequisites not satisfied by the current environment");
+	let env = Prereqs::probe_disk_build()
+		.expect("prerequisites not satisfied by the current environment");
 	let scope = Scope::standalone();
 
 	let h = Harness::setup(&env);
@@ -149,11 +150,7 @@ struct Harness {
 
 impl Harness {
 	fn setup(env: &Prereqs) -> Self {
-		// On disk-backed /var/tmp, not tmpfs /tmp (a bootc disk image overflows it).
-		let home = tempfile::Builder::new()
-			.prefix("bootcher-e2e-")
-			.tempdir_in(SCRATCH_BASE)
-			.expect("tempdir under /var/tmp");
+		let home = common::run_dir("bootcher-e2e-");
 		let store = StoreGuard::new(STORE_DIR);
 		let hp = home.path();
 

@@ -58,7 +58,6 @@ echo \"sudo=$(command -v sudo >/dev/null 2>&1 && echo yes || echo no)\"
 echo \"arch=$(uname -m)\"
 echo \"boot=$([ -d /boot ] && [ -n \"$(ls -A /boot 2>/dev/null)\" ] && echo yes || echo no)\"
 echo \"fstype=$(findmnt -no FSTYPE / 2>/dev/null || true)\"
-echo \"efi=$([ -d /sys/firmware/efi ] && echo yes || echo no)\"
 echo \"bootc=$(command -v bootc >/dev/null 2>&1 && sudo bootc status >/dev/null 2>&1 && echo yes || echo no)\"
 ";
 
@@ -198,13 +197,6 @@ fn evaluate_probe(out: &str) -> HostReadiness {
 	}
 	if get("boot") != "yes" {
 		reasons.push("/boot is missing or empty — no bootloader partition to adopt".to_owned());
-	}
-	if get("efi") != "yes" {
-		reasons.push(
-			"no /sys/firmware/efi — the host appears to be booted in legacy BIOS mode, which \
-			 bootc install does not support"
-				.to_owned(),
-		);
 	}
 
 	if reasons.is_empty() { HostReadiness::Ready } else { HostReadiness::Unsupported(reasons) }
@@ -586,20 +578,20 @@ mod tests {
 
 	#[test]
 	fn probe_ready_host_passes() {
-		let out = "podman=yes\nsudo=yes\narch=x86_64\nboot=yes\nfstype=ext4\nefi=yes\nbootc=no\n";
+		let out = "podman=yes\nsudo=yes\narch=x86_64\nboot=yes\nfstype=ext4\nbootc=no\n";
 		assert_eq!(evaluate_probe(out), HostReadiness::Ready);
 	}
 
 	#[test]
 	fn probe_already_bootc_short_circuits() {
 		// A bootc host is skipped regardless of the other lines.
-		let out = "podman=no\nsudo=no\narch=x86_64\nboot=yes\nfstype=ext4\nefi=yes\nbootc=yes\n";
+		let out = "podman=no\nsudo=no\narch=x86_64\nboot=yes\nfstype=ext4\nbootc=yes\n";
 		assert_eq!(evaluate_probe(out), HostReadiness::AlreadyBootc);
 	}
 
 	#[test]
 	fn probe_missing_podman_is_unsupported_with_install_hint() {
-		let out = "podman=no\nsudo=yes\narch=x86_64\nboot=yes\nfstype=ext4\nefi=yes\nbootc=no\n";
+		let out = "podman=no\nsudo=yes\narch=x86_64\nboot=yes\nfstype=ext4\nbootc=no\n";
 		let HostReadiness::Unsupported(reasons) = evaluate_probe(out) else {
 			panic!("expected Unsupported, got {:?}", evaluate_probe(out));
 		};
@@ -611,7 +603,7 @@ mod tests {
 
 	#[test]
 	fn probe_bad_arch_is_unsupported() {
-		let out = "podman=yes\nsudo=yes\narch=riscv64\nboot=yes\nfstype=ext4\nefi=yes\nbootc=no\n";
+		let out = "podman=yes\nsudo=yes\narch=riscv64\nboot=yes\nfstype=ext4\nbootc=no\n";
 		let HostReadiness::Unsupported(reasons) = evaluate_probe(out) else {
 			panic!("expected Unsupported");
 		};
@@ -620,20 +612,11 @@ mod tests {
 
 	#[test]
 	fn probe_bad_fstype_is_unsupported() {
-		let out = "podman=yes\nsudo=yes\narch=x86_64\nboot=yes\nfstype=zfs\nefi=yes\nbootc=no\n";
+		let out = "podman=yes\nsudo=yes\narch=x86_64\nboot=yes\nfstype=zfs\nbootc=no\n";
 		let HostReadiness::Unsupported(reasons) = evaluate_probe(out) else {
 			panic!("expected Unsupported");
 		};
 		assert!(reasons.iter().any(|r| r.contains("filesystem")), "{reasons:?}");
-	}
-
-	#[test]
-	fn probe_legacy_bios_is_unsupported() {
-		let out = "podman=yes\nsudo=yes\narch=x86_64\nboot=yes\nfstype=ext4\nefi=no\nbootc=no\n";
-		let HostReadiness::Unsupported(reasons) = evaluate_probe(out) else {
-			panic!("expected Unsupported");
-		};
-		assert!(reasons.iter().any(|r| r.contains("BIOS") || r.contains("efi")), "{reasons:?}");
 	}
 
 	#[test]

@@ -86,13 +86,18 @@ impl Drop for Agent {
 
 // ----------------------------------------------------------------- prereqs
 
-/// The host facts the e2e needs, or `None` (with a printed reason) to skip.
+/// The host facts a VM e2e needs. [`Prereqs::probe`] checks what every VM e2e
+/// needs; [`Prereqs::probe_disk_build`] additionally checks what building a disk
+/// image needs.
 pub(crate) struct Prereqs {
 	pub arch: Arch,
 	pub firmware: PathBuf,
 }
 
 impl Prereqs {
+	/// Probe for qemu + KVM, UEFI firmware, podman and the ssh tools — enough for an
+	/// e2e that boots a VM but never builds a disk (e.g. takeover, which only builds
+	/// the container rootlessly).
 	pub(crate) fn probe() -> Result<Self> {
 		let Some(arch) = Arch::host() else {
 			bail!("unrecognised host arch");
@@ -110,6 +115,12 @@ impl Prereqs {
 		let Some(firmware) = bootcher_core::qemu::find_uefi_firmware(arch) else {
 			bail!("no UEFI firmware (install edk2-ovmf / AAVMF)");
 		};
+		Ok(Self { arch, firmware })
+	}
+
+	/// [`Prereqs::probe`] plus passwordless `sudo sh`, for e2es that build a disk image.
+	pub(crate) fn probe_disk_build() -> Result<Self> {
+		let env = Self::probe()?;
 		// image-builder runs a privileged container, and bootcher opens it through one `sudo sh`
 		// root session (see bootcher_core::sudo). The e2e needs passwordless
 		// `sudo sh` specifically since while it's running there's no TTY
@@ -128,7 +139,7 @@ impl Prereqs {
 				user = std::env::var("USER").unwrap_or_else(|_| "<you>".into()),
 			);
 		}
-		Ok(Self { arch, firmware })
+		Ok(env)
 	}
 }
 
@@ -322,6 +333,29 @@ pub(crate) fn host_primary_ip() -> String {
 		.nth(1)
 		.map(str::to_owned)
 		.expect("no `src` IP in `ip route get` output")
+}
+
+// ----------------------------------------------------------------- run dir
+
+/// Set this (to any value) to *keep* a test's throwaway run dir (`$HOME`, project,
+/// VM disk overlay, serial log) after the run, for post-mortem inspection of a
+/// failure. By default it's removed on teardown.
+pub(crate) const KEEP_RUN_ENV: &str = "BOOTCHER_E2E_KEEP_RUN";
+
+/// Create a test's throwaway run dir under [`SCRATCH_BASE`] — disk-backed, since a
+/// bootc disk image overflows tmpfs `/tmp` — removed on drop unless [`KEEP_RUN_ENV`]
+/// is set (then its path is printed so it can be found).
+pub(crate) fn run_dir(prefix: &str) -> tempfile::TempDir {
+	let keep = std::env::var_os(KEEP_RUN_ENV).is_some();
+	let dir = tempfile::Builder::new()
+		.prefix(prefix)
+		.disable_cleanup(keep)
+		.tempdir_in(SCRATCH_BASE)
+		.expect("tempdir under /var/tmp");
+	if keep {
+		eprintln!("e2e: keeping run dir {}", dir.path().display());
+	}
+	dir
 }
 
 // ----------------------------------------------------------------- store cleanup

@@ -17,11 +17,12 @@
 //!
 //! A stock Debian generic cloud qcow2, cached + sha512-verified on first use via
 //! [`fetch::download`] (the new [`Checksum::Sha512`] path — Debian publishes a
-//! `SHA512SUMS`, not a sha256). It's booted under **UEFI** (OVMF) so the guest has
-//! `/sys/firmware/efi` — `bootc install` requires UEFI, and takeover's host
-//! pre-flight rejects a legacy-BIOS boot. A cloud-init `NoCloud` seed gives the
-//! stock `debian` user our admin key and installs `podman` (takeover never installs
-//! it — the host must already have it), mirroring `bootcher-core`'s vm builder seed.
+//! `SHA512SUMS`, not a sha256). The image is hybrid (BIOS boot partition + ESP), so
+//! the same base runs the takeover twice: once under **UEFI** (OVMF) and once under
+//! **legacy BIOS** (`SeaBIOS`), proving `bootc install to-existing-root` (and takeover's
+//! pre-flight) work on both firmwares. A cloud-init `NoCloud` seed gives the stock `debian` user our admin key and installs `podman` (takeover
+//! never installs it — the host must already have it), mirroring `bootcher-core`'s
+//! vm builder seed.
 //!
 //! ## The two identities, mirrored
 //!
@@ -40,8 +41,7 @@ use bootcher_core::qemu::{self, Vm, VmConfig};
 
 mod common;
 use common::{
-	ADMIN_KEYS, Agent, Prereqs, SCRATCH_BASE, SSH_TIMEOUT, Ssh, StoreGuard, VM_USER, keygen,
-	read_pub_key,
+	ADMIN_KEYS, Agent, Prereqs, SSH_TIMEOUT, Ssh, StoreGuard, VM_USER, keygen, read_pub_key,
 };
 
 /// Stock cloud login on the Debian generic image — takeover's *initial* connection
@@ -58,25 +58,48 @@ const DEBIAN_SHA512: &str = "e6ec0864d0b9c32ee60669cfe189e06baaaba26921ec0e8aeba
 /// Persistent download cache for the multi-hundred-MB Debian base — out of the
 /// temp dir so the fetch happens once across runs. Wiped only by hand.
 const CACHE_DIR: &str = "/var/tmp/bootcher-e2e-takeover-cache";
-/// Persistent podman store, pointed at via `XDG_DATA_HOME` (out of the user's real
-/// store). Wiped on teardown unless `BOOTCHER_E2E_KEEP_STORE` is set.
-const STORE_DIR: &str = "/var/tmp/bootcher-e2e-takeover-store";
+/// Persistent podman stores, pointed at via `XDG_DATA_HOME` (out of the user's real
+/// store), one per firmware variant so the two tests can run in parallel. Wiped on
+/// teardown unless `BOOTCHER_E2E_KEEP_STORE` is set.
+const UEFI_STORE_DIR: &str = "/var/tmp/bootcher-e2e-takeover-store";
+const BIOS_STORE_DIR: &str = "/var/tmp/bootcher-e2e-takeover-bios-store";
 
 #[test]
 #[cfg_attr(not(feature = "e2e"), ignore = "slow VM e2e; opt in with --features=e2e")]
 fn lan_takeover_converts_a_stock_debian_host() {
 	let env = Prereqs::probe().expect("prerequisites not satisfied by the current environment");
-	// bootc install requires UEFI; takeover's host pre-flight rejects a BIOS boot, so
-	// the guest must boot OVMF. `Prereqs` already located the host-arch firmware.
+	// Boot OVMF (UEFI); `Prereqs` already located the host-arch firmware.
+	run_takeover(Some(env.firmware.clone()), UEFI_STORE_DIR);
+}
+
+#[test]
+#[cfg_attr(not(feature = "e2e"), ignore = "slow VM e2e; opt in with --features=e2e")]
+fn lan_takeover_converts_a_legacy_bios_debian_host() {
+	Prereqs::probe().expect("prerequisites not satisfied by the current environment");
+	// No firmware blob: qemu boots its default `SeaBIOS`, so the guest has no
+	// `/sys/firmware/efi` — the legacy-BIOS path through the whole takeover.
+	run_takeover(None, BIOS_STORE_DIR);
+}
+
+/// The shared takeover scenario, booting the guest on `firmware` (`None` = legacy
+/// BIOS) with its own podman store at `store_dir`.
+fn run_takeover(firmware: Option<PathBuf>, store_dir: &'static str) {
 	let scope = Scope::standalone();
 
-	let h = Harness::setup(&env);
+	let h = Harness::setup(firmware, store_dir);
 	let _vm = h.boot(&scope);
 
 	// 1. Reachable as the stock `debian` user with our admin key, and cloud-init done
 	//    (so `podman` — the takeover prerequisite — is installed).
 	h.wait_for_ssh(STOCK_USER, &scope, "Debian guest never answered ssh as debian");
 	h.wait_cloud_init();
+	// Guard the variant's premise: the guest really is on the intended firmware.
+	let efi = h.ssh_out(STOCK_USER, "[ -d /sys/firmware/efi ] && echo yes || echo no");
+	assert_eq!(
+		efi.as_deref().map(str::trim),
+		Some(if h.firmware.is_some() { "yes" } else { "no" }),
+		"guest booted on the wrong firmware"
+	);
 
 	// 2. Take it over: build the bootc image and convert the live host in place. `-y`
 	//    skips the destructive confirmation (non-TTY); the remote's `takeover_login`
@@ -105,7 +128,9 @@ fn lan_takeover_converts_a_stock_debian_host() {
 /// Everything a takeover run needs: the throwaway project + `$HOME`, the admin
 /// keypair, the ssh-agent, the boot overlay, and the forwarded port.
 struct Harness {
-	firmware: PathBuf,
+	/// UEFI blob for `-bios`; `None` boots qemu's default legacy BIOS (`SeaBIOS`).
+	firmware: Option<PathBuf>,
+	store_dir: &'static str,
 	home: tempfile::TempDir,
 	proj: PathBuf,
 	port: u16,
@@ -117,12 +142,9 @@ struct Harness {
 }
 
 impl Harness {
-	fn setup(env: &Prereqs) -> Self {
-		let home = tempfile::Builder::new()
-			.prefix("bootcher-e2e-takeover-")
-			.tempdir_in(SCRATCH_BASE)
-			.expect("tempdir under /var/tmp");
-		let store = StoreGuard::new(STORE_DIR);
+	fn setup(firmware: Option<PathBuf>, store_dir: &'static str) -> Self {
+		let home = common::run_dir("bootcher-e2e-takeover-");
+		let store = StoreGuard::new(store_dir);
 		let hp = home.path();
 
 		// One keypair drives both identities: its public half is seeded onto the stock
@@ -158,7 +180,8 @@ impl Harness {
 		.unwrap();
 
 		Self {
-			firmware: env.firmware.clone(),
+			firmware,
+			store_dir,
 			proj,
 			port,
 			agent,
@@ -171,7 +194,8 @@ impl Harness {
 	}
 
 	/// Boot a writable, grown overlay on the cached Debian base, attaching the
-	/// cloud-init seed, under UEFI (OVMF). Returns the running guest.
+	/// cloud-init seed, under UEFI (OVMF) or legacy BIOS per `firmware`. Returns the
+	/// running guest.
 	fn boot(&self, scope: &Scope) -> Vm {
 		let base = ensure_debian_base(scope);
 		// CoW overlay grown to 20G so growpart + the bootc install have room (the stock
@@ -186,7 +210,7 @@ impl Harness {
 				arch: bootcher_core::context::Arch::X86_64,
 				disk: &self.overlay,
 				seed: Some(&seed),
-				firmware: Some(&self.firmware),
+				firmware: self.firmware.as_deref(),
 				port: self.port,
 				log: &self.serial_log,
 				accel: "kvm",
@@ -232,8 +256,12 @@ impl Harness {
 	/// A `bootcher` command rooted at the project, with the throwaway `$HOME`, the
 	/// agent socket, and the e2e's own persistent podman store.
 	fn bootcher(&self, args: &[&str]) -> AssertCommand {
-		let mut c =
-			common::bootcher_cmd(&self.proj, self.home.path(), STORE_DIR, Some(self.agent.sock()));
+		let mut c = common::bootcher_cmd(
+			&self.proj,
+			self.home.path(),
+			self.store_dir,
+			Some(self.agent.sock()),
+		);
 		c.args(args);
 		c
 	}
@@ -260,7 +288,10 @@ impl Harness {
 /// Ensure the pinned Debian base is present + sha512-verified in [`CACHE_DIR`],
 /// returning its path. Downloads (atomic `.part` + checksum + rename) on first use,
 /// trusts the cached file thereafter — the same criterion as the Fedora Cloud base.
+/// Serialized so the parallel firmware variants don't race on the same `.part`.
 fn ensure_debian_base(scope: &Scope) -> PathBuf {
+	static FETCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+	let _guard = FETCH.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 	std::fs::create_dir_all(CACHE_DIR).expect("create download cache dir");
 	let base = Path::new(CACHE_DIR).join("debian-13-generic-amd64.qcow2");
 	if !base.is_file() {

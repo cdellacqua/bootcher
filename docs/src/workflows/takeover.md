@@ -21,7 +21,9 @@ The pre-flight (run before the build) checks each host over SSH and fails fast o
 - missing `podman` or `sudo`;
 - a CPU architecture the project doesn't build (`[targets]`);
 - a root filesystem the installer can't adopt (must be `ext4` / `xfs` / `btrfs`);
-- an empty/missing `/boot`, or a host booted in **legacy BIOS** mode (UEFI is required — `/sys/firmware/efi` must exist).
+- an empty/missing `/boot`.
+
+Both UEFI and legacy BIOS hosts are supported.
 
 The authoritative layout check runs at install start; the pre-flight is the cheap filter so a disqualified host fails before a multi-GB build.
 
