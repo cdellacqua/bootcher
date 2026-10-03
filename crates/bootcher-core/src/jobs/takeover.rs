@@ -368,7 +368,7 @@ fn takeover_host(
 	//    load-bearing step (admin key, pull token, signing policy). Signing
 	//    enforcement otherwise rides the image's baked install config, exactly as in
 	//    disk provisioning.
-	inject_secrets(initial, files, job)?;
+	inject_secrets(initial, &install_ref, files, job)?;
 
 	// 4. Reboot over the stock login (it blocks until the host drops off), then
 	//    switch to admin@ to wait for it back and assert it's now bootc — which also
@@ -462,7 +462,17 @@ fn install_to_existing_root(
 /// Every provisioning path is under `/etc`, so its tail maps straight onto the
 /// staged etc root — landing the secrets exactly where disk provisioning's
 /// blueprint would, so the ostree 3-way merge preserves them across upgrades.
-fn inject_secrets(initial: &Ssh, files: &[DeviceFile], job: &Scope) -> Result<()> {
+///
+/// The files are then SELinux-labelled with the image's own `setfiles` and policy
+/// (run from `install_ref`): the stock host writing them is usually not
+/// SELinux-enabled, so they'd land unlabelled and an enforcing image would deny
+/// sshd the admin key. A policy-less image skips the relabel.
+fn inject_secrets(
+	initial: &Ssh,
+	install_ref: &str,
+	files: &[DeviceFile],
+	job: &Scope,
+) -> Result<()> {
 	let mut script = String::from(
 		"set -eu\n\
 		 etc=$(set -- /ostree/deploy/*/deploy/*.0/etc; echo \"$1\")\n\
@@ -482,6 +492,13 @@ fn inject_secrets(initial: &Ssh, files: &[DeviceFile], job: &Scope) -> Result<()
 			mode = f.mode,
 		);
 	}
+	let _ = writeln!(
+		script,
+		"sudo podman run --rm --privileged --security-opt label=disable \
+		 -v \"${{etc%/etc}}:/deploy\" {install_ref} sh -c '\
+		 [ -f /etc/selinux/config ] || exit 0; . /etc/selinux/config; \
+		 setfiles -F -r /deploy \"/etc/selinux/$SELINUXTYPE/contexts/files/file_contexts\" /deploy/etc'"
+	);
 	initial.run_sh(job, "inject secrets into staged /etc", &[], script)
 }
 
