@@ -196,12 +196,17 @@ impl Builder for LocalBuilder {
 		// to the project root the session inherits as cwd), the store, the empty-db
 		// shadow, and the whole inner command. The longer `db.sql` mount destination
 		// makes podman layer the shadow on top of the `:O` store mount.
+		// `--image-volume=ignore`: the image-builder image declares `VOLUME
+		// /var/lib/containers/storage`, which podman 4 counts as a second volume on the
+		// `:O` store's destination and refuses to start ("two volumes found with
+		// destination"); podman 5 lets the explicit mount win. The image's other
+		// volumes are throwaway caches (and `/output`, bind-mounted anyway).
 		let out = sh_quote(&format!("./{}", output.display()));
 		// This builder's configured `podman_opts` (e.g. `--network=host`), re-quoted
 		// and spliced in right after `run`.
 		let run_opts = crate::podman::opts_shell(&self.podman_opts);
 		let build_cmd = format!(
-			"podman run{run_opts} --rm --privileged --pull=missing \
+			"podman run{run_opts} --rm --privileged --pull=missing --image-volume=ignore \
 			 --security-opt label=type:unconfined_t \
 			 --entrypoint /bin/sh \
 			 -v {out}:/output \
