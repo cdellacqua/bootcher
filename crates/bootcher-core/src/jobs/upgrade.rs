@@ -459,6 +459,11 @@ impl Drop for KillOnDrop {
 /// A host-key mismatch ends the wait at once: it won't resolve itself, and on a
 /// routine reboot a changed key is exactly what `known_hosts` exists to catch.
 pub(crate) fn wait_online(remote: &Ssh, job: &Scope) -> Result<()> {
+	poll_online(remote, job, || {})
+}
+
+/// [`wait_online`], calling `on_down` after every probe that didn't get in.
+pub(crate) fn poll_online(remote: &Ssh, job: &Scope, mut on_down: impl FnMut()) -> Result<()> {
 	const POLL: Duration = Duration::from_secs(2);
 	const UP_TIMEOUT: Duration = Duration::from_mins(10);
 
@@ -476,7 +481,7 @@ pub(crate) fn wait_online(remote: &Ssh, job: &Scope) -> Result<()> {
 					host = remote.host()
 				);
 			}
-			Probe::Down => {}
+			Probe::Down => on_down(),
 		}
 		// Poll the cancellation flag so a Ctrl-C ends the (up-to-10-min) wait
 		// promptly instead of pinning a worker until the device returns.

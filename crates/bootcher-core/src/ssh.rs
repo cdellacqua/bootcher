@@ -50,6 +50,23 @@ impl Ssh {
 		Self { host: remote.into(), opts: opts.into_iter().map(Opt::into).collect() }
 	}
 
+	/// A copy that records and checks host keys *only* against `file` — the user's
+	/// and the global `known_hosts` are ignored. Placed ahead of the configured opts,
+	/// since ssh keeps the first value it sees for an option (a remote's own
+	/// `UserKnownHostsFile` would otherwise win). Under the base `accept-new` policy
+	/// a connect writes the host's current key to `file`, leaving the real
+	/// `known_hosts` untouched.
+	pub(crate) fn with_known_hosts_file(&self, file: &std::path::Path) -> Self {
+		let mut opts = vec![
+			"-o".to_owned(),
+			format!("UserKnownHostsFile={}", file.display()),
+			"-o".to_owned(),
+			"GlobalKnownHostsFile=/dev/null".to_owned(),
+		];
+		opts.extend(self.opts.iter().cloned());
+		Self { host: self.host.clone(), opts }
+	}
+
 	#[must_use]
 	pub fn host(&self) -> &str {
 		&self.host
@@ -209,5 +226,15 @@ mod tests {
 		// The host reaches ssh verbatim (port kept in the `ssh://` URL), second-to-last.
 		assert_eq!(argv[argv.len() - 2], "ssh://admin@host:2222");
 		assert_eq!(argv.last().unwrap(), "sh");
+	}
+
+	#[test]
+	fn known_hosts_override_precedes_the_configured_opts() {
+		let r = Ssh::new("admin@h", ["-o", "UserKnownHostsFile=/dev/null"]);
+		let argv = strs(&r.with_known_hosts_file(std::path::Path::new("/t/kh")).argv(&[], "true"));
+		let ours = argv.iter().position(|a| a == "UserKnownHostsFile=/t/kh").unwrap();
+		let theirs = argv.iter().position(|a| a == "UserKnownHostsFile=/dev/null").unwrap();
+		assert!(ours < theirs, "ssh keeps the first value, so the override must come first");
+		assert!(argv.iter().any(|a| a == "GlobalKnownHostsFile=/dev/null"));
 	}
 }

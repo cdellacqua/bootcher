@@ -392,6 +392,7 @@ fn run() -> Result<()> {
 				key_path,
 				skip_build,
 				&channel,
+				yes,
 			)
 		}
 		Cmd::Sign(cmd) => run_sign(cmd, manifest_path),

@@ -15,7 +15,8 @@ use crate::{jobs, progress};
 /// (`--login`); `provisioning` is the same secret set disk provisioning bakes;
 /// `ssh_key` is the resolved admin private key path. `skip_build` (`--skip-build`)
 /// converts the hosts from the already-built container, skipping the container
-/// build — the takeover phase alone.
+/// build — the takeover phase alone. `yes` (`-y`) trusts each host's new SSH host
+/// key without prompting.
 ///
 /// # Errors
 ///
@@ -27,6 +28,7 @@ pub fn run(
 	ssh_key: &str,
 	skip_build: bool,
 	channel: &str,
+	yes: bool,
 ) -> Result<()> {
 	if skip_build {
 		return jobs::takeover::run(
@@ -35,12 +37,21 @@ pub fn run(
 			provisioning,
 			ssh_key,
 			channel,
+			yes,
 			&mut progress::Scope::standalone(),
 		);
 	}
 	let mut b = progress::Scope::root("takeover", Some(2));
 	jobs::build::run(manifest, None, &mut b.child("build"))?;
-	jobs::takeover::run(manifest, login, provisioning, ssh_key, channel, &mut b.child("takeover"))
+	jobs::takeover::run(
+		manifest,
+		login,
+		provisioning,
+		ssh_key,
+		channel,
+		yes,
+		&mut b.child("takeover"),
+	)
 }
 
 /// Check `takeover`'s prerequisites up front, before the build: the local build

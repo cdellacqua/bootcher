@@ -21,6 +21,30 @@
 //!   ([`RemoteConfig::admin_ssh`]) — the normal steady-state remote, so the box needs
 //!   no `bootcher.toml` edit afterwards.
 //!
+//! ## The host key changes
+//!
+//! The installed image boots with an empty `/etc/ssh` key set, so sshd generates
+//! fresh host keys and the `known_hosts` entry recorded for the stock OS no longer
+//! matches — ordinary ssh would refuse the post-reboot connection as a possible
+//! MITM. Takeover expects this one change and handles it the way a first
+//! connection would:
+//!
+//! - the post-reboot wait connects with a throwaway `known_hosts` file, so the
+//!   new key is captured without touching the user's;
+//! - if the user's `known_hosts` already holds that key, or has no entry for the
+//!   host, nothing needs confirming (a missing entry is simply added);
+//! - otherwise the change is put to the same gate as the destructive confirmation:
+//!   an interactive run without `-y` shows the old and new fingerprints and asks
+//!   `[Y/n/a]` before replacing the entry — defaulting to yes, since the change
+//!   follows a reboot bootcher itself triggered into an install it just ran, and
+//!   with `a` trusting every further changed key in the run — while `-y` trusts the
+//!   new key outright. Every key trusted without a prompt logs both fingerprints.
+//!
+//! The entry's name and file come from `ssh -G` over the remote's own argv, so a
+//! non-default port, a `HostKeyAlias` or a per-remote `UserKnownHostsFile` are
+//! honoured. Only takeover does this: `upgrade`/`deploy` treat a changed key as
+//! the error it is there.
+//!
 //! ## Backends
 //!
 //! Mirrors the upgrade job: in LAN mode each host pulls the matching arch
@@ -34,6 +58,7 @@
 use crate::context::{DEVICE_AUTH_JSON, ImageRef, Manifest, RemoteConfig};
 use crate::jobs::secrets::{DeviceFile, Provisioning};
 use crate::jobs::upgrade;
+use crate::known_hosts;
 use crate::preflight::{self, Checks};
 use crate::progress::Scope;
 use crate::ssh::Ssh;
@@ -42,6 +67,8 @@ use anyhow::{Context, Result, bail};
 use std::fmt::Write as _;
 use std::io::IsTerminal;
 use std::num::NonZeroUsize;
+use std::path::Path;
+use std::sync::{Mutex, PoisonError};
 
 /// Root filesystems `bootc install to-existing-root` can adopt — the layout
 /// pre-check rejects anything else before a multi-GB build (bootc runs the
@@ -210,6 +237,8 @@ fn evaluate_probe(out: &str) -> HostReadiness {
 /// secret set disk provisioning bakes (its [`Provisioning::files`] are installed
 /// into the staged `/etc`); `ssh_key` is the resolved admin **private** key path —
 /// its public half is injected, its private half is the post-reboot identity.
+/// `yes` (`-y`) trusts each host's new SSH host key without asking (see the module
+/// docs).
 ///
 /// Dispatches on registry vs LAN exactly like [`upgrade::run`]: a configured
 /// registry pushes the multi-arch list and has each host pull the ref; otherwise
@@ -225,6 +254,7 @@ pub(crate) fn run(
 	provisioning: &Provisioning,
 	ssh_key: &str,
 	channel: &str,
+	yes: bool,
 	job: &mut Scope,
 ) -> Result<()> {
 	let images = manifest.images();
@@ -257,7 +287,7 @@ pub(crate) fn run(
 		)?;
 		let auth_json = files.iter().find(|f| f.path == DEVICE_AUTH_JSON).map(|f| f.data.as_str());
 		let backend = Backend::Registry { reference: &channel_ref, auth_json };
-		run_fleet(&targets, &backend, &files, max_workers, job)
+		run_fleet(&targets, &backend, &files, yes, max_workers, job)
 	} else {
 		// LAN mode: stand up one loopback registry for the whole fleet (it handles
 		// concurrent pulls) and tear it down once every host has finished. The list
@@ -266,7 +296,7 @@ pub(crate) fn run(
 		let reg = registry::serve_manifest_list(&local_list_ref, "latest", job)?;
 		let backend =
 			Backend::Lan { images: &images, local_list_ref: &local_list_ref, port: reg.port() };
-		let result = run_fleet(&targets, &backend, &files, max_workers, job);
+		let result = run_fleet(&targets, &backend, &files, yes, max_workers, job);
 		drop(reg);
 		result
 	}
@@ -317,6 +347,7 @@ fn run_fleet(
 	targets: &[Target],
 	backend: &Backend,
 	files: &[DeviceFile],
+	yes: bool,
 	max_workers: Option<NonZeroUsize>,
 	job: &mut Scope,
 ) -> Result<()> {
@@ -327,7 +358,7 @@ fn run_fleet(
 		|t| t.host.clone(),
 		max_workers,
 		job,
-		|target, scope| takeover_host(target, backend, files, scope),
+		|target, scope| takeover_host(target, backend, files, yes, scope),
 	)
 }
 
@@ -338,6 +369,7 @@ fn takeover_host(
 	target: &Target,
 	backend: &Backend,
 	files: &[DeviceFile],
+	yes: bool,
 	job: &mut Scope,
 ) -> Result<()> {
 	let initial = &target.initial;
@@ -371,11 +403,161 @@ fn takeover_host(
 	inject_secrets(initial, &install_ref, files, job)?;
 
 	// 4. Reboot over the stock login (it blocks until the host drops off), then
-	//    switch to admin@ to wait for it back and assert it's now bootc — which also
-	//    proves the injected admin key authenticates.
+	//    switch to admin@ to wait for it back — against a throwaway known_hosts,
+	//    which captures the reinstall's new host key — and trust that key before
+	//    asserting the host is now bootc (which also proves the injected admin key
+	//    authenticates).
 	upgrade::reboot(initial, job)?;
-	upgrade::wait_online(&target.admin, job)?;
+	let probe_dir = tempfile::tempdir().context("creating a temp dir for the host-key probe")?;
+	let fresh = probe_dir.path().join("known_hosts");
+	// A probe can reach a sshd that isn't the installed one — the stock OS's, still
+	// accepting while it shuts down — and `accept-new` records that key even though
+	// `admin@` can't log in there. Dropping the file after every failed probe keeps
+	// only the key of the session that authenticated as `admin`, i.e. the new OS.
+	upgrade::poll_online(&target.admin.with_known_hosts_file(&fresh), job, || {
+		let _ = std::fs::remove_file(&fresh);
+	})?;
+	trust_new_host_key(target, &fresh, yes, job)?;
 	verify_bootc(&target.admin, job)
+}
+
+/// Fleet-wide host-key trust state, behind [`KNOWN_HOSTS`].
+struct HostKeyTrust {
+	/// Set once the user answers "all" at a prompt: every later changed key in this
+	/// run is trusted without asking.
+	accept_all: bool,
+}
+
+/// Serialises the `known_hosts` read-modify-write — and any prompt — across the
+/// fleet's parallel workers, so prompts don't interleave and edits don't race. A
+/// worker waiting on the lock sees an "all" answer given while it waited.
+static KNOWN_HOSTS: Mutex<HostKeyTrust> = Mutex::new(HostKeyTrust { accept_all: false });
+
+/// An answer to the changed-host-key prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrustAnswer {
+	Yes,
+	No,
+	/// Yes, and for every further changed key in this run.
+	All,
+}
+
+impl std::str::FromStr for TrustAnswer {
+	type Err = ();
+
+	fn from_str(s: &str) -> Result<Self, ()> {
+		parse_trust_answer(s).ok_or(())
+	}
+}
+
+impl std::fmt::Display for TrustAnswer {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str(match self {
+			Self::Yes => "yes",
+			Self::No => "no",
+			Self::All => "yes, for all hosts",
+		})
+	}
+}
+
+/// Parse a `[Y/n/a]` answer, case-insensitively: empty is the default, yes.
+fn parse_trust_answer(input: &str) -> Option<TrustAnswer> {
+	match input.trim().to_ascii_lowercase().as_str() {
+		"" | "y" | "yes" => Some(TrustAnswer::Yes),
+		"n" | "no" => Some(TrustAnswer::No),
+		"a" | "all" => Some(TrustAnswer::All),
+		_ => None,
+	}
+}
+
+/// Bring the user's `known_hosts` in line with the key the host presented after
+/// the reboot (captured in `fresh`): nothing to do if it's already trusted, add it
+/// if the host has no entry, otherwise replace the stale entry — after asking, or
+/// straight away under `-y` or an earlier "all" answer (see the module docs).
+///
+/// The prompt defaults to yes: the change follows a reboot bootcher itself just
+/// triggered into an install it just ran, so a new key is the expected outcome.
+fn trust_new_host_key(target: &Target, fresh: &Path, yes: bool, job: &Scope) -> Result<()> {
+	let entry = known_hosts::resolve(&target.admin)?;
+	let new = known_hosts::lookup(&entry.name, fresh)?;
+	if new.is_empty() {
+		bail!(
+			"{}: ssh recorded no host key under {} after the reboot — can't verify the new key",
+			target.host,
+			entry.name
+		);
+	}
+
+	let mut trust = KNOWN_HOSTS.lock().unwrap_or_else(PoisonError::into_inner);
+	let old = known_hosts::lookup(&entry.name, &entry.file)?;
+	if old.is_empty() {
+		return known_hosts::append(&entry.file, &new);
+	}
+	if new.iter().any(|n| old.iter().any(|o| o.key == n.key)) {
+		return Ok(());
+	}
+
+	let fingerprints = |lines: &[known_hosts::Line]| -> Vec<String> {
+		lines.iter().map(|l| l.key.fingerprint()).collect()
+	};
+	let (old_fps, new_fps) = (fingerprints(&old), fingerprints(&new));
+	let log_trusted = |why: &str| {
+		job.println(format!(
+			"{}: host key changed by the reinstall ({} → {}); trusting the new key ({why})",
+			target.host,
+			old_fps.join(", "),
+			new_fps.join(", "),
+		));
+	};
+	match gate(yes, std::io::stdin().is_terminal()) {
+		Gate::Proceed => log_trusted("-y"),
+		Gate::Prompt if trust.accept_all => log_trusted("accepted for all hosts"),
+		Gate::Prompt => {
+			let answer = job.suspend(|| {
+				eprintln!(
+					"{}: the SSH host key changed — expected, the reinstall generated new keys.",
+					target.host
+				);
+				for fp in &old_fps {
+					eprintln!("  old: {fp}");
+				}
+				for fp in &new_fps {
+					eprintln!("  new: {fp}");
+				}
+				eprintln!(
+					"Check the new fingerprint out of band if in doubt (e.g. `ssh-keygen -lf \
+					 /etc/ssh/ssh_host_ed25519_key.pub` on the provider's console)."
+				);
+				inquire::CustomType::<TrustAnswer>::new(&format!(
+					"Trust the new key and update {}?",
+					entry.file.display()
+				))
+				.with_default(TrustAnswer::Yes)
+				.with_default_value_formatter(&|_| "Y/n/a".into())
+				.with_help_message("y: yes · n: no · a: yes, and for every further host this run")
+				.with_error_message("answer y (yes), n (no) or a (all)")
+				.prompt()
+			})?;
+			match answer {
+				TrustAnswer::Yes => {}
+				TrustAnswer::All => trust.accept_all = true,
+				TrustAnswer::No => bail!(
+					"{}: new host key not trusted — the host was converted and rebooted, but \
+					 bootcher didn't connect to verify it; check the key out of band, update {} \
+					 and run `bootc status` on the host",
+					target.host,
+					entry.file.display()
+				),
+			}
+		}
+		Gate::Bail => bail!(
+			"{}: the SSH host key changed and stdin is not a TTY to confirm the new one — \
+			 re-run with -y/--yes to trust it",
+			target.host
+		),
+	}
+	known_hosts::remove(&entry)?;
+	known_hosts::append(&entry.file, &new)
 }
 
 /// LAN backend: identify the host's arch, ship it the matching member from the
@@ -663,5 +845,21 @@ mod tests {
 		assert_eq!(gate(true, true), Gate::Proceed);
 		assert_eq!(gate(false, true), Gate::Prompt);
 		assert_eq!(gate(false, false), Gate::Bail);
+	}
+
+	#[test]
+	fn trust_answer_defaults_to_yes_and_parses_case_insensitively() {
+		for yes in ["", "  ", "y", "Y", "yes", "YES"] {
+			assert_eq!(parse_trust_answer(yes), Some(TrustAnswer::Yes), "{yes:?}");
+		}
+		for no in ["n", "N", "no", "No"] {
+			assert_eq!(parse_trust_answer(no), Some(TrustAnswer::No), "{no:?}");
+		}
+		for all in ["a", "A", "all", "ALL"] {
+			assert_eq!(parse_trust_answer(all), Some(TrustAnswer::All), "{all:?}");
+		}
+		for junk in ["x", "yess", "nope", "y n", "always"] {
+			assert_eq!(parse_trust_answer(junk), None, "{junk:?}");
+		}
 	}
 }

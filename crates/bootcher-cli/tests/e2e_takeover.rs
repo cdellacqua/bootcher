@@ -30,6 +30,14 @@
 //! remote's `takeover_login`); after the reboot it's `admin@` with the injected key
 //! — the same key, so one keypair drives both. The forwarded loopback port rides in
 //! the `ssh://…:<port>` remote URL.
+//!
+//! ## The host key
+//!
+//! The reinstall gives the guest fresh SSH host keys, so the remote's
+//! `UserKnownHostsFile` is a real, test-owned file (not `/dev/null`, which would
+//! hide the mismatch): seeded with the stock host's keys before the run, it must
+//! hold the new key — and none of the old ones — afterwards, which `-y` accepts
+//! without a prompt.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -101,6 +109,14 @@ fn run_takeover(firmware: Option<PathBuf>, store_dir: &'static str) {
 		"guest booted on the wrong firmware"
 	);
 
+	// Seed the test-owned known_hosts with the stock host's keys, as a prior login
+	// would have; takeover must replace them.
+	let old_keys = h.host_keys(STOCK_USER);
+	assert!(!old_keys.is_empty(), "found no host keys on the stock guest");
+	let lines: Vec<_> = old_keys.iter().map(|k| format!("[127.0.0.1]:{} {k}", h.port)).collect();
+	let seed = lines.join("\n") + "\n";
+	std::fs::write(&h.known_hosts, seed).unwrap();
+
 	// 2. Take it over: build the bootc image and convert the live host in place. `-y`
 	//    skips the destructive confirmation (non-TTY); the remote's `takeover_login`
 	//    supplies the stock login.
@@ -120,6 +136,22 @@ fn run_takeover(firmware: Option<PathBuf>, store_dir: &'static str) {
 	let keys = h.ssh_out(VM_USER, &format!("cat {ADMIN_KEYS}")).expect("read injected admin keys");
 	assert!(keys.contains(&read_pub_key(&h.admin_key)), "injected admin key missing from host");
 
+	// 4. known_hosts now trusts the reinstalled host's key and dropped the stock ones
+	//    (compared by key blob: a system `HashKnownHosts yes` hashes the names).
+	let known = std::fs::read_to_string(&h.known_hosts).expect("read known_hosts");
+	let new_keys = h.host_keys(VM_USER);
+	assert!(
+		new_keys.iter().any(|k| known.contains(blob(k))),
+		"known_hosts lacks the reinstalled host's key:\n{known}\nhost keys:\n{}",
+		new_keys.join("\n")
+	);
+	for k in &old_keys {
+		assert!(
+			!known.contains(blob(k)),
+			"known_hosts still holds a stock host key ({k}):\n{known}"
+		);
+	}
+
 	eprintln!("e2e/takeover: passed");
 }
 
@@ -133,6 +165,8 @@ struct Harness {
 	store_dir: &'static str,
 	home: tempfile::TempDir,
 	proj: PathBuf,
+	/// The remote's `UserKnownHostsFile` — test-owned, so the run's edits are checked.
+	known_hosts: PathBuf,
 	port: u16,
 	agent: Agent,
 	admin_key: PathBuf,
@@ -160,8 +194,9 @@ impl Harness {
 		// Throwaway project, scaffolded with `bootcher init -y` then pointed at the
 		// guest: the steady-state remote is `admin@` over the forwarded loopback port
 		// (in the `ssh://` URL), with `takeover_login = "debian"` for the initial
-		// connection and known-hosts pinned to /dev/null for the throwaway host key.
+		// connection and known-hosts in a test-owned file (see the module docs).
 		let proj = common::scaffold_project(hp, "e2e");
+		let known_hosts = hp.join("known_hosts");
 
 		let port = qemu::free_port().expect("free port");
 		let manifest_path = proj.join("bootcher.toml");
@@ -172,8 +207,9 @@ impl Harness {
 				"remotes = []",
 				&format!(
 					"remotes = [{{ remote = \"ssh://{VM_USER}@127.0.0.1:{port}\", \
-					 ssh_opts = [\"-o\", \"UserKnownHostsFile=/dev/null\"], \
-					 takeover_login = \"{STOCK_USER}\" }}]"
+					 ssh_opts = [\"-o\", \"UserKnownHostsFile={}\"], \
+					 takeover_login = \"{STOCK_USER}\" }}]",
+					known_hosts.display()
 				),
 			),
 		)
@@ -183,6 +219,7 @@ impl Harness {
 			firmware,
 			store_dir,
 			proj,
+			known_hosts,
 			port,
 			agent,
 			admin_key,
@@ -278,11 +315,28 @@ impl Harness {
 		}
 	}
 
+	/// The guest's host public keys as `<type> <blob>` pairs, read over ssh as `user`
+	/// straight from `/etc/ssh` — `ssh-keyscan` over user-net can return a partial set.
+	fn host_keys(&self, user: &str) -> Vec<String> {
+		let out = self.ssh_out(user, "cat /etc/ssh/ssh_host_*_key.pub").expect("read host keys");
+		out.lines()
+			.filter_map(|l| {
+				let mut f = l.split_whitespace();
+				Some(format!("{} {}", f.next()?, f.next()?))
+			})
+			.collect()
+	}
+
 	/// Capture stdout of `cmd` over ssh as `user`, retrying through the transient
 	/// post-reboot transport blips qemu's user-net can produce.
 	fn ssh_out(&self, user: &str, cmd: &str) -> Option<String> {
 		self.ssh(user).out(cmd)
 	}
+}
+
+/// The base64 blob of a `<type> <blob>` key from [`Harness::host_keys`].
+fn blob(key: &str) -> &str {
+	key.split_whitespace().nth(1).unwrap_or(key)
 }
 
 /// Ensure the pinned Debian base is present + sha512-verified in [`CACHE_DIR`],

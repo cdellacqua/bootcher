@@ -21,6 +21,7 @@ pub mod fetch;
 pub(crate) mod fleet;
 pub(crate) mod hooks;
 pub mod jobs;
+pub(crate) mod known_hosts;
 pub mod pipelines;
 pub mod podman;
 pub(crate) mod preflight;
