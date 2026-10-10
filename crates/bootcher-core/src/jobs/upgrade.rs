@@ -455,13 +455,29 @@ impl Drop for KillOnDrop {
 /// for it to come back. Each probe is a throwaway `ssh true` with a short
 /// connect timeout and `BatchMode` so a still-down host fails fast instead of
 /// hanging or prompting.
+///
+/// A host-key mismatch ends the wait at once: it won't resolve itself, and on a
+/// routine reboot a changed key is exactly what `known_hosts` exists to catch.
 pub(crate) fn wait_online(remote: &Ssh, job: &Scope) -> Result<()> {
 	const POLL: Duration = Duration::from_secs(2);
 	const UP_TIMEOUT: Duration = Duration::from_mins(10);
 
 	let pb = job.spinner("waiting for device to come back online");
 	let start = Instant::now();
-	while !reachable(remote) {
+	loop {
+		match probe(remote) {
+			Probe::Up => break,
+			Probe::HostKeyChanged => {
+				pb.finish();
+				bail!(
+					"{host} is back online but its SSH host key no longer matches known_hosts — \
+					 refusing to connect. If the change is expected, remove the stale entry \
+					 (`ssh-keygen -R <host>`), verify the new key, and re-run",
+					host = remote.host()
+				);
+			}
+			Probe::Down => {}
+		}
 		// Poll the cancellation flag so a Ctrl-C ends the (up-to-10-min) wait
 		// promptly instead of pinning a worker until the device returns.
 		signals::check()?;
@@ -475,19 +491,47 @@ pub(crate) fn wait_online(remote: &Ssh, job: &Scope) -> Result<()> {
 	Ok(())
 }
 
-/// One throwaway `ssh true`: `true` if the device accepts an SSH session and
-/// runs a command, `false` on any connect/auth/exec failure.
-fn reachable(remote: &Ssh) -> bool {
+/// Outcome of one reachability probe, from [`classify_probe`].
+#[derive(Debug, PartialEq, Eq)]
+enum Probe {
+	/// The device accepted a session and ran the command.
+	Up,
+	/// Not reachable yet (connect/auth/exec failure) — keep polling.
+	Down,
+	/// ssh refused the host key: the device answers, but not with the key on record.
+	HostKeyChanged,
+}
+
+/// One throwaway `ssh true`, classified by [`classify_probe`]. stderr is captured
+/// (not shown) only to tell a host-key refusal apart from "not up yet".
+fn probe(remote: &Ssh) -> Probe {
 	// `accept-new` host-key policy is already in `Ssh`'s base opts.
 	let argv = remote.argv(&["-o", "ConnectTimeout=5"], "true");
 	let (program, rest) = argv.split_first().expect("non-empty argv");
 	duct::cmd(program, rest)
 		.stdin_null()
 		.stdout_null()
-		.stderr_null()
+		.stderr_capture()
 		.unchecked()
 		.run()
-		.is_ok_and(|o| o.status.success())
+		.map_or(Probe::Down, |o| {
+			classify_probe(o.status.success(), &String::from_utf8_lossy(&o.stderr))
+		})
+}
+
+/// Classify an `ssh true` probe from its exit status and stderr. ssh prints
+/// `Host key verification failed.` whenever it rejects the host key (a changed key
+/// under `accept-new`, or an unknown one under `yes`).
+fn classify_probe(success: bool, stderr: &str) -> Probe {
+	if success {
+		Probe::Up
+	} else if stderr.contains("Host key verification failed")
+		|| stderr.contains("REMOTE HOST IDENTIFICATION HAS CHANGED")
+	{
+		Probe::HostKeyChanged
+	} else {
+		Probe::Down
+	}
 }
 
 /// Ship `image` to the target's local containers-storage incrementally, from the
@@ -566,4 +610,30 @@ fn remote_podman_image_id(remote: &Ssh, tag: &str) -> Result<Option<String>> {
 		.to_owned();
 
 	Ok(if id.is_empty() || id.starts_with("Error: ") { None } else { Some(id) })
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn probe_success_is_up() {
+		assert_eq!(classify_probe(true, ""), Probe::Up);
+	}
+
+	#[test]
+	fn probe_connect_failure_is_down() {
+		let stderr = "ssh: connect to host h port 22: Connection refused\n";
+		assert_eq!(classify_probe(false, stderr), Probe::Down);
+		assert_eq!(classify_probe(false, "admin@h: Permission denied (publickey).\n"), Probe::Down);
+	}
+
+	#[test]
+	fn probe_changed_host_key_is_detected() {
+		let stderr = "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
+			@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n\
+			Host key for h has changed and you have requested strict checking.\n\
+			Host key verification failed.\n";
+		assert_eq!(classify_probe(false, stderr), Probe::HostKeyChanged);
+	}
 }
