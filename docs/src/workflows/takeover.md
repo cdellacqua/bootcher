@@ -56,7 +56,7 @@ remotes = [
 4. **Inject secrets** into the staged deployment's `/etc` — the admin key, the registry pull token, and (in signing mode) the signature-enforcement policy — exactly the file set [disk provisioning](setup.md) bakes.
 5. **Reboot**, wait for the host to answer SSH on the new boot as `admin@`, and assert `bootc status`.
 
-Hosts roll out in parallel, capped by `[concurrency] takeover`.
+Hosts roll out in parallel, capped by `[concurrency] takeover`. Steps 2–5 are bracketed, once for the whole fleet, by the [`[hooks.takeover]`](../reference/bootcher-toml.md#hooksphase) `pre`/`post` commands — also with `--skip-build`. `post` runs only after every host has finished.
 
 ## Afterwards
 

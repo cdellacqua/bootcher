@@ -416,6 +416,10 @@ fn init_scaffolds_commented_hooks_examples() {
 		"manifest documents the upgrade hook: {manifest}"
 	);
 	assert!(
+		manifest.contains("# [hooks.takeover]"),
+		"manifest documents the takeover hook: {manifest}"
+	);
+	assert!(
 		!manifest.lines().any(|l| l.trim().starts_with("[hooks")),
 		"a hookless project must not ship a live [hooks.*] table: {manifest}",
 	);

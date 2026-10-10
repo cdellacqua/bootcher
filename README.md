@@ -149,7 +149,8 @@ Per-stage shortcuts exist too: `bootcher build`, `bootcher disk`,
 
 Hooks allow performing project-specific tasks when building with `bootcher`, by providing a way of injecting custom behavior between the standard steps.
 
-Each phase — the container build, the disk-image step, and the deploy upgrade —
+Each phase — the container build, the disk-image step, the deploy upgrade, and
+the in-place takeover —
 is a `[hooks.<phase>]` table with an optional `pre` and `post` command:
 
 ```toml
@@ -164,6 +165,10 @@ post = "echo 'here you could edit the disk image to embed stuff that is outside 
 [hooks.upgrade]
 pre  = "echo 'here you could drain or notify the fleet before rolling out'"
 post = "echo 'here you could run a post-deploy smoke test against the devices'"
+
+[hooks.takeover]
+pre  = "echo 'here you could snapshot the hosts before converting them'"
+post = "echo 'here you could run a smoke test against the converted hosts'"
 ```
 
 Each command is run with `sh -c` from the project root, with bootcher's progress
@@ -173,7 +178,8 @@ UI suspended and the terminal handed over — so a hook may print freely, prompt
 The hooks fire wherever the phase runs, so they apply across the shortcuts too:
 `[hooks.build]` wraps the container build (`build`, `provision`, `deploy`);
 `[hooks.disk]` wraps the disk build (`disk`, `provision`); `[hooks.upgrade]`
-wraps the push + per-device `bootc upgrade` (`upgrade`, `deploy`).
+wraps the push + per-device `bootc upgrade` (`upgrade`, `deploy`);
+`[hooks.takeover]` wraps the image transfer + per-host conversion (`takeover`).
 
 ## Secrets: collected at provision, never stored
 

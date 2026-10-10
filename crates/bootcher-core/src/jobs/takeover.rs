@@ -56,6 +56,7 @@
 //! host reboots into bootc.
 
 use crate::context::{DEVICE_AUTH_JSON, ImageRef, Manifest, RemoteConfig};
+use crate::hooks::{HookMetadata, Phase, Stage};
 use crate::jobs::secrets::{DeviceFile, Provisioning};
 use crate::jobs::upgrade;
 use crate::known_hosts;
@@ -244,10 +245,15 @@ fn evaluate_probe(out: &str) -> HostReadiness {
 /// registry pushes the multi-arch list and has each host pull the ref; otherwise
 /// each host pulls its arch member from a shared loopback registry over `ssh -R`.
 ///
+/// The manifest's `[hooks.takeover]` `pre`/`post` commands run once around the
+/// whole push + per-host rollout — so they fire with or without `--skip-build`.
+/// The `pre` hook runs after the targets resolve but before the push; `post` only
+/// after every host has finished.
+///
 /// # Errors
 ///
-/// Returns an error if no arches/remotes are configured, the push fails, or any
-/// host's takeover fails.
+/// Returns an error if no arches/remotes are configured, a hook fails, the push
+/// fails, or any host's takeover fails.
 pub(crate) fn run(
 	manifest: &Manifest,
 	login: Option<&str>,
@@ -271,7 +277,24 @@ pub(crate) fn run(
 	let max_workers = manifest.concurrency().takeover;
 
 	let provenance = crate::context::GitProvenance::detect(std::path::Path::new("."));
+	// Compute the immutable CalVer tag now, while `provenance` is still whole (its
+	// fields are moved into `meta` just below).
 	let calver = crate::context::calver_now(provenance.short_sha().as_deref());
+	let hooks = manifest.hooks();
+	let mut meta = HookMetadata {
+		phase: Phase::Takeover,
+		stage: Stage::Pre,
+		image_name: manifest.general.name.clone(),
+		arches: images.iter().map(|i| i.arch).collect(),
+		// The ref pushed/served and recorded as the host's bootc origin, as at `upgrade`.
+		image_ref: manifest.registry_list_ref(channel).unwrap_or_else(|| manifest.local_list_ref()),
+		revision: provenance.revision,
+		version: provenance.version,
+		output_dir: None,
+		targets: None,
+		remotes: Some(targets.iter().map(|t| t.host.clone()).collect()),
+	};
+	crate::hooks::run(&meta, hooks.takeover.pre.as_deref(), job)?;
 	if let Some(channel_ref) = manifest.registry_list_ref(channel)
 		&& let Some(version_ref) = manifest.registry_version_ref(&calver)
 	{
@@ -287,7 +310,7 @@ pub(crate) fn run(
 		)?;
 		let auth_json = files.iter().find(|f| f.path == DEVICE_AUTH_JSON).map(|f| f.data.as_str());
 		let backend = Backend::Registry { reference: &channel_ref, auth_json };
-		run_fleet(&targets, &backend, &files, yes, max_workers, job)
+		run_fleet(&targets, &backend, &files, yes, max_workers, job)?;
 	} else {
 		// LAN mode: stand up one loopback registry for the whole fleet (it handles
 		// concurrent pulls) and tear it down once every host has finished. The list
@@ -298,8 +321,10 @@ pub(crate) fn run(
 			Backend::Lan { images: &images, local_list_ref: &local_list_ref, port: reg.port() };
 		let result = run_fleet(&targets, &backend, &files, yes, max_workers, job);
 		drop(reg);
-		result
+		result?;
 	}
+	meta.stage = Stage::Post;
+	crate::hooks::run(&meta, hooks.takeover.post.as_deref(), job)
 }
 
 /// How a host obtains the image into its containers-storage. The two backends from

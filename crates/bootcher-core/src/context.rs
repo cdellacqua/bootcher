@@ -903,6 +903,8 @@ impl ConcurrencyConfig {
 ///   and `provision`.
 /// - `[hooks.upgrade]` wraps the push + per-device `bootc upgrade`, so it applies
 ///   to `upgrade` and `deploy`.
+/// - `[hooks.takeover]` wraps the image transfer + per-host in-place conversion,
+///   so it applies to `takeover` (with or without `--skip-build`).
 ///
 /// Every table and key is optional; an absent one is no hook. Each is
 /// `skip_serializing_if`-empty so a hookless project serializes no `[hooks]`
@@ -920,6 +922,10 @@ pub struct Hooks {
 	/// `deploy`).
 	#[serde(default, skip_serializing_if = "HookPair::is_empty")]
 	pub upgrade: HookPair,
+	/// Hooks around the takeover transfer + per-host in-place conversion
+	/// (`takeover`).
+	#[serde(default, skip_serializing_if = "HookPair::is_empty")]
+	pub takeover: HookPair,
 }
 
 /// A `[hooks.<phase>]` table: the optional `pre` command run before a phase and
@@ -950,7 +956,10 @@ impl Hooks {
 	/// so an unused `[hooks]` section never appears in a serialized manifest.
 	#[must_use]
 	pub fn is_empty(&self) -> bool {
-		self.build.is_empty() && self.disk.is_empty() && self.upgrade.is_empty()
+		self.build.is_empty()
+			&& self.disk.is_empty()
+			&& self.upgrade.is_empty()
+			&& self.takeover.is_empty()
 	}
 }
 
@@ -2064,7 +2073,8 @@ mod tests {
 		let m = parse(
 			"[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n\
 			 [hooks.build]\npre = \"a.sh\"\n\
-			 [hooks.disk]\npost = \"b.sh\"\n",
+			 [hooks.disk]\npost = \"b.sh\"\n\
+			 [hooks.takeover]\npre = \"c.sh\"\n",
 		);
 		assert!(!m.hooks().is_empty());
 		assert_eq!(m.hooks().build.pre.as_deref(), Some("a.sh"));
@@ -2072,6 +2082,8 @@ mod tests {
 		assert_eq!(m.hooks().disk.post.as_deref(), Some("b.sh"));
 		assert!(m.hooks().disk.pre.is_none());
 		assert!(m.hooks().upgrade.is_empty());
+		assert_eq!(m.hooks().takeover.pre.as_deref(), Some("c.sh"));
+		assert!(m.hooks().takeover.post.is_none());
 	}
 
 	#[test]

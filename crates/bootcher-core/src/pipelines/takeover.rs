@@ -11,12 +11,12 @@ use crate::{jobs, progress};
 /// take over from there unchanged.
 ///
 /// Two phases, like the others: the build fan-out (honouring `[hooks.build]`) then
-/// the per-host takeover rollout. `login` is the fleet-wide stock cloud login
-/// (`--login`); `provisioning` is the same secret set disk provisioning bakes;
-/// `ssh_key` is the resolved admin private key path. `skip_build` (`--skip-build`)
-/// converts the hosts from the already-built container, skipping the container
-/// build — the takeover phase alone. `yes` (`-y`) trusts each host's new SSH host
-/// key without prompting.
+/// the per-host takeover rollout (honouring `[hooks.takeover]`). `login` is the
+/// fleet-wide stock cloud login (`--login`); `provisioning` is the same secret set
+/// disk provisioning bakes; `ssh_key` is the resolved admin private key path.
+/// `skip_build` (`--skip-build`) converts the hosts from the already-built
+/// container, skipping the container build — the takeover phase alone (its hooks
+/// still fire). `yes` (`-y`) trusts each host's new SSH host key without prompting.
 ///
 /// # Errors
 ///

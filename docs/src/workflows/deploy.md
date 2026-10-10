@@ -53,6 +53,10 @@ post = "dd if=output/... of=/dev/sdX   # embed into target"
 [hooks.upgrade]
 pre  = "echo 'drain traffic before rollout'"
 post = "echo 'run post-deploy smoke test'"
+
+[hooks.takeover]
+pre  = "echo 'snapshot hosts before conversion'"
+post = "echo 'smoke-test converted hosts'"
 ```
 
 Each hook runs with `sh -c` from the project root. The terminal is handed over — the hook may print freely, prompt, or `sudo`. A non-zero exit aborts the run.

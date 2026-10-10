@@ -1,5 +1,6 @@
 //! Lifecycle hooks: user-supplied shell commands run before and after bootcher's
-//! phases (the container build, the image step, and the deploy upgrade),
+//! phases (the container build, the image step, the deploy upgrade, and the
+//! in-place takeover),
 //! configured in the manifest's `[hooks.<phase>]` tables (see
 //! [`crate::context::Hooks`]).
 //!
@@ -39,7 +40,7 @@ use serde::Serialize;
 use std::path::PathBuf;
 
 /// Which lifecycle phase a hook brackets. Serializes lowercase (`build` / `disk`
-/// / `upgrade`) into [`HookMetadata::phase`].
+/// / `upgrade` / `takeover`) into [`HookMetadata::phase`].
 #[derive(Clone, Copy, Debug, Serialize, strum::Display, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
@@ -47,6 +48,7 @@ pub(crate) enum Phase {
 	Build,
 	Disk,
 	Upgrade,
+	Takeover,
 }
 
 /// Whether a hook runs before (`pre`) or after (`post`) its phase. Serializes
@@ -94,7 +96,8 @@ pub(crate) struct HookMetadata {
 	pub arches: Vec<Arch>,
 	/// The suffix-free image ref this phase concerns: the local manifest-list ref
 	/// at `build`, the bootc-origin source ref at `disk`, the pushed/served list ref
-	/// at `upgrade`. Deterministic from the manifest, so it's valid even at `pre`.
+	/// at `upgrade` and `takeover`. Deterministic from the manifest, so it's valid
+	/// even at `pre`.
 	pub image_ref: String,
 	/// The git commit the image was built from (`org.opencontainers.image.revision`),
 	/// `-dirty`-suffixed for an uncommitted tree. Mirrors the OCI label stamped on the
@@ -113,8 +116,9 @@ pub(crate) struct HookMetadata {
 	/// The per-target build matrix — `disk` phase only.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub targets: Option<Vec<DiskTargetMeta>>,
-	/// The LAN deploy targets (`user@host`) — `upgrade` phase only, omitted in
-	/// pure-registry mode.
+	/// The deploy targets (`user@host`) — `upgrade` and `takeover` phases only.
+	/// Omitted at `upgrade` in pure-registry mode (no remotes listed); always set at
+	/// `takeover`, as the steady-state `admin@host` each host ends up as.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub remotes: Option<Vec<String>>,
 }
@@ -293,5 +297,24 @@ mod tests {
 		let v = json_of(&meta);
 		assert_eq!(v["remotes"], json!(["root@10.0.0.2"]));
 		assert!(!v.as_object().unwrap().contains_key("targets"));
+	}
+
+	#[test]
+	fn takeover_serializes_its_phase_and_remotes() {
+		let meta = HookMetadata {
+			phase: Phase::Takeover,
+			stage: Stage::Pre,
+			image_name: "kiosk".into(),
+			arches: vec![Arch::X86_64],
+			image_ref: "localhost/kiosk:latest".into(),
+			revision: None,
+			version: None,
+			output_dir: None,
+			targets: None,
+			remotes: Some(vec!["admin@vps.example.com".into()]),
+		};
+		let v = json_of(&meta);
+		assert_eq!(v["phase"], "takeover");
+		assert_eq!(v["remotes"], json!(["admin@vps.example.com"]));
 	}
 }
