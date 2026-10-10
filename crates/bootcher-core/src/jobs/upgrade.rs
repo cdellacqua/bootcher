@@ -101,6 +101,7 @@ pub(crate) fn run(
 		output_dir: None,
 		targets: None,
 		remotes: (!remote_hosts.is_empty()).then_some(remote_hosts),
+		credential: None,
 	};
 	crate::hooks::run(&meta, hooks.upgrade.pre.as_deref(), job)?;
 	if let Some(channel_ref) = manifest.registry_list_ref(channel)

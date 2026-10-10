@@ -149,8 +149,8 @@ Per-stage shortcuts exist too: `bootcher build`, `bootcher disk`,
 
 Hooks allow performing project-specific tasks when building with `bootcher`, by providing a way of injecting custom behavior between the standard steps.
 
-Each phase — the container build, the disk-image step, the deploy upgrade, and
-the in-place takeover —
+Each phase — the container build, the disk-image step, the deploy upgrade, the
+in-place takeover, and the credential rotation —
 is a `[hooks.<phase>]` table with an optional `pre` and `post` command:
 
 ```toml
@@ -169,6 +169,10 @@ post = "echo 'here you could run a post-deploy smoke test against the devices'"
 [hooks.takeover]
 pre  = "echo 'here you could snapshot the hosts before converting them'"
 post = "echo 'here you could run a smoke test against the converted hosts'"
+
+[hooks.rotate]
+pre  = "echo 'here you could store the new credential in your secrets manager'"
+post = "echo 'here you could revoke the old credential at its issuer'"
 ```
 
 Each command is run with `sh -c` from the project root, with bootcher's progress
@@ -179,7 +183,9 @@ The hooks fire wherever the phase runs, so they apply across the shortcuts too:
 `[hooks.build]` wraps the container build (`build`, `provision`, `deploy`);
 `[hooks.disk]` wraps the disk build (`disk`, `provision`); `[hooks.upgrade]`
 wraps the push + per-device `bootc upgrade` (`upgrade`, `deploy`);
-`[hooks.takeover]` wraps the image transfer + per-host conversion (`takeover`).
+`[hooks.takeover]` wraps the image transfer + per-host conversion (`takeover`);
+`[hooks.rotate]` wraps the per-device credential rollout (every `rotate`
+subcommand).
 
 ## Secrets: collected at provision, never stored
 

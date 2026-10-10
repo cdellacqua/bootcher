@@ -1,6 +1,6 @@
 //! Lifecycle hooks: user-supplied shell commands run before and after bootcher's
-//! phases (the container build, the image step, the deploy upgrade, and the
-//! in-place takeover),
+//! phases (the container build, the image step, the deploy upgrade, the in-place
+//! takeover, and the credential rotation),
 //! configured in the manifest's `[hooks.<phase>]` tables (see
 //! [`crate::context::Hooks`]).
 //!
@@ -40,7 +40,7 @@ use serde::Serialize;
 use std::path::PathBuf;
 
 /// Which lifecycle phase a hook brackets. Serializes lowercase (`build` / `disk`
-/// / `upgrade` / `takeover`) into [`HookMetadata::phase`].
+/// / `upgrade` / `takeover` / `rotate`) into [`HookMetadata::phase`].
 #[derive(Clone, Copy, Debug, Serialize, strum::Display, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
@@ -49,6 +49,7 @@ pub(crate) enum Phase {
 	Disk,
 	Upgrade,
 	Takeover,
+	Rotate,
 }
 
 /// Whether a hook runs before (`pre`) or after (`post`) its phase. Serializes
@@ -59,6 +60,20 @@ pub(crate) enum Phase {
 pub(crate) enum Stage {
 	Pre,
 	Post,
+}
+
+/// Which device credential a `rotate` run replaces — one per `bootcher rotate`
+/// subcommand, serialized as its name into [`HookMetadata::credential`] so a
+/// shared `[hooks.rotate]` script can branch on it.
+#[derive(Clone, Copy, Debug, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum Credential {
+	/// The registry pull token (`rotate pull-token`).
+	PullToken,
+	/// The admin SSH authorized key (`rotate ssh-key`).
+	SshKey,
+	/// The image-signing public key + policy (`rotate sign-key`).
+	SignKey,
 }
 
 /// One disk artifact in the `disk` phase's [`HookMetadata::targets`] matrix: the
@@ -96,18 +111,19 @@ pub(crate) struct HookMetadata {
 	pub arches: Vec<Arch>,
 	/// The suffix-free image ref this phase concerns: the local manifest-list ref
 	/// at `build`, the bootc-origin source ref at `disk`, the pushed/served list ref
-	/// at `upgrade` and `takeover`. Deterministic from the manifest, so it's valid
-	/// even at `pre`.
+	/// at `upgrade` and `takeover`, the devices' bootc-origin ref at `rotate`.
+	/// Deterministic from the manifest, so it's valid even at `pre`.
 	pub image_ref: String,
 	/// The git commit the image was built from (`org.opencontainers.image.revision`),
 	/// `-dirty`-suffixed for an uncommitted tree. Mirrors the OCI label stamped on the
 	/// container, so a hook and the device's `bootc status` agree. Omitted when the
-	/// project isn't a git work tree (see [`crate::context::GitProvenance`]).
+	/// project isn't a git work tree (see [`crate::context::GitProvenance`]), and at
+	/// `rotate`, which builds nothing.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub revision: Option<String>,
 	/// A human description of the build (`org.opencontainers.image.version` —
 	/// `git describe`: nearest tag, else short SHA). Mirrors the OCI label; omitted
-	/// outside a git work tree. See [`crate::context::GitProvenance`].
+	/// outside a git work tree and at `rotate`. See [`crate::context::GitProvenance`].
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub version: Option<String>,
 	/// The base output dir (relative to the project root) — `disk` phase only.
@@ -116,11 +132,15 @@ pub(crate) struct HookMetadata {
 	/// The per-target build matrix — `disk` phase only.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub targets: Option<Vec<DiskTargetMeta>>,
-	/// The deploy targets (`user@host`) — `upgrade` and `takeover` phases only.
-	/// Omitted at `upgrade` in pure-registry mode (no remotes listed); always set at
-	/// `takeover`, as the steady-state `admin@host` each host ends up as.
+	/// The deploy targets (`user@host`) — `upgrade`, `takeover` and `rotate` phases
+	/// only. Omitted at `upgrade` in pure-registry mode (no remotes listed); always
+	/// set at `takeover` (as the steady-state `admin@host` each host ends up as) and
+	/// `rotate`.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub remotes: Option<Vec<String>>,
+	/// The credential being rotated — `rotate` phase only.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub credential: Option<Credential>,
 }
 
 impl HookMetadata {
@@ -215,6 +235,7 @@ mod tests {
 				},
 			]),
 			remotes: None,
+			credential: None,
 		};
 		assert_eq!(
 			json_of(&meta),
@@ -247,6 +268,7 @@ mod tests {
 			output_dir: None,
 			targets: None,
 			remotes: None,
+			credential: None,
 		};
 		let v = json_of(&meta);
 		assert_eq!(v["phase"], "build");
@@ -274,6 +296,7 @@ mod tests {
 			output_dir: None,
 			targets: None,
 			remotes: None,
+			credential: None,
 		};
 		let v = json_of(&meta);
 		assert_eq!(v["revision"], "abc123-dirty");
@@ -293,6 +316,7 @@ mod tests {
 			output_dir: None,
 			targets: None,
 			remotes: Some(vec!["root@10.0.0.2".into()]),
+			credential: None,
 		};
 		let v = json_of(&meta);
 		assert_eq!(v["remotes"], json!(["root@10.0.0.2"]));
@@ -312,9 +336,32 @@ mod tests {
 			output_dir: None,
 			targets: None,
 			remotes: Some(vec!["admin@vps.example.com".into()]),
+			credential: None,
 		};
 		let v = json_of(&meta);
 		assert_eq!(v["phase"], "takeover");
 		assert_eq!(v["remotes"], json!(["admin@vps.example.com"]));
+		assert!(!v.as_object().unwrap().contains_key("credential"));
+	}
+
+	#[test]
+	fn rotate_serializes_the_credential_kebab_cased() {
+		let meta = HookMetadata {
+			phase: Phase::Rotate,
+			stage: Stage::Post,
+			image_name: "kiosk".into(),
+			arches: vec![Arch::X86_64],
+			image_ref: "registry.example.com/org/kiosk:latest".into(),
+			revision: None,
+			version: None,
+			output_dir: None,
+			targets: None,
+			remotes: Some(vec!["admin@10.0.0.2".into()]),
+			credential: Some(Credential::PullToken),
+		};
+		let v = json_of(&meta);
+		assert_eq!(v["phase"], "rotate");
+		assert_eq!(v["credential"], "pull-token");
+		assert_eq!(v["remotes"], json!(["admin@10.0.0.2"]));
 	}
 }

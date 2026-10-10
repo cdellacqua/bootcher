@@ -57,6 +57,10 @@ post = "echo 'run post-deploy smoke test'"
 [hooks.takeover]
 pre  = "echo 'snapshot hosts before conversion'"
 post = "echo 'smoke-test converted hosts'"
+
+[hooks.rotate]
+pre  = "echo 'store the new credential'"
+post = "echo 'revoke the old credential'"
 ```
 
 Each hook runs with `sh -c` from the project root. The terminal is handed over — the hook may print freely, prompt, or `sudo`. A non-zero exit aborts the run.

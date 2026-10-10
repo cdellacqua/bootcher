@@ -39,8 +39,14 @@
 //! expensive and only makes sense when a new image is actually ready to deploy. A
 //! bad key only blocks future `bootc upgrade` attempts — SSH access is always
 //! unaffected, so the fleet is always recoverable by rotating the signing key again.
+//!
+//! Every subcommand honours the manifest's `[hooks.rotate]` `pre`/`post` commands,
+//! run once around the fleet rollout (after the new credential is collected and
+//! checked locally), with the credential kind in `BOOTCHER_METADATA`'s
+//! `credential` field.
 
 use crate::context::{DEVICE_ADMIN_AUTHORIZED_KEYS, DEVICE_AUTH_JSON, Manifest, ToSsh};
+use crate::hooks::{Credential, HookMetadata, Phase, Stage};
 use crate::preflight::Checks;
 use crate::progress::Scope;
 use crate::ssh::Ssh;
@@ -82,6 +88,41 @@ fn deploy_remotes_or_bail(manifest: &Manifest, cmd: &str) -> Result<Vec<Ssh>> {
 	Ok(remotes)
 }
 
+/// Bracket a rotation's fleet rollout with the `[hooks.rotate]` `pre`/`post`
+/// commands: `pre` before `rollout` touches any device, `post` only once every
+/// device has succeeded. `credential` names the rotation for the hook metadata.
+fn with_hooks(
+	manifest: &Manifest,
+	credential: Credential,
+	remotes: &[Ssh],
+	job: &mut Scope,
+	rollout: impl FnOnce(&mut Scope) -> Result<()>,
+) -> Result<()> {
+	let hooks = manifest.hooks();
+	let mut meta = HookMetadata {
+		phase: Phase::Rotate,
+		stage: Stage::Pre,
+		image_name: manifest.general.name.clone(),
+		arches: manifest.images().iter().map(|i| i.arch).collect(),
+		// The ref the devices track as their bootc origin (the default channel in
+		// registry mode; per-device channels aren't known here).
+		image_ref: manifest
+			.registry_list_ref(crate::context::DEFAULT_CHANNEL)
+			.unwrap_or_else(|| manifest.local_list_ref()),
+		// Nothing is built, so there's no image provenance to report.
+		revision: None,
+		version: None,
+		output_dir: None,
+		targets: None,
+		remotes: Some(remotes.iter().map(|r| r.host().to_owned()).collect()),
+		credential: Some(credential),
+	};
+	crate::hooks::run(&meta, hooks.rotate.pre.as_deref(), job)?;
+	rollout(job)?;
+	meta.stage = Stage::Post;
+	crate::hooks::run(&meta, hooks.rotate.post.as_deref(), job)
+}
+
 /// Rotate the registry pull token on every configured device. Collects a fresh
 /// credential once up front (env or TTY prompt, like provision), verifies it
 /// against the registry from this machine, then per device verifies it actually
@@ -99,7 +140,7 @@ fn deploy_remotes_or_bail(manifest: &Manifest, cmd: &str) -> Result<Vec<Ssh>> {
 /// # Errors
 ///
 /// Returns an error if registry mode is not configured, no devices are set, credential
-/// collection fails, or any device's rotation fails.
+/// collection fails, a hook fails, or any device's rotation fails.
 pub fn registry_token(manifest: &Manifest, skip_pull_check: bool, job: &mut Scope) -> Result<()> {
 	let Some(ns) = manifest.registry() else {
 		bail!(
@@ -133,15 +174,17 @@ pub fn registry_token(manifest: &Manifest, skip_pull_check: bool, job: &mut Scop
 		.registry_list_ref(crate::context::DEFAULT_CHANNEL)
 		.expect("registry set ⇒ a registry ref exists");
 
-	fleet::for_each_remote(
-		&remotes,
-		"pull-token rotation",
-		manifest.concurrency().rotate,
-		job,
-		|remote, scope| {
-			verify_and_commit_token(remote, scope, &registry_ref, DEVICE_AUTH_JSON, &auth_json)
-		},
-	)
+	with_hooks(manifest, Credential::PullToken, &remotes, job, |job| {
+		fleet::for_each_remote(
+			&remotes,
+			"pull-token rotation",
+			manifest.concurrency().rotate,
+			job,
+			|remote, scope| {
+				verify_and_commit_token(remote, scope, &registry_ref, DEVICE_AUTH_JSON, &auth_json)
+			},
+		)
+	})
 }
 
 /// Verify the candidate `auth.json` on `remote`, then commit it to `path` — all
@@ -201,29 +244,31 @@ const KEY_VALIDATE_ATTEMPTS: usize = 3;
 ///
 /// # Errors
 ///
-/// Returns an error if no devices are configured, key collection fails, or any
-/// device's rotation fails.
+/// Returns an error if no devices are configured, key collection fails, a hook
+/// fails, or any device's rotation fails.
 pub fn ssh_key(manifest: &Manifest, key: Option<&str>, job: &mut Scope) -> Result<()> {
 	let remotes = deploy_remotes_or_bail(manifest, "ssh-key")?;
 
 	// Collect the new key; may run the interactive picker on a TTY.
 	let (authorized_keys, key_path) = secrets::collect_authorized_keys(key)?;
 
-	fleet::for_each_remote(
-		&remotes,
-		"admin-key rotation",
-		manifest.concurrency().rotate,
-		job,
-		|remote, scope| {
-			verify_and_commit_key(
-				remote,
-				scope,
-				DEVICE_ADMIN_AUTHORIZED_KEYS,
-				&authorized_keys,
-				&key_path,
-			)
-		},
-	)
+	with_hooks(manifest, Credential::SshKey, &remotes, job, |job| {
+		fleet::for_each_remote(
+			&remotes,
+			"admin-key rotation",
+			manifest.concurrency().rotate,
+			job,
+			|remote, scope| {
+				verify_and_commit_key(
+					remote,
+					scope,
+					DEVICE_ADMIN_AUTHORIZED_KEYS,
+					&authorized_keys,
+					&key_path,
+				)
+			},
+		)
+	})
 }
 
 /// Push the image-signing config to every configured device. Registry mode only;
@@ -245,7 +290,7 @@ pub fn ssh_key(manifest: &Manifest, key: Option<&str>, job: &mut Scope) -> Resul
 /// # Errors
 ///
 /// Returns an error if registry/signing mode is not configured, key collection fails,
-/// or any device's update fails.
+/// a hook fails, or any device's update fails.
 pub fn signing_key(manifest: &Manifest, pubkey: Option<&str>, job: &mut Scope) -> Result<()> {
 	let Some(ns) = manifest.registry() else {
 		bail!(
@@ -278,20 +323,22 @@ pub fn signing_key(manifest: &Manifest, pubkey: Option<&str>, job: &mut Scope) -
 		&registries_d,
 	);
 
-	fleet::for_each_remote(
-		&remotes,
-		"sign-key rotation",
-		manifest.concurrency().rotate,
-		job,
-		|remote, scope| {
-			remote.run_sh(
-				scope,
-				format!("replace signing key on {}", remote.host()),
-				&[],
-				script.clone(),
-			)
-		},
-	)
+	with_hooks(manifest, Credential::SignKey, &remotes, job, |job| {
+		fleet::for_each_remote(
+			&remotes,
+			"sign-key rotation",
+			manifest.concurrency().rotate,
+			job,
+			|remote, scope| {
+				remote.run_sh(
+					scope,
+					format!("replace signing key on {}", remote.host()),
+					&[],
+					script.clone(),
+				)
+			},
+		)
+	})
 }
 
 /// Read a public-key PEM from `path`, with a pointer to enroll on a miss.

@@ -109,6 +109,7 @@ pub(crate) fn run(
 		output_dir: Some(PathBuf::from("output")),
 		targets: Some(target_meta(&targets, false)),
 		remotes: None,
+		credential: None,
 	};
 	crate::hooks::run(&meta, hooks.disk.pre.as_deref(), job)?;
 

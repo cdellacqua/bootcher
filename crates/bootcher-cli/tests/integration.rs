@@ -420,6 +420,10 @@ fn init_scaffolds_commented_hooks_examples() {
 		"manifest documents the takeover hook: {manifest}"
 	);
 	assert!(
+		manifest.contains("# [hooks.rotate]"),
+		"manifest documents the rotate hook: {manifest}"
+	);
+	assert!(
 		!manifest.lines().any(|l| l.trim().starts_with("[hooks")),
 		"a hookless project must not ship a live [hooks.*] table: {manifest}",
 	);

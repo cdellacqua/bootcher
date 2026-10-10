@@ -70,7 +70,7 @@ const HOOKS_EXAMPLE: &str = "\
 # a non-zero exit aborts the run. Each phase has an optional pre/post pair, and
 # fires wherever that phase runs (build also during provision/deploy, image also
 # during provision, upgrade also during deploy, takeover with or without
-# --skip-build).
+# --skip-build, rotate for every rotate subcommand).
 #
 # Each hook gets a BOOTCHER_METADATA env var (JSON) describing the phase and the
 # artifacts it concerns — e.g. disk.post lists each built disk's resolved path, so
@@ -90,6 +90,10 @@ const HOOKS_EXAMPLE: &str = "\
 # post = \"echo REPLACEME\"
 #
 # [hooks.takeover]  # around the takeover transfer + per-host in-place conversion
+# pre  = \"echo REPLACEME\"
+# post = \"echo REPLACEME\"
+#
+# [hooks.rotate]    # around the per-device credential rollout (every `rotate` subcommand)
 # pre  = \"echo REPLACEME\"
 # post = \"echo REPLACEME\"
 ";

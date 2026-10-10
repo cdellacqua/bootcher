@@ -905,6 +905,8 @@ impl ConcurrencyConfig {
 ///   to `upgrade` and `deploy`.
 /// - `[hooks.takeover]` wraps the image transfer + per-host in-place conversion,
 ///   so it applies to `takeover` (with or without `--skip-build`).
+/// - `[hooks.rotate]` wraps the per-device credential rollout, so it applies to
+///   every `rotate` subcommand (`pull-token`, `ssh-key`, `sign-key`).
 ///
 /// Every table and key is optional; an absent one is no hook. Each is
 /// `skip_serializing_if`-empty so a hookless project serializes no `[hooks]`
@@ -926,6 +928,10 @@ pub struct Hooks {
 	/// (`takeover`).
 	#[serde(default, skip_serializing_if = "HookPair::is_empty")]
 	pub takeover: HookPair,
+	/// Hooks around the per-device credential rollout (`rotate pull-token` /
+	/// `ssh-key` / `sign-key`).
+	#[serde(default, skip_serializing_if = "HookPair::is_empty")]
+	pub rotate: HookPair,
 }
 
 /// A `[hooks.<phase>]` table: the optional `pre` command run before a phase and
@@ -960,6 +966,7 @@ impl Hooks {
 			&& self.disk.is_empty()
 			&& self.upgrade.is_empty()
 			&& self.takeover.is_empty()
+			&& self.rotate.is_empty()
 	}
 }
 
@@ -2074,7 +2081,8 @@ mod tests {
 			"[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n\
 			 [hooks.build]\npre = \"a.sh\"\n\
 			 [hooks.disk]\npost = \"b.sh\"\n\
-			 [hooks.takeover]\npre = \"c.sh\"\n",
+			 [hooks.takeover]\npre = \"c.sh\"\n\
+			 [hooks.rotate]\npost = \"d.sh\"\n",
 		);
 		assert!(!m.hooks().is_empty());
 		assert_eq!(m.hooks().build.pre.as_deref(), Some("a.sh"));
@@ -2084,6 +2092,8 @@ mod tests {
 		assert!(m.hooks().upgrade.is_empty());
 		assert_eq!(m.hooks().takeover.pre.as_deref(), Some("c.sh"));
 		assert!(m.hooks().takeover.post.is_none());
+		assert_eq!(m.hooks().rotate.post.as_deref(), Some("d.sh"));
+		assert!(m.hooks().rotate.pre.is_none());
 	}
 
 	#[test]

@@ -293,6 +293,7 @@ pub(crate) fn run(
 		output_dir: None,
 		targets: None,
 		remotes: Some(targets.iter().map(|t| t.host.clone()).collect()),
+		credential: None,
 	};
 	crate::hooks::run(&meta, hooks.takeover.pre.as_deref(), job)?;
 	if let Some(channel_ref) = manifest.registry_list_ref(channel)

@@ -62,6 +62,10 @@ remotes = []               # SSH targets: "admin@host" or { remote = "...", ssh_
 # [hooks.takeover]
 # pre  = "sh snapshot-hosts.sh"
 # post = "sh smoke-test.sh"
+
+# [hooks.rotate]
+# pre  = "sh store-credential.sh"
+# post = "sh revoke-old-credential.sh"
 ```
 
 ---
@@ -340,6 +344,7 @@ Because of this, **a `bootcher.toml` is executable content**, not inert configur
 | `[hooks.disk]` | image-builder disk-image step (`disk`, `provision`) |
 | `[hooks.upgrade]` | Push + `bootc upgrade` per device (`upgrade`, `deploy`) |
 | `[hooks.takeover]` | Image transfer + in-place conversion per host (`takeover`) |
+| `[hooks.rotate]` | Per-device credential rollout (`rotate pull-token`, `rotate ssh-key`, `rotate sign-key`) |
 
 Each `[hooks.<phase>]` table accepts `pre` and/or `post` string keys. Absent keys are no-ops.
 
@@ -349,7 +354,7 @@ Every hook is run with a single environment variable, `BOOTCHER_METADATA`, holdi
 
 ```jsonc
 {
-  "phase": "disk",            // "build" | "disk" | "upgrade" | "takeover"
+  "phase": "disk",            // "build" | "disk" | "upgrade" | "takeover" | "rotate"
   "stage": "post",            // "pre" | "post"
   "image_name": "kiosk",
   "arches": ["x86_64", "aarch64"],
@@ -364,8 +369,11 @@ Every hook is run with a single environment variable, `BOOTCHER_METADATA`, holdi
     { "arch": "aarch64", "disk_type": "raw",   "dir": "output/aarch64/raw",  "file": "output/aarch64/raw/disk.raw"    }
   ],
 
-  // upgrade / takeover phases only:
-  "remotes": ["root@10.0.0.2"]
+  // upgrade / takeover / rotate phases only:
+  "remotes": ["root@10.0.0.2"],
+
+  // rotate phase only:
+  "credential": "ssh-key"     // "pull-token" | "ssh-key" | "sign-key"
 }
 ```
 
@@ -374,12 +382,13 @@ Every hook is run with a single environment variable, `BOOTCHER_METADATA`, holdi
 | `phase`, `stage` | all | branch a shared script on `"\(.phase).\(.stage)"` |
 | `image_name` | all | `[general] name` |
 | `arches` | all | the `[targets]` keys |
-| `image_ref` | all | suffix-free ref: local list ref at `build`, bootc-origin source ref at `disk`, pushed/served list ref at `upgrade` / `takeover` |
-| `revision` | all | git commit the image was built from (`git rev-parse HEAD`, `-dirty`-suffixed for an uncommitted tree); the `org.opencontainers.image.revision` label stamped on the container. Omitted outside a git work tree |
-| `version` | all | human build description (`git describe --tags --always --dirty`: nearest tag, else short SHA); the `org.opencontainers.image.version` label. Omitted outside a git work tree |
+| `image_ref` | all | suffix-free ref: local list ref at `build`, bootc-origin source ref at `disk`, pushed/served list ref at `upgrade` / `takeover`, the devices' bootc-origin ref (default channel) at `rotate` |
+| `revision` | all but rotate | git commit the image was built from (`git rev-parse HEAD`, `-dirty`-suffixed for an uncommitted tree); the `org.opencontainers.image.revision` label stamped on the container. Omitted outside a git work tree, and at `rotate` (nothing is built) |
+| `version` | all but rotate | human build description (`git describe --tags --always --dirty`: nearest tag, else short SHA); the `org.opencontainers.image.version` label. Omitted outside a git work tree, and at `rotate` |
 | `output_dir` | disk | base output dir, relative to the project root |
 | `targets[]` | disk | the `(arch × disk_type)` build matrix; `file` is the resolved `disk.<ext>`, present only at `disk.post` (and omitted if a dir doesn't hold exactly one `disk.*` — fall back to `dir`) |
-| `remotes[]` | upgrade, takeover | the `[deploy] remotes` ssh targets; at `upgrade`, omitted in pure-registry mode with no remotes; at `takeover`, always set, as the post-takeover `admin@host` |
+| `remotes[]` | upgrade, takeover, rotate | the `[deploy] remotes` ssh targets; at `upgrade`, omitted in pure-registry mode with no remotes; at `takeover`, always set, as the post-takeover `admin@host`; at `rotate`, always set |
+| `credential` | rotate | the `rotate` subcommand: `pull-token`, `ssh-key` or `sign-key` |
 
 Paths are relative to the project root (the hook's working directory). A `disk.post` recipe walks the matrix straight from the JSON — e.g. embedding Raspberry Pi firmware into the aarch64 raw image:
 
