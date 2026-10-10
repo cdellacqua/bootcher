@@ -105,6 +105,7 @@ pub fn run(manifest: &Manifest, target: Option<Arch>, job: &mut Scope) -> Result
 		targets: None,
 		remotes: None,
 		credential: None,
+		results: None,
 	};
 	crate::hooks::run(&meta, hooks.build.pre.as_deref(), job)?;
 	crate::fleet::for_each(

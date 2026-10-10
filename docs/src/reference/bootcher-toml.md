@@ -334,7 +334,9 @@ Each value must be ≥ 1. Setting a cap only ever lowers the pool — it is boun
 
 ## `[hooks.<phase>]`
 
-Pre/post shell commands wrapping a build phase. Each hook is run with `sh -c` from the project root; a non-zero exit aborts the run.
+Pre/post shell commands wrapping a phase. Each hook is run with `sh -c` from the project root; a non-zero exit aborts the run.
+
+A `post` hook runs once its phase succeeded — except on the device-fleet phases (`upgrade`, `takeover`, `rotate`), where it runs once every device has been attempted, even if some failed, with each device's outcome in `BOOTCHER_METADATA`'s `results`; the run still fails afterwards if any device did. A failure before any device is attempted (e.g. the registry push) still aborts without `post`.
 
 Because of this, **a `bootcher.toml` is executable content**, not inert configuration: a hook runs with the privileges of the phase it brackets, and `[hooks.disk]` brackets a step that runs under `sudo`. Treat a manifest from somewhere else — a recipe you copied, a colleague's project, a repository you just cloned — exactly as you would treat their `Makefile`, and read its hooks before the first run.
 
@@ -373,7 +375,13 @@ Every hook is run with a single environment variable, `BOOTCHER_METADATA`, holdi
   "remotes": ["root@10.0.0.2"],
 
   // rotate phase only:
-  "credential": "ssh-key"     // "pull-token" | "ssh-key" | "sign-key"
+  "credential": "ssh-key",    // "pull-token" | "ssh-key" | "sign-key"
+
+  // post stage of upgrade / takeover / rotate only:
+  "results": [
+    { "host": "admin@10.0.0.2", "ok": true },
+    { "host": "admin@10.0.0.3", "ok": false, "error": "ssh: connect to host 10.0.0.3 port 22: Connection timed out" }
+  ]
 }
 ```
 
@@ -389,6 +397,7 @@ Every hook is run with a single environment variable, `BOOTCHER_METADATA`, holdi
 | `targets[]` | disk | the `(arch × disk_type)` build matrix; `file` is the resolved `disk.<ext>`, present only at `disk.post` (and omitted if a dir doesn't hold exactly one `disk.*` — fall back to `dir`) |
 | `remotes[]` | upgrade, takeover, rotate | the `[deploy] remotes` ssh targets; at `upgrade`, omitted in pure-registry mode with no remotes; at `takeover`, always set, as the post-takeover `admin@host`; at `rotate`, always set |
 | `credential` | rotate | the `rotate` subcommand: `pull-token`, `ssh-key` or `sign-key` |
+| `results[]` | upgrade, takeover, rotate (`post` only) | each device's outcome in `[deploy] remotes` order: `host`, `ok`, and `error` (only when `ok` is false). Empty when no device was attempted (a registry `upgrade` with no remotes, or `--skip-bootc-upgrade`) |
 
 Paths are relative to the project root (the hook's working directory). A `disk.post` recipe walks the matrix straight from the JSON — e.g. embedding Raspberry Pi firmware into the aarch64 raw image:
 

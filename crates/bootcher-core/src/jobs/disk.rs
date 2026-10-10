@@ -110,6 +110,7 @@ pub(crate) fn run(
 		targets: Some(target_meta(&targets, false)),
 		remotes: None,
 		credential: None,
+		results: None,
 	};
 	crate::hooks::run(&meta, hooks.disk.pre.as_deref(), job)?;
 

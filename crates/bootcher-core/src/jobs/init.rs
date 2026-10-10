@@ -63,14 +63,17 @@ const BUILDER_OVERRIDE_EXAMPLE: &str = "\
 /// live table so a fresh project has *no* hooks until the user opts in.
 const HOOKS_EXAMPLE: &str = "\
 # Lifecycle hooks (optional): shell commands bootcher runs around its phases —
-# the container build, the disk-image step, and the deploy upgrade. This is the
+# the container build, the disk-image step, the deploy upgrade, the takeover, and
+# the credential rotation. This is the
 # extension point for board- or project-specific work; bootcher itself stays
 # generic. Each command runs with `sh -c` from this directory, with the progress
 # UI suspended and the terminal handed over (so it can print, prompt, or `sudo`);
 # a non-zero exit aborts the run. Each phase has an optional pre/post pair, and
 # fires wherever that phase runs (build also during provision/deploy, image also
 # during provision, upgrade also during deploy, takeover with or without
-# --skip-build, rotate for every rotate subcommand).
+# --skip-build, rotate for every rotate subcommand). A post hook runs once its
+# phase succeeded; on the fleet phases (upgrade, takeover, rotate) it runs even
+# after a partial failure, with each device's outcome in the metadata `results`.
 #
 # Each hook gets a BOOTCHER_METADATA env var (JSON) describing the phase and the
 # artifacts it concerns — e.g. disk.post lists each built disk's resolved path, so

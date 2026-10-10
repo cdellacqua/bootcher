@@ -247,8 +247,9 @@ fn evaluate_probe(out: &str) -> HostReadiness {
 ///
 /// The manifest's `[hooks.takeover]` `pre`/`post` commands run once around the
 /// whole push + per-host rollout — so they fire with or without `--skip-build`.
-/// The `pre` hook runs after the targets resolve but before the push; `post` only
-/// after every host has finished.
+/// The `pre` hook runs after the targets resolve but before the push; `post` after
+/// every host has finished, even if some failed (each host's outcome in its
+/// metadata `results`) — the run still fails afterwards if any host did.
 ///
 /// # Errors
 ///
@@ -294,9 +295,10 @@ pub(crate) fn run(
 		targets: None,
 		remotes: Some(targets.iter().map(|t| t.host.clone()).collect()),
 		credential: None,
+		results: None,
 	};
 	crate::hooks::run(&meta, hooks.takeover.pre.as_deref(), job)?;
-	if let Some(channel_ref) = manifest.registry_list_ref(channel)
+	let report = if let Some(channel_ref) = manifest.registry_list_ref(channel)
 		&& let Some(version_ref) = manifest.registry_version_ref(&calver)
 	{
 		// Registry mode: the host pulls the ref directly, so it must be in the registry
@@ -311,7 +313,7 @@ pub(crate) fn run(
 		)?;
 		let auth_json = files.iter().find(|f| f.path == DEVICE_AUTH_JSON).map(|f| f.data.as_str());
 		let backend = Backend::Registry { reference: &channel_ref, auth_json };
-		run_fleet(&targets, &backend, &files, yes, max_workers, job)?;
+		run_fleet(&targets, &backend, &files, yes, max_workers, job)?
 	} else {
 		// LAN mode: stand up one loopback registry for the whole fleet (it handles
 		// concurrent pulls) and tear it down once every host has finished. The list
@@ -322,10 +324,9 @@ pub(crate) fn run(
 			Backend::Lan { images: &images, local_list_ref: &local_list_ref, port: reg.port() };
 		let result = run_fleet(&targets, &backend, &files, yes, max_workers, job);
 		drop(reg);
-		result?;
-	}
-	meta.stage = Stage::Post;
-	crate::hooks::run(&meta, hooks.takeover.post.as_deref(), job)
+		result?
+	};
+	crate::hooks::run_post(&mut meta, hooks.takeover.post.as_deref(), &report, job)
 }
 
 /// How a host obtains the image into its containers-storage. The two backends from
@@ -368,7 +369,8 @@ fn resolve_targets(
 }
 
 /// Apply [`takeover_host`] to every target in parallel (its own `[concurrency]
-/// takeover` cap), attempting all and naming any laggards (see [`fleet::for_each`]).
+/// takeover` cap), attempting all and returning each host's outcome (see
+/// [`fleet::for_each_host`]) for the caller to raise after its `post` hook.
 fn run_fleet(
 	targets: &[Target],
 	backend: &Backend,
@@ -376,10 +378,9 @@ fn run_fleet(
 	yes: bool,
 	max_workers: Option<NonZeroUsize>,
 	job: &mut Scope,
-) -> Result<()> {
-	fleet::for_each(
+) -> Result<fleet::Report> {
+	fleet::for_each_host(
 		targets,
-		"host",
 		"takeover",
 		|t| t.host.clone(),
 		max_workers,

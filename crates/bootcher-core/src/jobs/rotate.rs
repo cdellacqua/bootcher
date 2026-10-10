@@ -43,7 +43,9 @@
 //! Every subcommand honours the manifest's `[hooks.rotate]` `pre`/`post` commands,
 //! run once around the fleet rollout (after the new credential is collected and
 //! checked locally), with the credential kind in `BOOTCHER_METADATA`'s
-//! `credential` field.
+//! `credential` field. `post` runs even if some devices failed, with each
+//! device's outcome in `results` — e.g. to revoke the old credential only where
+//! the new one landed.
 
 use crate::context::{DEVICE_ADMIN_AUTHORIZED_KEYS, DEVICE_AUTH_JSON, Manifest, ToSsh};
 use crate::hooks::{Credential, HookMetadata, Phase, Stage};
@@ -89,14 +91,15 @@ fn deploy_remotes_or_bail(manifest: &Manifest, cmd: &str) -> Result<Vec<Ssh>> {
 }
 
 /// Bracket a rotation's fleet rollout with the `[hooks.rotate]` `pre`/`post`
-/// commands: `pre` before `rollout` touches any device, `post` only once every
-/// device has succeeded. `credential` names the rotation for the hook metadata.
+/// commands: `pre` before `rollout` touches any device, `post` once every device
+/// has finished, even if some failed (see [`crate::hooks::run_post`]).
+/// `credential` names the rotation for the hook metadata.
 fn with_hooks(
 	manifest: &Manifest,
 	credential: Credential,
 	remotes: &[Ssh],
 	job: &mut Scope,
-	rollout: impl FnOnce(&mut Scope) -> Result<()>,
+	rollout: impl FnOnce(&mut Scope) -> Result<fleet::Report>,
 ) -> Result<()> {
 	let hooks = manifest.hooks();
 	let mut meta = HookMetadata {
@@ -116,11 +119,11 @@ fn with_hooks(
 		targets: None,
 		remotes: Some(remotes.iter().map(|r| r.host().to_owned()).collect()),
 		credential: Some(credential),
+		results: None,
 	};
 	crate::hooks::run(&meta, hooks.rotate.pre.as_deref(), job)?;
-	rollout(job)?;
-	meta.stage = Stage::Post;
-	crate::hooks::run(&meta, hooks.rotate.post.as_deref(), job)
+	let report = rollout(job)?;
+	crate::hooks::run_post(&mut meta, hooks.rotate.post.as_deref(), &report, job)
 }
 
 /// Rotate the registry pull token on every configured device. Collects a fresh

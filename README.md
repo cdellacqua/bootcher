@@ -179,6 +179,12 @@ Each command is run with `sh -c` from the project root, with bootcher's progress
 UI suspended and the terminal handed over — so a hook may print freely, prompt, or
 `sudo` for the steps that need root. A non-zero exit aborts the run.
 
+A `post` hook runs once its phase succeeded — except on the phases that act on
+the whole fleet (`upgrade`, `takeover`, `rotate`), where it runs once every device
+has been attempted, even if some failed. Each device's outcome is in
+`BOOTCHER_METADATA`'s `results`, and the run still fails afterwards if any device
+did.
+
 The hooks fire wherever the phase runs, so they apply across the shortcuts too:
 `[hooks.build]` wraps the container build (`build`, `provision`, `deploy`);
 `[hooks.disk]` wraps the disk build (`disk`, `provision`); `[hooks.upgrade]`

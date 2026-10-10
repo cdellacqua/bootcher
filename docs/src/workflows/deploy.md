@@ -65,6 +65,8 @@ post = "echo 'revoke the old credential'"
 
 Each hook runs with `sh -c` from the project root. The terminal is handed over — the hook may print freely, prompt, or `sudo`. A non-zero exit aborts the run.
 
+A `post` hook runs once its phase succeeded — except on the device-fleet phases (`upgrade`, `takeover`, `rotate`), where it runs once every device has been attempted, even if some failed, with each device's outcome in `BOOTCHER_METADATA`'s `results`; the run still fails afterwards if any device did.
+
 ## Continuous deployment
 
 `deploy` (push an update to the registry) and `provision` (build a disk artifact)

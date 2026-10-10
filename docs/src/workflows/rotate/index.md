@@ -7,7 +7,7 @@ All `rotate` subcommands:
 - Target the `[deploy] remotes` devices listed in `bootcher.toml`.
 - Run the fleet in parallel (up to `[concurrency] rotate` workers).
 - Attempt every device even when some fail, collecting all errors before returning.
-- Run the [`[hooks.rotate]`](../../reference/bootcher-toml.md#hooksphase) `pre`/`post` commands once around the rollout — `pre` after the new credential is collected and checked locally, `post` only once every device has succeeded. The hook's `BOOTCHER_METADATA` names the subcommand in `credential` (`pull-token` / `ssh-key` / `sign-key`).
+- Run the [`[hooks.rotate]`](../../reference/bootcher-toml.md#hooksphase) `pre`/`post` commands once around the rollout — `pre` after the new credential is collected and checked locally, `post` once every device has been attempted, even if some failed, with each device's outcome in [`results`](../../reference/bootcher-toml.md#bootcher_metadata) (e.g. to revoke the old credential only where the new one landed); the run still fails afterwards if any device did. The hook's `BOOTCHER_METADATA` names the subcommand in `credential` (`pull-token` / `ssh-key` / `sign-key`).
 - Never brick a device: `rotate key` keeps the old SSH key live until the new one is proven by a fresh login; `rotate pull-token` verifies the token can actually pull before committing it. The only exception is `rotate sign-key`, which writes directly without a post-write check — verifying a new signing key would require pulling and staging an image signed with it, which is expensive and only makes sense when a new image is actually ready to deploy; a bad key only blocks future upgrades, SSH access is always unaffected and can be used to rotate the signing key again.
 
 ## Subcommands

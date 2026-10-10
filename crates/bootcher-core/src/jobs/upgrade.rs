@@ -60,8 +60,9 @@ pub(crate) fn preflight(manifest: &Manifest, skip_bootc_upgrade: bool) -> Result
 /// `hooks` carries the manifest's `[hooks.upgrade]` `pre`/`post` commands, run
 /// once around the whole push + per-device rollout — so they fire for `deploy`
 /// (which calls this, with or without `--skip-build`). The `pre` hook runs after
-/// the target-arch check but before the push; `post` only after every device has
-/// finished.
+/// the target-arch check but before the push; `post` after every device has
+/// finished, even if some failed (each device's outcome in its metadata
+/// `results`) — the run still fails afterwards if any device did.
 ///
 /// `max_workers` is the manifest's `[concurrency] upgrade` cap (`None` =
 /// unbounded), bounding how many devices roll out at once.
@@ -102,9 +103,10 @@ pub(crate) fn run(
 		targets: None,
 		remotes: (!remote_hosts.is_empty()).then_some(remote_hosts),
 		credential: None,
+		results: None,
 	};
 	crate::hooks::run(&meta, hooks.upgrade.pre.as_deref(), job)?;
-	if let Some(channel_ref) = manifest.registry_list_ref(channel)
+	let report = if let Some(channel_ref) = manifest.registry_list_ref(channel)
 	// The immutable companion tag for this push (see `run_registry`); both refs
 	// come from the manifest, not any one arch's image.
 	 && let Some(version_ref) = manifest.registry_version_ref(&calver)
@@ -118,7 +120,7 @@ pub(crate) fn run(
 			manifest.concurrency().upgrade,
 			skip_bootc_upgrade,
 			job,
-		)?;
+		)?
 	} else if remotes.is_empty() {
 		bail!(
 			"LAN deploys need at least one target in the `[deploy] remotes` array \
@@ -126,16 +128,9 @@ pub(crate) fn run(
 			 to push to a registry without one"
 		);
 	} else {
-		run_lan(
-			&images,
-			&manifest.local_list_ref(),
-			&remotes,
-			manifest.concurrency().upgrade,
-			job,
-		)?;
-	}
-	meta.stage = Stage::Post;
-	crate::hooks::run(&meta, hooks.upgrade.post.as_deref(), job)
+		run_lan(&images, &manifest.local_list_ref(), &remotes, manifest.concurrency().upgrade, job)?
+	};
+	crate::hooks::run_post(&mut meta, hooks.upgrade.post.as_deref(), &report, job)
 }
 
 /// Registry backend: assemble the per-arch members into one multi-arch manifest
@@ -147,7 +142,8 @@ pub(crate) fn run(
 /// remotes the push is the whole job — every target's auto-update timer fetches
 /// the new revision (and resolves its own arch out of the list) on its own. The
 /// first switch is idempotent against a registry-mode provision (origin already
-/// the ref).
+/// the ref). Returns the per-device [`fleet::Report`] (empty when no device was
+/// switched), failures included, for the caller to raise after its `post` hook.
 fn run_registry(
 	local_list_ref: &str,
 	// `(channel_ref, version_ref)`: the run's mutable channel tag (`:latest` by
@@ -159,7 +155,7 @@ fn run_registry(
 	max_workers: Option<NonZeroUsize>,
 	skip_bootc_upgrade: bool,
 	job: &mut Scope,
-) -> Result<()> {
+) -> Result<fleet::Report> {
 	let (channel_ref, version_ref) = refs;
 	let enforce_sig = push_multiarch_list(local_list_ref, channel_ref, version_ref, signing, job)?;
 
@@ -168,7 +164,7 @@ fn run_registry(
 			"pushed {channel_ref} (also tagged {version_ref}) — targets will pull it on their next \
 			 auto-update; add a target to `[deploy] remotes` to apply it immediately"
 		));
-		return Ok(());
+		return Ok(fleet::Report::empty("upgrade", "device"));
 	}
 
 	// Apply to every listed device in parallel, attempting all (see `fleet`).
@@ -287,14 +283,15 @@ fn apply_registry(
 
 /// LAN backend: ship to and reboot each listed device in turn. Each device is a
 /// single arch, identified over ssh, so it gets the matching member out of
-/// `images`.
+/// `images`. Returns the per-device [`fleet::Report`], failures included, like
+/// [`run_registry`].
 fn run_lan(
 	images: &[ImageRef],
 	local_list_ref: &str,
 	remotes: &[Ssh],
 	max_workers: Option<NonZeroUsize>,
 	job: &mut Scope,
-) -> Result<()> {
+) -> Result<fleet::Report> {
 	// Serve the multi-arch list (assembled by the build phase) once, from a single
 	// loopback registry shared by the whole fleet (it handles concurrent pulls),
 	// rather than standing one up per device. Each device pulls the suffix-free

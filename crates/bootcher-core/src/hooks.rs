@@ -16,6 +16,14 @@
 //! its duration and may print freely, prompt, or `sudo`. A non-zero exit aborts
 //! the surrounding step.
 //!
+//! A `post` hook normally runs only once its phase succeeded. The device-fleet
+//! phases (`upgrade`, `takeover`, `rotate`) are the exception: their `post` runs
+//! once the per-device rollout has run *whatever its outcome* — a device that
+//! failed doesn't undo the ones that succeeded — with each device's outcome in
+//! [`HookMetadata::results`], and the run fails afterwards if any device did (see
+//! [`run_post`]). A failure before any device is attempted (e.g. the registry
+//! push) still aborts without `post`.
+//!
 //! ## The `BOOTCHER_METADATA` contract
 //!
 //! Every hook is handed a single `BOOTCHER_METADATA` environment variable holding
@@ -34,8 +42,9 @@
 //! ```
 
 use crate::context::{Arch, DiskType};
+use crate::fleet::{Outcome, Report};
 use crate::progress::Scope;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -141,6 +150,12 @@ pub(crate) struct HookMetadata {
 	/// The credential being rotated — `rotate` phase only.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub credential: Option<Credential>,
+	/// Each device's outcome, in `[deploy] remotes` order — `post` stage of the
+	/// `upgrade`, `takeover` and `rotate` phases only, which run `post` even after a
+	/// partial failure. Empty when the rollout attempted no device (e.g. a
+	/// registry-mode `upgrade` with no remotes, which only pushes).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub results: Option<Vec<Outcome>>,
 }
 
 impl HookMetadata {
@@ -200,6 +215,31 @@ pub(crate) fn run(meta: &HookMetadata, command: Option<&str>, job: &Scope) -> Re
 	Ok(())
 }
 
+/// Close a device-fleet phase: flip `meta` to `post`, attach `report`'s
+/// per-device outcomes as [`HookMetadata::results`], run the `post` hook
+/// `command`, then raise the rollout's verdict ([`Report::finish`]). So `post`
+/// runs on a partial failure too, and the run still fails if any device did.
+///
+/// # Errors
+///
+/// Returns an error if any device failed, the hook failed, or both (the two
+/// combined into one message).
+pub(crate) fn run_post(
+	meta: &mut HookMetadata,
+	command: Option<&str>,
+	report: &Report,
+	job: &Scope,
+) -> Result<()> {
+	meta.stage = Stage::Post;
+	meta.results = Some(report.outcomes().to_vec());
+	let hook = run(meta, command, job);
+	match (report.finish(job), hook) {
+		(Ok(()), hook) => hook,
+		(Err(fleet), Ok(())) => Err(fleet),
+		(Err(fleet), Err(hook)) => Err(anyhow!("{fleet:#}; then {hook:#}")),
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -236,6 +276,7 @@ mod tests {
 			]),
 			remotes: None,
 			credential: None,
+			results: None,
 		};
 		assert_eq!(
 			json_of(&meta),
@@ -269,6 +310,7 @@ mod tests {
 			targets: None,
 			remotes: None,
 			credential: None,
+			results: None,
 		};
 		let v = json_of(&meta);
 		assert_eq!(v["phase"], "build");
@@ -297,6 +339,7 @@ mod tests {
 			targets: None,
 			remotes: None,
 			credential: None,
+			results: None,
 		};
 		let v = json_of(&meta);
 		assert_eq!(v["revision"], "abc123-dirty");
@@ -317,6 +360,7 @@ mod tests {
 			targets: None,
 			remotes: Some(vec!["root@10.0.0.2".into()]),
 			credential: None,
+			results: None,
 		};
 		let v = json_of(&meta);
 		assert_eq!(v["remotes"], json!(["root@10.0.0.2"]));
@@ -337,6 +381,7 @@ mod tests {
 			targets: None,
 			remotes: Some(vec!["admin@vps.example.com".into()]),
 			credential: None,
+			results: None,
 		};
 		let v = json_of(&meta);
 		assert_eq!(v["phase"], "takeover");
@@ -358,10 +403,40 @@ mod tests {
 			targets: None,
 			remotes: Some(vec!["admin@10.0.0.2".into()]),
 			credential: Some(Credential::PullToken),
+			results: None,
 		};
 		let v = json_of(&meta);
 		assert_eq!(v["phase"], "rotate");
 		assert_eq!(v["credential"], "pull-token");
 		assert_eq!(v["remotes"], json!(["admin@10.0.0.2"]));
+		assert!(!v.as_object().unwrap().contains_key("results"));
+	}
+
+	#[test]
+	fn fleet_post_lists_each_outcome_with_errors_only_on_failures() {
+		let meta = HookMetadata {
+			phase: Phase::Upgrade,
+			stage: Stage::Post,
+			image_name: "kiosk".into(),
+			arches: vec![Arch::X86_64],
+			image_ref: "registry.example.com/org/kiosk:latest".into(),
+			revision: None,
+			version: None,
+			output_dir: None,
+			targets: None,
+			remotes: Some(vec!["admin@a".into(), "admin@b".into()]),
+			credential: None,
+			results: Some(vec![
+				Outcome { host: "admin@a".into(), ok: true, error: None },
+				Outcome { host: "admin@b".into(), ok: false, error: Some("ssh: timed out".into()) },
+			]),
+		};
+		assert_eq!(
+			json_of(&meta)["results"],
+			json!([
+				{ "host": "admin@a", "ok": true },
+				{ "host": "admin@b", "ok": false, "error": "ssh: timed out" }
+			])
+		);
 	}
 }
