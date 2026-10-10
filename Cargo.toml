@@ -3,7 +3,7 @@ members = ["crates/bootcher-core", "crates/bootcher-cli", "crates/xtask"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.4"
+version = "0.1.5"
 authors = ["Carlo Dell'Acqua <carlo.dellacqua97@gmail.com>"]
 edition = "2024"
 license = "MIT"
