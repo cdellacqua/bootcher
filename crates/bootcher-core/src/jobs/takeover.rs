@@ -89,6 +89,21 @@ echo \"fstype=$(findmnt -no FSTYPE / 2>/dev/null || true)\"
 echo \"bootc=$(command -v bootc >/dev/null 2>&1 && sudo bootc status >/dev/null 2>&1 && echo yes || echo no)\"
 ";
 
+/// Sets `$generic` to `--generic-image` on a legacy-BIOS host whose root disk(s)
+/// carry an ESP (GPT type GUID, or MBR type `0xef`), empty otherwise — see
+/// [`install_to_existing_root`]. `findmnt -v` drops a btrfs `[/subvol]` suffix;
+/// `lsblk -s` walks up from the root device (through LVM/LUKS) to its disk(s).
+const GENERIC_IMAGE_SH: &str = "\
+generic=
+if [ ! -d /sys/firmware/efi ]; then
+  for disk in $(lsblk -nrpso NAME,TYPE \"$(findmnt -nvo SOURCE /)\" | awk '$2 == \"disk\" { print $1 }'); do
+    if lsblk -nrpo PARTTYPE \"$disk\" | grep -qixE 'c12a7328-f81f-11d2-ba4b-00a0c93ec93b|0xef'; then
+      generic=--generic-image
+    fi
+  done
+fi
+";
+
 /// Verdict for one host's readiness, from [`evaluate_probe`].
 #[derive(Debug, PartialEq, Eq)]
 enum HostReadiness {
@@ -644,6 +659,15 @@ fn stage_registry_image(
 /// The exact flags here are the ones validated on the e2e VM; signing enforcement
 /// is not set explicitly — it rides the image's baked install config, exactly as in
 /// disk provisioning.
+///
+/// A legacy-BIOS host whose root disk also carries an ESP (the usual hybrid VPS
+/// layout) gets `--generic-image`. Otherwise bootc's `--auto` bootupd install
+/// records only the BIOS component, and every boot's `bootloader-update.service`
+/// then tries to *adopt* the ESP as an EFI install — failing on an empty one
+/// ("opening EFI dir"). Installing both components up front leaves bootupd nothing
+/// to adopt. A BIOS host without an ESP, or a UEFI host, keeps bootc's default
+/// (on UEFI the firmware boot entry must still be updated, which
+/// `--generic-image` skips).
 fn install_to_existing_root(
 	initial: &Ssh,
 	install_ref: &str,
@@ -659,9 +683,11 @@ fn install_to_existing_root(
 	};
 	let script = format!(
 		"set -eu\n\
+		 {GENERIC_IMAGE_SH}\
 		 sudo podman run --rm --privileged --pid=host --security-opt label=disable \
 		 -v /:/target -v /var/lib/containers:/var/lib/containers -v /dev:/dev \
-		 {install_ref} bootc install to-existing-root --acknowledge-destructive {target_flags}\n"
+		 {install_ref} bootc install to-existing-root --acknowledge-destructive {target_flags} \
+		 $generic\n"
 	);
 	initial.run_sh(job, "bootc install to-existing-root", &[], script)
 }

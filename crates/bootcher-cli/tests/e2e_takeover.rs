@@ -108,6 +108,12 @@ fn run_takeover(firmware: Option<PathBuf>, store_dir: &'static str) {
 		Some(if h.firmware.is_some() { "yes" } else { "no" }),
 		"guest booted on the wrong firmware"
 	);
+	// Under BIOS, empty the stock ESP — the common VPS layout (an ESP that a
+	// BIOS-booted distro never populated), and the one where bootupd's at-boot EFI
+	// adoption fails on the missing `EFI/` dir unless takeover installs EFI itself.
+	if h.firmware.is_none() {
+		h.ssh_out(STOCK_USER, "sudo rm -rf /boot/efi/EFI").expect("empty the stock ESP");
+	}
 
 	// Seed the test-owned known_hosts with the stock host's keys, as a prior login
 	// would have; takeover must replace them.
@@ -135,6 +141,15 @@ fn run_takeover(firmware: Option<PathBuf>, store_dir: &'static str) {
 	);
 	let keys = h.ssh_out(VM_USER, &format!("cat {ADMIN_KEYS}")).expect("read injected admin keys");
 	assert!(keys.contains(&read_pub_key(&h.admin_key)), "injected admin key missing from host");
+	// Both firmwares leave bootupd managing the ESP (BIOS via `--generic-image`), so
+	// the at-boot `bootloader-update.service` has nothing to adopt and succeeds.
+	// `start` waits for the oneshot (re-running it if it failed at boot).
+	let state = h.ssh_out(VM_USER, "cat /boot/bootupd-state.json").expect("read bootupd state");
+	assert!(state.contains("\"EFI\""), "bootupd did not record the EFI component:\n{state}");
+	assert!(
+		h.ssh_out(VM_USER, "sudo systemctl start bootloader-update.service").is_some(),
+		"bootloader-update.service fails after takeover"
+	);
 
 	// 4. known_hosts now trusts the reinstalled host's key and dropped the stock ones
 	//    (compared by key blob: a system `HashKnownHosts yes` hashes the names).
