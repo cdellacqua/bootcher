@@ -16,6 +16,8 @@ bootcher deploy
    - **LAN mode** — serve the image from a loopback registry and forward it over SSH; see [LAN backend](../concepts/deploy-backends.md).
    - **Registry mode** — `podman push` to `<registry>/<name>:latest`, *and* to an immutable `<registry>/<name>:<version>` tag for the same digest (see [Image identity & provenance](../concepts/image-identity.md)); SSH into each `[deploy] remotes` device and run `bootc upgrade`.
 
+Each device then reboots into the staged deployment, and `deploy` checks with `bootc status` that it booted it: a device that came back on its old deployment fails the deploy. A device already booted into the image has nothing staged and isn't rebooted. In LAN mode a device that already stores the image skips the transfer.
+
 In registry mode with no `[deploy] remotes` configured, the push to the registry is the whole operation. Devices self-update on their `bootc-fetch-apply-updates.timer` schedule.
 
 Every device connection uses trust-on-first-use host-key checking; on an untrusted network, pin the host key instead — see [Host-key verification](../reference/bootcher-toml.md#host-key-verification).

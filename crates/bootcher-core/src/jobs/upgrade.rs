@@ -273,12 +273,9 @@ fn apply_registry(
 
 	// 2. Stage a new deployment, pulling from the registry.
 	remote.run_sh(job, "bootc upgrade", &[], "sudo bootc upgrade".into())?;
-	// 3. Reboot into the staged deployment; blocks until the device drops off.
-	reboot(remote, job)?;
-	// 4. Wait for the device to answer SSH again on the new boot.
-	wait_online(remote, job)?;
-
-	Ok(())
+	// 3. Reboot into it and check it's what booted. Nothing staged means the device
+	//    already runs this image (e.g. its auto-update got there first).
+	reboot_into_staged(remote, job)
 }
 
 /// LAN backend: ship to and reboot each listed device in turn. Each device is a
@@ -339,18 +336,13 @@ fn apply_lan(
 	// pulled member is tagged as it), so a multi-arch project pins every device to
 	// the same `localhost/<name>:latest` origin.
 
-	// Pre-flight: if the device is already booted into this exact image, the whole
-	// pipeline (multi-GB transfer + bootc dance + reboot) is a no-op. bootc itself
-	// reports "No update available" at step 3, but only after we've shipped the
-	// bytes — so check the digests first: the device's stored list tag against this
-	// arch's local member (what the device would pull and re-tag).
+	// Pre-flight: if the device already stores this exact image (the arch member's
+	// local ID against the device's stored list tag), skip the multi-GB transfer.
+	// That alone doesn't mean it *booted* it — a staged deployment can be dropped at
+	// shutdown — so the switch + upgrade below still run, and bootc stages nothing
+	// when the booted deployment already matches.
 	let local_id = local_podman_image_id(&image.tag())?;
-	if let Some(remote_id) = remote_podman_image_id(remote, local_list_ref)?
-		&& remote_id == local_id
-	{
-		job.println(format!("{}: already booted into {local_id} — nothing to do", remote.host()));
-		return Ok(());
-	}
+	let stored = remote_podman_image_id(remote, local_list_ref)?.is_some_and(|id| id == local_id);
 
 	// Runs on its own concurrent `Scope` (header = the device name), so each step
 	// below renders as a live bar beneath it without a per-device step counter.
@@ -360,7 +352,9 @@ fn apply_lan(
 	//    an SSH remote forward, so podman only fetches the layers the device is
 	//    missing and the secret-bearing bytes ride the trusted SSH channel, not
 	//    cleartext LAN HTTP.
-	transfer(job, image, local_list_ref, remote, port)?;
+	if !stored {
+		transfer(job, image, local_list_ref, remote, port)?;
+	}
 
 	// 2. Pin the bootc image spec to the containers-storage transport. Without this
 	//    bootc defaults to the `registry` transport and tries to fetch
@@ -379,20 +373,109 @@ fn apply_lan(
 	// 4. Remove the ephemeral pull ref and prune the now-untagged previous image.
 	//    bootc has already committed the staged data into the ostree repo, so the
 	//    containers-storage copies are redundant. bootc does not prune them itself.
-	let pull_ref = format!("127.0.0.1:{port}/{}:latest", image.name);
-	remote.run_sh(
-		job,
-		"cleanup images",
-		&[],
-		format!("sudo podman rmi --ignore {pull_ref} && sudo podman image prune -f"),
-	)?;
+	if !stored {
+		let pull_ref = format!("127.0.0.1:{port}/{}:latest", image.name);
+		remote.run_sh(
+			job,
+			"cleanup images",
+			&[],
+			format!("sudo podman rmi --ignore {pull_ref} && sudo podman image prune -f"),
+		)?;
+	}
 
-	// 5. Reboot into the staged deployment; blocks until the device drops off.
+	// 5. Reboot into the staged deployment and check it's what booted.
+	reboot_into_staged(remote, job)
+}
+
+/// Reboot `remote` into its staged bootc deployment and check that it booted it.
+/// Nothing staged means the booted deployment already is the image `bootc upgrade`
+/// was pointed at, so there's nothing to reboot for.
+///
+/// The check matters because ostree only writes a staged deployment out at shutdown
+/// (`ostree-finalize-staged.service`); when that fails the device comes back on the
+/// old deployment and the staged one is gone, with nothing else reporting it.
+fn reboot_into_staged(remote: &Ssh, job: &Scope) -> Result<()> {
+	let Some(staged) = bootc_status(remote)?.staged else {
+		job.println(format!("{}: already booted into this image — nothing to do", remote.host()));
+		return Ok(());
+	};
+	// Blocks until the device drops off, then until it answers SSH on the new boot.
 	reboot(remote, job)?;
-	// 6. Wait for the device to answer SSH again on the new boot.
 	wait_online(remote, job)?;
 
+	let booted = bootc_status_after_reboot(remote)?.booted;
+	if booted.as_ref() != Some(&staged) {
+		let booted = booted.map_or_else(|| "no bootc deployment".to_owned(), |b| b.to_string());
+		bail!(
+			"{} rebooted into {booted} instead of the staged {staged}: the staged deployment \
+			 wasn't applied — check `journalctl -b -1 -u ostree-finalize-staged` on the device",
+			remote.host()
+		);
+	}
 	Ok(())
+}
+
+/// [`bootc_status`], retried for a while: right after a reboot one ssh login can get
+/// in and the next still be reset while the device settles (sshd restarting,
+/// qemu user-net), and that blip says nothing about what booted.
+fn bootc_status_after_reboot(remote: &Ssh) -> Result<BootcStatus> {
+	const ATTEMPTS: u32 = 15;
+	const RETRY: Duration = Duration::from_secs(2);
+	let mut attempt = 1;
+	loop {
+		let status = bootc_status(remote);
+		if status.is_ok() || attempt >= ATTEMPTS {
+			return status;
+		}
+		signals::check()?;
+		thread::sleep(RETRY);
+		attempt += 1;
+	}
+}
+
+/// A bootc deployment's image, as `bootc status --format json` reports it: the
+/// manifest digest identifies it, the version label (if any) names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeployedImage {
+	digest: String,
+	version: Option<String>,
+}
+
+impl std::fmt::Display for DeployedImage {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match &self.version {
+			Some(v) => write!(f, "version {v} ({})", self.digest),
+			None => f.write_str(&self.digest),
+		}
+	}
+}
+
+/// The booted and staged deployments' images on a device.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct BootcStatus {
+	booted: Option<DeployedImage>,
+	staged: Option<DeployedImage>,
+}
+
+/// Read `remote`'s booted and staged deployments from `bootc status --format json`.
+fn bootc_status(remote: &Ssh) -> Result<BootcStatus> {
+	let json = remote
+		.read_sh("sudo bootc status --format json")
+		.with_context(|| format!("reading `bootc status` on {}", remote.host()))?;
+	parse_bootc_status(&json)
+		.with_context(|| format!("parsing `bootc status --format json` from {}", remote.host()))
+}
+
+fn parse_bootc_status(json: &str) -> Result<BootcStatus> {
+	let v: serde_json::Value = serde_json::from_str(json)?;
+	let image = |slot: &str| {
+		let img = v.pointer(&format!("/status/{slot}/image"))?;
+		Some(DeployedImage {
+			digest: img.get("imageDigest")?.as_str()?.to_owned(),
+			version: img.get("version").and_then(|v| v.as_str()).map(str::to_owned),
+		})
+	};
+	Ok(BootcStatus { booted: image("booted"), staged: image("staged") })
 }
 
 /// Trigger a reboot and block until the device has actually left the network.
@@ -618,6 +701,34 @@ fn remote_podman_image_id(remote: &Ssh, tag: &str) -> Result<Option<String>> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn bootc_status_reads_booted_and_staged() {
+		let json = r#"{"apiVersion":"org.containers.bootc/v1","kind":"BootcHost","status":{
+			"staged":{"image":{"image":{"image":"localhost/x:latest","transport":"containers-storage"},
+				"version":"3978a03","timestamp":null,"imageDigest":"sha256:bbb"},"pinned":false},
+			"booted":{"image":{"image":{"image":"localhost/x:latest","transport":"containers-storage"},
+				"timestamp":null,"imageDigest":"sha256:aaa"},"pinned":false},
+			"rollback":null}}"#;
+		let status = parse_bootc_status(json).unwrap();
+		assert_eq!(
+			status.booted,
+			Some(DeployedImage { digest: "sha256:aaa".into(), version: None })
+		);
+		assert_eq!(
+			status.staged,
+			Some(DeployedImage { digest: "sha256:bbb".into(), version: Some("3978a03".into()) })
+		);
+		assert_eq!(status.staged.unwrap().to_string(), "version 3978a03 (sha256:bbb)");
+	}
+
+	#[test]
+	fn bootc_status_without_staged_deployment() {
+		let json = r#"{"status":{"staged":null,"booted":{"image":{"imageDigest":"sha256:aaa"}}}}"#;
+		let status = parse_bootc_status(json).unwrap();
+		assert!(status.staged.is_none());
+		assert_eq!(status.booted.unwrap().digest, "sha256:aaa");
+	}
 
 	#[test]
 	fn probe_success_is_up() {
