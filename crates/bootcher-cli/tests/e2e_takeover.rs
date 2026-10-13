@@ -49,7 +49,8 @@ use bootcher_core::qemu::{self, Vm, VmConfig};
 
 mod common;
 use common::{
-	ADMIN_KEYS, Agent, Prereqs, SSH_TIMEOUT, Ssh, StoreGuard, VM_USER, keygen, read_pub_key,
+	ADMIN_KEYS, Agent, Prereqs, SENTINEL_PATH, SSH_TIMEOUT, Ssh, StoreGuard, VM_USER, keygen,
+	read_pub_key,
 };
 
 /// Stock cloud login on the Debian generic image — takeover's *initial* connection
@@ -166,6 +167,31 @@ fn run_takeover(firmware: Option<PathBuf>, store_dir: &'static str) {
 			"known_hosts still holds a stock host key ({k}):\n{known}"
 		);
 	}
+
+	// 5. The first upgrade after takeover actually lands. The guest keeps Debian's
+	//    layout (an ESP beside `/boot` on the root fs), where systemd's ESP automount
+	//    on `/boot` used to make ostree drop every staged deployment at shutdown.
+	let boot = h.ssh_out(VM_USER, "findmnt -no FSTYPE /boot").expect("inspect /boot");
+	assert!(!boot.contains("autofs"), "an automount sits on /boot after takeover:\n{boot}");
+	common::set_sentinel(&h.proj, "after-takeover");
+	// `deploy` itself fails if the device didn't boot the staged deployment.
+	h.bootcher(&["deploy"]).assert().success();
+	h.wait_for_ssh(VM_USER, &scope, "host never came back after the post-takeover deploy");
+	let sentinel = h.ssh_out(VM_USER, &format!("cat {SENTINEL_PATH}")).unwrap_or_default();
+	assert_eq!(sentinel.trim(), "after-takeover", "host did not boot the deployed image");
+	// Independently of `deploy`'s own check: nothing left staged, and the takeover
+	// deployment is now the rollback.
+	let status =
+		h.ssh_out(VM_USER, "sudo bootc status --format yaml").expect("`bootc status` after deploy");
+	assert!(status.contains("staged: null"), "a deployment is still staged:\n{status}");
+	assert!(!status.contains("rollback: null"), "no rollback deployment:\n{status}");
+
+	// 6. Deploying the same image again is a no-op: already stored and booted, so no
+	//    transfer and no reboot.
+	h.bootcher(&["deploy", "--skip-build"])
+		.assert()
+		.success()
+		.stderr(predicates::str::contains("nothing to do"));
 
 	eprintln!("e2e/takeover: passed");
 }

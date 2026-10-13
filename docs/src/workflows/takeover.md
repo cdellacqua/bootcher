@@ -53,11 +53,15 @@ remotes = [
 1. **Build** the container image (the pipeline's first phase, with `[hooks.build]`).
 2. **Transfer** the arch-matched image into the host's `containers-storage` — the same two backends as `deploy`: a loopback registry over `ssh -R` in [LAN mode](../concepts/deploy-backends.md), or a direct registry pull (the multi-arch list is pushed first) in registry mode.
 3. **Convert** the disk in place from the transferred image.
-4. **Inject secrets** into the staged deployment's `/etc` — the admin key, the registry pull token, and (in signing mode) the signature-enforcement policy — exactly the file set [disk provisioning](setup.md) bakes.
-5. **Reboot**, wait for the host to answer SSH on the new boot as `admin@`, and assert `bootc status`.
+4. **Inject secrets** into the staged deployment's `/etc` — the admin key, the registry pull token, and (in signing mode) the signature-enforcement policy — exactly the file set [disk provisioning](setup.md) bakes. The same step masks `boot.automount` there (see [Hosts with an ESP](#hosts-with-an-esp)).
+5. **Reboot**, wait for the host to answer SSH on the new boot as `admin@`, assert `bootc status`, and check that nothing automounts on `/boot`.
 
 Hosts roll out in parallel, capped by `[concurrency] takeover`. Steps 2–5 are bracketed, once for the whole fleet, by the [`[hooks.takeover]`](../reference/bootcher-toml.md#hooksphase) `pre`/`post` commands — also with `--skip-build`. `post` runs once every host has been attempted, even if some failed — each host's outcome is in `BOOTCHER_METADATA`'s [`results`](../reference/bootcher-toml.md#bootcher_metadata) — and the run still fails afterwards if any host did.
 
 ## Afterwards
 
 The host is a normal bootc device with no `bootcher.toml` change needed — `[deploy] remotes` already names it as `admin@host`. Ship it updates with `bootcher deploy`, and roll its credentials with `bootcher rotate`, exactly as for a host that was disk-provisioned.
+
+## Hosts with an ESP
+
+A taken-over host keeps its disk layout: `/boot` is a directory on the root filesystem, and most cloud and VPS images also carry an EFI System Partition (ESP), whatever firmware they boot with. On that layout systemd-gpt-auto-generator adds an automount for the ESP on `/boot`, on top of ostree's own `/boot`. ostree then can't apply a staged upgrade at shutdown (`ostree-finalize-staged`: `Remounting /boot read-write: Invalid argument`), and the host reboots into its old deployment. Takeover masks the automount in the new deployment's `/etc`, which bootc keeps across upgrades, so this needs nothing from your image. `deploy` checks what each device booted and fails if a staged upgrade wasn't applied.

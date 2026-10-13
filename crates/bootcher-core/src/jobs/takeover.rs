@@ -441,7 +441,8 @@ fn takeover_host(
 	// 3. Inject the provisioning secrets into the staged deployment's /etc — the
 	//    load-bearing step (admin key, pull token, signing policy). Signing
 	//    enforcement otherwise rides the image's baked install config, exactly as in
-	//    disk provisioning.
+	//    disk provisioning. The same step masks the ESP automount (see
+	//    `MASK_ESP_AUTOMOUNT_SH`), which would otherwise break every later upgrade.
 	inject_secrets(initial, &install_ref, files, job)?;
 
 	// 4. Reboot over the stock login (it blocks until the host drops off), then
@@ -692,11 +693,30 @@ fn install_to_existing_root(
 	initial.run_sh(job, "bootc install to-existing-root", &[], script)
 }
 
+/// Masks `boot.automount` in the staged deployment's `/etc` (`$etc`, set by
+/// [`inject_secrets`]' script).
+///
+/// A taken-over host keeps its stock disk layout: `/boot` is a directory on the
+/// root filesystem, and the disk usually carries an ESP too. On that layout
+/// systemd-gpt-auto-generator adds an "EFI System Partition Automount" on `/boot`,
+/// on top of ostree's read-only `/boot` bind mount. ostree's shutdown-time
+/// `finalize-staged` then can't remount `/boot` read-write (EINVAL), so every staged
+/// upgrade is silently dropped and the host reboots into the old deployment. A
+/// mask in `/etc` outranks the generator's unit, and bootc carries `/etc` across
+/// deployments. bootupd mounts the ESP itself when it needs it. Hosts installed by
+/// `bootc install to-disk` have `/boot` on its own partition, which the generator
+/// leaves alone.
+const MASK_ESP_AUTOMOUNT_SH: &str = "sudo mkdir -p \"$etc/systemd/system\"\n\
+	sudo ln -sfn /dev/null \"$etc/systemd/system/boot.automount\"\n";
+
 /// Install each [`DeviceFile`] into the freshly staged bootc deployment's `/etc`
 /// (`/ostree/deploy/*/deploy/*.0/etc`), reusing rotate's heredoc-over-stdin shape.
 /// Every provisioning path is under `/etc`, so its tail maps straight onto the
 /// staged etc root — landing the secrets exactly where disk provisioning's
 /// blueprint would, so the ostree 3-way merge preserves them across upgrades.
+///
+/// It also masks `boot.automount` there ([`MASK_ESP_AUTOMOUNT_SH`]), so every
+/// image converted by takeover can upgrade, whether or not it masks it itself.
 ///
 /// The files are then SELinux-labelled with the image's own `setfiles` and policy
 /// (run from `install_ref`): the stock host writing them is usually not
@@ -727,6 +747,7 @@ fn inject_secrets(
 			mode = f.mode,
 		);
 	}
+	script.push_str(MASK_ESP_AUTOMOUNT_SH);
 	let _ = writeln!(
 		script,
 		"sudo podman run --rm --privileged --security-opt label=disable \
@@ -768,7 +789,17 @@ fn verify_bootc(admin: &Ssh, job: &Scope) -> Result<()> {
 	admin.run_sh(job, "verify bootc status", &[], "sudo bootc status".into()).context(
 		"`bootc status` failed after takeover — the host may not have converted, or the injected \
 		 admin key does not authenticate",
-	)
+	)?;
+	// The ESP automount on `/boot` makes ostree drop staged upgrades at shutdown, and
+	// nothing else should automount `/boot` on a bootc host. Takeover masks it (see
+	// `MASK_ESP_AUTOMOUNT_SH`), so this catches it coming back some other way.
+	admin.run_sh(job, "verify /boot", &[], "! findmnt -t autofs /boot".into()).with_context(|| {
+		format!(
+			"{} has an automount on /boot, so upgrades won't apply — mask it with \
+				 `sudo systemctl mask boot.automount` and reboot",
+			admin.host()
+		)
+	})
 }
 
 /// The destructive-confirmation gate for `bootcher takeover`. `-y/--yes` proceeds;
