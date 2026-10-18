@@ -78,7 +78,8 @@ enum Cmd {
 	/// Run the test suite.
 	Test,
 	/// Everything CI runs (invoked by .github/workflows/verify.yml so the two
-	/// can't drift): fmt check, clippy, doc, test.
+	/// can't drift): fmt check, clippy, doc, test. Locally it also runs a
+	/// non-blocking `cargo audit` (see `audit`).
 	Ci {
 		/// Additionally run the slow VM end-to-end suite (see `e2e`).
 		#[arg(long)]
@@ -193,6 +194,7 @@ fn run() -> Result<ExitCode> {
 			if run_e2e_cross {
 				e2e_cross(&sh, &cargo, flags)?;
 			}
+			audit(&sh, &cargo);
 		}
 		Cmd::E2e => e2e(&sh, &cargo, flags)?,
 		Cmd::E2eCross => e2e_cross(&sh, &cargo, flags)?,
@@ -273,6 +275,33 @@ fn e2e_cross(sh: &Shell, cargo: &Path, flags: &[OsString]) -> Result<()> {
 	)
 	.run()?;
 	Ok(())
+}
+
+/// Scan `Cargo.lock` against the RUSTSEC advisory database, as a heads-up only:
+/// a finding (or a missing `cargo-audit`, or no network to fetch the database)
+/// prints a warning and never fails the task. Advisories usually land in
+/// transitive crates on someone else's fix timeline, so they're monitoring, not
+/// a gate — the same reasoning as .github/workflows/audit.yml.
+///
+/// Skipped under CI (`$CI` set): verify.yml runs offline and audit.yml already
+/// covers the repo on its own schedule.
+fn audit(sh: &Shell, cargo: &Path) {
+	if env::var_os("CI").is_some() {
+		return;
+	}
+	if cmd!(sh, "{cargo} audit --version").quiet().ignore_stdout().ignore_stderr().run().is_err() {
+		eprintln!(
+			"xtask: warning: cargo-audit not installed, skipping the advisory scan \
+			 (`cargo install cargo-audit --locked`)"
+		);
+		return;
+	}
+	if cmd!(sh, "{cargo} audit").run().is_err() {
+		eprintln!(
+			"xtask: warning: cargo audit reported issues (see above); not failing the run. \
+			 `cargo update -p <crate>` once a patched version exists"
+		);
+	}
 }
 
 fn docs(sh: &Shell, cargo: &Path, flags: &[OsString]) -> Result<()> {

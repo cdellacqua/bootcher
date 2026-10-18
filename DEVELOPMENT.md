@@ -8,7 +8,7 @@ This is a mandatory pre-commit step, not a suggestion — the same checks run in
 red pipeline. Skipping it is how broken commits reach `main`.
 
 ```sh
-cargo xtask ci    # fmt check + clippy + doc + test — must pass before you commit
+cargo xtask ci    # fmt check + clippy + doc + test (+ advisory audit, warn-only) — must pass before you commit
 cargo xtask fix   # auto-fix fmt and clippy warnings, then re-run `cargo xtask ci`
 ```
 
@@ -69,7 +69,7 @@ and fails up front naming any that are missing (see
 ```sh
 cargo xtask run <args>   # run a dev build of the binary (in the current directory)
 cargo xtask test         # cargo test
-cargo xtask ci           # fmt check + clippy + doc + test (what CI runs)
+cargo xtask ci           # fmt check + clippy + doc + test (what CI runs) + warn-only cargo audit
 cargo xtask fix          # auto-fix fmt and clippy warnings
 cargo xtask install      # cargo install --path crates/bootcher-cli
 cargo xtask --help       # the full list
