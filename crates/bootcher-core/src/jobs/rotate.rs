@@ -32,7 +32,7 @@
 //! the old key (live below the marker) would answer and the probe would pass even
 //! for a typo'd new key — then the commit would retire the old key and lock the
 //! device out. So [`ssh_key`] needs the new *private* key, passed directly as the
-//! `--key` argument (the `.pub` sibling is derived from it for `authorized_keys`).
+//! `--path` argument (the `.pub` sibling is derived from it for `authorized_keys`).
 //!
 //! [`signing_key`] writes directly without a post-write check: verifying a new
 //! signing key would require pulling and staging an image signed with it, which is
@@ -253,7 +253,7 @@ pub fn ssh_key(manifest: &Manifest, key: Option<&str>, job: &mut Scope) -> Resul
 	let remotes = deploy_remotes_or_bail(manifest, "ssh-key")?;
 
 	// Collect the new key; may run the interactive picker on a TTY.
-	let (authorized_keys, key_path) = secrets::collect_authorized_keys(key)?;
+	let (authorized_keys, key_path) = secrets::collect_authorized_keys(key, "--path")?;
 
 	with_hooks(manifest, Credential::SshKey, &remotes, job, |job| {
 		fleet::for_each_remote(

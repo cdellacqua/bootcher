@@ -101,7 +101,7 @@ impl Provisioning {
 		skip_pull_check: bool,
 		anonymous: bool,
 	) -> Result<(Self, PathBuf)> {
-		let (authorized_keys, key_path) = collect_authorized_keys(key)?;
+		let (authorized_keys, key_path) = collect_authorized_keys(key, "--ssh-key")?;
 		let auth_json = match manifest.registry() {
 			// `--anonymous`: the registry is public, so collect no pull credential and
 			// bake no `auth.json` — the device pulls anonymously. Without it, a
@@ -458,9 +458,10 @@ fn probe_registry_login(ns: &str, user: &str, token: &str) -> Result<()> {
 /// [`crate::jobs::rotate::ssh_key`], so a provisioned key file and a rotated one
 /// are byte-for-byte the same shape. Returns the content and the private key
 /// path (the `<key>.pub` sibling was read, but the private key path is what
-/// `rotate key` passes to ssh as the identity).
-pub(crate) fn collect_authorized_keys(key: Option<&str>) -> Result<(String, PathBuf)> {
-	let (keys, path) = collect_pubkeys(key)?;
+/// `rotate key` passes to ssh as the identity). `flag` names the caller's CLI
+/// option for the key path, quoted in the non-TTY error.
+pub(crate) fn collect_authorized_keys(key: Option<&str>, flag: &str) -> Result<(String, PathBuf)> {
+	let (keys, path) = collect_pubkeys(key, flag)?;
 	Ok((keys.join("\n") + "\n", path))
 }
 
@@ -468,8 +469,8 @@ pub(crate) fn collect_authorized_keys(key: Option<&str>) -> Result<(String, Path
 /// (a private key path, or `None` to discover keys / prompt on a TTY),
 /// stripping blanks and `#` comments. Returns the parsed keys and the private
 /// key path.
-fn collect_pubkeys(arg: Option<&str>) -> Result<(Vec<String>, PathBuf)> {
-	let (raw, key_path) = read_input(arg)?;
+fn collect_pubkeys(arg: Option<&str>, flag: &str) -> Result<(Vec<String>, PathBuf)> {
+	let (raw, key_path) = read_input(arg, flag)?;
 	let keys: Vec<String> = raw
 		.lines()
 		.map(str::trim)
@@ -482,7 +483,7 @@ fn collect_pubkeys(arg: Option<&str>) -> Result<(Vec<String>, PathBuf)> {
 	Ok((keys, key_path))
 }
 
-fn read_input(arg: Option<&str>) -> Result<(String, PathBuf)> {
+fn read_input(arg: Option<&str>, flag: &str) -> Result<(String, PathBuf)> {
 	match arg {
 		Some(key_path) => {
 			let pub_path = format!("{key_path}.pub");
@@ -492,7 +493,7 @@ fn read_input(arg: Option<&str>) -> Result<(String, PathBuf)> {
 			Ok((fs::read_to_string(&pub_path)?, PathBuf::from(key_path)))
 		}
 		None if io::stdin().is_terminal() => prompt_key(),
-		None => bail!("no key provided and stdin is not a TTY\nPass --key <path>."),
+		None => bail!("no key provided and stdin is not a TTY\nPass {flag} <path>."),
 	}
 }
 
@@ -730,7 +731,7 @@ mod tests {
 			"# comment\n\n  \nssh-ed25519 AAAA a\nssh-ed25519 BBBB b\n",
 		)
 		.unwrap();
-		let (keys, _) = collect_pubkeys(Some(key_path.to_str().unwrap())).unwrap();
+		let (keys, _) = collect_pubkeys(Some(key_path.to_str().unwrap()), "--ssh-key").unwrap();
 		assert_eq!(keys, vec!["ssh-ed25519 AAAA a", "ssh-ed25519 BBBB b"]);
 	}
 
@@ -739,6 +740,6 @@ mod tests {
 		let dir = tempfile::tempdir().unwrap();
 		let key_path = dir.path().join("id");
 		fs::write(dir.path().join("id.pub"), "# only a comment\n\n").unwrap();
-		assert!(collect_pubkeys(Some(key_path.to_str().unwrap())).is_err());
+		assert!(collect_pubkeys(Some(key_path.to_str().unwrap()), "--ssh-key").is_err());
 	}
 }
