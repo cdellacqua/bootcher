@@ -38,6 +38,27 @@ use std::sync::{Mutex, PoisonError};
 /// [`SessionGuard`] drops at the end of the phase.
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 
+/// The command `sudo` runs for the privileged session. Shared with
+/// [`can_start_noninteractive`] so the probe asks sudoers about exactly the
+/// argv the session will spawn — a rule allowlisting `sh` alone must match both.
+const SHELL_ARGV: &[&str] = &["sh"];
+
+/// Whether `sudo` would start the session's shell with no password prompt: runs
+/// the session's exact command under `sudo -n`, with stdin closed so the shell
+/// reads EOF and exits 0 at once. True under a NOPASSWD rule covering that command,
+/// as root, or with a still-valid cached credential — the cases that work without
+/// a terminal for sudo to prompt on.
+pub(crate) fn can_start_noninteractive() -> bool {
+	Command::new("sudo")
+		.arg("-n")
+		.args(SHELL_ARGV)
+		.stdin(Stdio::null())
+		.stdout(Stdio::null())
+		.stderr(Stdio::null())
+		.status()
+		.is_ok_and(|s| s.success())
+}
+
 /// Bring the privileged session up now, authenticating on `job`'s suspended
 /// (quiet) terminal so the one password prompt doesn't land under later bars.
 /// Idempotent. Call once before a parallel region that will run local root work,
@@ -124,7 +145,7 @@ impl Session {
 		// any pre-shell sudo error is visible. sudo reads the password from
 		// `/dev/tty`, not stdin, so the piped stdin doesn't interfere with auth.
 		let mut child = Command::new("sudo")
-			.arg("sh")
+			.args(SHELL_ARGV)
 			.stdin(Stdio::piped())
 			.stdout(Stdio::piped())
 			.stderr(Stdio::inherit())

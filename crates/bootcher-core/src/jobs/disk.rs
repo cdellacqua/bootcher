@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 
 /// Check the external tools the `image-builder` fan-out needs: a local
 /// `podman`, plus, per arch's `[builder] image`, either a privileged local
-/// image-builder run (`sudo`, and qemu-user for a cross-arch in-process build) or a
-/// remote/VM transport. Co-located with [`run`]; the CLI / pipeline calls it before
-/// any disk build starts.
+/// image-builder run (`sudo` that can authenticate, and qemu-user for a cross-arch
+/// in-process build) or a remote/VM transport. Co-located with [`run`]; the CLI /
+/// pipeline calls it before any disk build starts.
 ///
 /// # Errors
 ///
@@ -22,9 +22,13 @@ pub(crate) fn preflight(manifest: &Manifest, target: Option<Arch>) -> Result<()>
 	for image in manifest.images_for(target) {
 		let arch = image.arch;
 		let spec = manifest.image_builder(arch);
-		if crate::builder::is_local(spec) {
-			// The local image-builder step runs privileged, opened through one `sudo sh`.
+		// The same gate `run` opens the `sudo sh` session behind, so the sudo checks
+		// fire exactly when the privileged shell will actually be spawned.
+		if crate::builder::runs_local_root(spec) {
 			checks.bin("sudo", "run the privileged image-builder step (`sudo sh`)");
+			checks.sudo_auth();
+		}
+		if crate::builder::is_local(spec) {
 			if Arch::host() != Some(arch) {
 				checks.qemu_user();
 			}

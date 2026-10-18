@@ -403,6 +403,17 @@ fn set_hooks(proj: &Path, table: &str) {
 	fs::write(&path, format!("{manifest}\n{table}\n")).unwrap();
 }
 
+/// Point the scaffold's `[builder] image` at a (never-contacted) remote host, so
+/// `provision`'s preflight doesn't require the local builder's privileged `sudo sh`.
+/// For tests that exercise a failure *before* the disk build, which would otherwise
+/// hinge on the host's sudo setup (no tty under `assert_cmd`, so sudo can't prompt).
+fn use_remote_image_builder(proj: &Path) {
+	let path = proj.join("bootcher.toml");
+	let manifest = fs::read_to_string(&path).unwrap();
+	assert!(manifest.contains("image = \"local\""), "scaffold builder changed: {manifest}");
+	fs::write(&path, manifest.replace("image = \"local\"", "image = \"builder.invalid\"")).unwrap();
+}
+
 #[test]
 fn init_scaffolds_commented_hooks_examples() {
 	// The extension point is discoverable: `init` documents the `[hooks.*]` tables
@@ -490,6 +501,7 @@ fn provision_without_key_on_non_tty_errors() {
 	// the build — rather than producing a keyless device. `--skip-build` exercises
 	// the disk-only path (no container build) while still requiring the key.
 	let (tmp, proj) = project("demo");
+	use_remote_image_builder(&proj);
 	// No --platform: the arch defaults to the manifest's `[targets]` keys
 	// (seeded by init).
 	bootcher_in(tmp.path(), &proj)
@@ -508,6 +520,7 @@ fn provision_skip_build_without_registry_or_local_image_errors() {
 	// `bootcher build`, not an opaque podman error. (A registry-mode reuse needs a
 	// real registry to pull from, so it lives in the e2e suite.)
 	let (tmp, proj) = project("demo");
+	use_remote_image_builder(&proj);
 	// A key so secret collection passes and we actually reach the seeding step;
 	// `provision` reads only the `.pub` sibling, so a placeholder line is enough.
 	let key = proj.join("admin_key");

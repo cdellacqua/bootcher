@@ -6,12 +6,13 @@
 //!
 //! This module is a *toolkit*, not a registry of commands: the [`Checks`]
 //! accumulator and the primitive probes (a binary on `PATH`, UEFI firmware, a
-//! qemu-user binfmt handler, a builder spec's transport). Each job records the
-//! tools it needs into a `Checks` and returns [`Checks::finish`] from its own
-//! `preflight`, co-located with its `run` — so adding a job touches only that job,
-//! not this file. A pipeline chains its jobs' `preflight`s; a CLI subcommand calls
-//! one. Either way the check runs *before any work starts* and fails with a single
-//! message listing everything missing and how to install it.
+//! qemu-user binfmt handler, sudo being able to authenticate, a builder spec's
+//! transport). Each job records the tools it needs into a `Checks` and returns
+//! [`Checks::finish`] from its own `preflight`, co-located with its `run` — so
+//! adding a job touches only that job, not this file. A pipeline chains its jobs'
+//! `preflight`s; a CLI subcommand calls one. Either way the check runs *before any
+//! work starts* and fails with a single message listing everything missing and how
+//! to install it.
 
 use crate::builder;
 use crate::context::{Arch, BuilderSpec};
@@ -88,6 +89,30 @@ impl Checks {
 		}
 	}
 
+	/// Require that `sudo` can authenticate the privileged session without a
+	/// prompt it has nowhere to show. sudo asks for the password on the controlling
+	/// terminal (`/dev/tty`, not stdin), so with one there's nothing to check;
+	/// without one (CI, cron, `ssh host bootcher …` with no `-t`) sudo itself only
+	/// says "a terminal is required", which hides the fix. Probed by running the
+	/// session's exact command under `sudo -n`
+	/// ([`crate::sudo::can_start_noninteractive`]), so sudoers is asked about the
+	/// very argv the session spawns. Skipped when `sudo` is missing outright —
+	/// [`Checks::bin`] already reports that.
+	pub(crate) fn sudo_auth(&mut self) {
+		if self.seen.insert("sudo-auth".into())
+			&& binary_available("sudo")
+			&& !sudo_can_authenticate(has_controlling_tty(), crate::sudo::can_start_noninteractive)
+		{
+			self.missing.push(
+				"non-interactive `sudo` — the `local` image builder runs image-builder as root \
+				 through `sudo`, and with no terminal attached sudo can't prompt for a \
+				 password: run from a terminal, allow this user to run `sudo sh` without a \
+				 password (NOPASSWD), or set `[builder] image` to `\"vm\"` or a remote host in bootcher.toml"
+					.into(),
+			);
+		}
+	}
+
 	/// Turn the recorded requirements into a result: `Ok` when nothing is missing,
 	/// otherwise an error listing every gap. The tail of each job's `preflight`.
 	///
@@ -125,6 +150,18 @@ fn binary_available(bin: &str) -> bool {
 			.is_ok_and(|o| o.status.success())
 }
 
+/// Whether sudo will be able to authenticate: always with a terminal to prompt
+/// on, otherwise only if the non-interactive `probe` succeeds. Factored out so the
+/// decision is testable without a real sudo or tty.
+fn sudo_can_authenticate(tty: bool, probe: impl FnOnce() -> bool) -> bool {
+	tty || probe()
+}
+
+/// True if this process has a controlling terminal sudo could prompt on.
+fn has_controlling_tty() -> bool {
+	std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty").is_ok()
+}
+
 /// True if any `qemu-*` handler is registered and enabled in `binfmt_misc` — a
 /// cheap proxy for "a cross-arch `podman build` can emulate the foreign userspace".
 fn qemu_user_registered() -> bool {
@@ -146,6 +183,15 @@ mod tests {
 		// `sh` is what we shell `command -v` through, so it must be present.
 		assert!(binary_available("sh"));
 		assert!(!binary_available("definitely-not-a-real-binary-xyzzy"));
+	}
+
+	#[test]
+	fn sudo_auth_probes_only_without_a_tty() {
+		// A terminal means sudo can prompt: no probe, always fine.
+		assert!(sudo_can_authenticate(true, || panic!("probed despite a tty")));
+		// No terminal: the non-interactive probe decides.
+		assert!(sudo_can_authenticate(false, || true));
+		assert!(!sudo_can_authenticate(false, || false));
 	}
 
 	#[test]
