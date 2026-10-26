@@ -101,18 +101,22 @@ jobs:
           BOOTCHER_E2E_KEEP_RUN: "1"
         run: cargo test --frozen -p bootcher-cli --features=e2e --test ${{ matrix.suite }} -- --nocapture
       # Logs and config only: the disk images and overlays in the run dir are
-      # multi-GB and not worth the upload.
+      # multi-GB and not worth the upload. Copied out first rather than globbed in
+      # place: a killed test leaves its podman store behind with root-owned overlay
+      # dirs, which upload-artifact walks (and fails on) even when excluded.
+      - name: Collect run dir
+        if: failure() && steps.select.outputs.run == 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/e2e-run"
+          for p in /var/tmp/bootcher-*; do
+            case "$p" in *-store | *-cache) continue ;; esac
+            sudo rsync -a --exclude='*.qcow2' --exclude='*.raw' --exclude='*.img' --exclude='*.iso' "$p" "$RUNNER_TEMP/e2e-run/"
+          done
+          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/e2e-run"
       - name: Upload run dir
         if: failure() && steps.select.outputs.run == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.suite }}-run
-          path: |
-            /var/tmp/bootcher-*/**
-            !/var/tmp/bootcher-*/**/*.qcow2
-            !/var/tmp/bootcher-*/**/*.raw
-            !/var/tmp/bootcher-*/**/*.img
-            !/var/tmp/bootcher-*/**/*.iso
-            !/var/tmp/bootcher-*-store/**
-            !/var/tmp/bootcher-*-cache/**
+          path: ${{ runner.temp }}/e2e-run
           if-no-files-found: ignore
