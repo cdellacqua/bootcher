@@ -502,6 +502,23 @@ pub(crate) fn wait_for_ssh(
 
 // ----------------------------------------------------------------- ssh
 
+/// How long [`Ssh::capture`] keeps retrying a login that failed before authentication.
+const TRANSPORT_RETRY: Duration = Duration::from_mins(1);
+
+/// Did this ssh run fail before authentication, i.e. without ever starting the remote
+/// command? ssh reports its own failures as exit 255; these stderr markers are the
+/// connect/handshake ones, as opposed to `Permission denied` (a rejected key, which
+/// the rotation tests assert on) or a session dropped mid-command.
+fn pre_auth_failure(out: &Output) -> bool {
+	const MARKERS: [&str; 3] = [
+		"Connection timed out during banner exchange",
+		"kex_exchange_identification:",
+		"ssh: connect to host",
+	];
+	let stderr = String::from_utf8_lossy(&out.stderr);
+	out.status.code() == Some(255) && MARKERS.iter().any(|m| stderr.contains(m))
+}
+
 /// A borrow-only view of one ssh identity to the guest — the login user, forwarded
 /// port, key, and whether to share an ssh-agent. Every harness's `ssh_*` helpers
 /// funnel through this so the retry/transport handling lives in one place. Cheap to
@@ -535,9 +552,25 @@ impl Ssh<'_> {
 		c
 	}
 
-	/// Run `cmd` once over a fresh login, capturing its output (stdin nulled).
+	/// Run `cmd` over a fresh login, capturing its output (stdin nulled). A login that
+	/// fails *before* authentication (see [`pre_auth_failure`]) never ran `cmd`, so it's
+	/// retried for up to [`TRANSPORT_RETRY`]: on a busy host the guest's sshd can miss
+	/// the banner deadline while a podman build or push hogs the CPU. Anything past
+	/// that point — a rejected key, `cmd` failing, the session dropping mid-command —
+	/// is returned as is, so a non-idempotent `cmd` never runs twice.
 	pub(crate) fn capture(&self, cmd: &str) -> Output {
-		self.command(cmd).stdin(Stdio::null()).output().expect("ssh")
+		let deadline = Instant::now() + TRANSPORT_RETRY;
+		loop {
+			let out = self.command(cmd).stdin(Stdio::null()).output().expect("ssh");
+			if !pre_auth_failure(&out) || Instant::now() >= deadline {
+				return out;
+			}
+			eprintln!(
+				"ssh transport blip, retrying: {}",
+				String::from_utf8_lossy(&out.stderr).trim()
+			);
+			std::thread::sleep(Duration::from_secs(2));
+		}
 	}
 
 	/// `true` iff a single login runs `cmd` to a zero exit.
