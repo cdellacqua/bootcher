@@ -212,8 +212,11 @@ pub fn ssh(user: &str, port: u16, key: &Path) -> Ssh {
 
 /// ssh options reaching a guest over its forwarded loopback port: the port, the
 /// identity key, and the throwaway known-hosts policy. The guest's host key isn't
-/// worth tracking, so pin known-hosts to `/dev/null`; a short `ConnectTimeout` keeps
-/// the readiness probe from hanging on a not-yet-listening guest.
+/// worth tracking, so pin known-hosts to `/dev/null`. The `ConnectTimeout` bounds each
+/// readiness probe against a not-yet-listening guest, but it also covers the banner
+/// exchange of every later call: user-net accepts the TCP connect on the guest's
+/// behalf, so the whole budget goes to waiting on sshd, which a guest starved by a
+/// busy host (or emulated under TCG) can take several seconds to send.
 fn ssh_opts(port: u16, key: &Path) -> Vec<String> {
 	vec![
 		"-p".into(),
@@ -225,7 +228,7 @@ fn ssh_opts(port: u16, key: &Path) -> Vec<String> {
 		"-o".into(),
 		"GlobalKnownHostsFile=/dev/null".into(),
 		"-o".into(),
-		"ConnectTimeout=5".into(),
+		"ConnectTimeout=15".into(),
 	]
 }
 
