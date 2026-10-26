@@ -1,0 +1,118 @@
+name: E2E
+
+# The slow VM end-to-end suites (`cargo xtask e2e` locally), on demand. Each suite
+# builds a real bootc disk, boots it under qemu/KVM and drives it over ssh, so a
+# full pass takes too long and is too heavy to gate every PR on: this is the
+# button to press before a release or after a risky dependency bump, without
+# tying up a workstation for an hour.
+#
+# One matrix job per suite: they run in parallel, one failure doesn't mask the
+# others, and each gets a runner of its own. The runner's root disk has plenty
+# of room for a suite's podman store and disk images, so nothing is freed first.
+#
+# The cross-arch suite (`xtask e2e-cross`) is not here: it boots everything
+# foreign under TCG, which takes hours on a 4-vCPU runner.
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Suite to run
+        type: choice
+        default: all
+        options:
+          - all
+          - e2e_vm
+          - e2e_registry
+          - e2e_lan_to_registry
+          - e2e_registry_sign
+          - e2e_channels
+          - e2e_takeover
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        # Mirrors the suite list in xtask's `e2e` (takeover included: these
+        # runners are x86-64).
+        suite:
+          - e2e_vm
+          - e2e_registry
+          - e2e_lan_to_registry
+          - e2e_registry_sign
+          - e2e_channels
+          - e2e_takeover
+    steps:
+      # Skipping per step rather than with a job-level `if`, since a job-level
+      # `if` can't see the matrix value; the skipped jobs finish in seconds.
+      - name: Select suite
+        id: select
+        run: echo "run=${{ inputs.suite == 'all' || inputs.suite == matrix.suite }}" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        if: steps.select.outputs.run == 'true'
+      # The runners expose /dev/kvm, but root-only; open it to the runner user
+      # so qemu (which runs unprivileged) can use it.
+      - name: Enable KVM
+        if: steps.select.outputs.run == 'true'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+      # podman and openssh are preinstalled. Passwordless sudo, which the disk
+      # builds need, is the runner default.
+      - name: Install qemu and UEFI firmware
+        if: steps.select.outputs.run == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf
+          podman --version
+          qemu-system-x86_64 --version
+          ls -l /usr/share/qemu/OVMF.fd /usr/share/ovmf/ /usr/share/OVMF/ || true
+      # Restore-only, on verify.yml's key: the e2e feature rebuilds bootcher-cli
+      # but the dependency rlibs are the same, and saving a second multi-GB entry
+      # would evict verify's from the repo's cache quota.
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        if: steps.select.outputs.run == 'true'
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+      - name: Fetch dependencies
+        if: steps.select.outputs.run == 'true'
+        run: cargo fetch --locked
+      # Same command xtask's `e2e` runs per suite. KEEP_RUN leaves the run dir
+      # (serial log, project, $HOME) behind for the failure upload below; the
+      # runner is thrown away anyway.
+      - name: Run ${{ matrix.suite }}
+        if: steps.select.outputs.run == 'true'
+        env:
+          BOOTCHER_E2E_KEEP_RUN: "1"
+        run: cargo test --frozen -p bootcher-cli --features=e2e --test ${{ matrix.suite }} -- --nocapture
+      # Logs and config only: the disk images and overlays in the run dir are
+      # multi-GB and not worth the upload.
+      - name: Upload run dir
+        if: failure() && steps.select.outputs.run == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.suite }}-run
+          path: |
+            /var/tmp/bootcher-*/**
+            !/var/tmp/bootcher-*/**/*.qcow2
+            !/var/tmp/bootcher-*/**/*.raw
+            !/var/tmp/bootcher-*/**/*.img
+            !/var/tmp/bootcher-*/**/*.iso
+            !/var/tmp/bootcher-*-store/**
+            !/var/tmp/bootcher-*-cache/**
+          if-no-files-found: ignore
