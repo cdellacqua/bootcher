@@ -386,8 +386,11 @@ impl StoreGuard {
 		std::fs::create_dir_all(&run).expect("create podman store dir");
 		// podman wants its XDG_RUNTIME_DIR private to the user.
 		std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
-		std::fs::write(Path::new(dir).join("containers.conf"), "[engine]\nlock_type = \"file\"\n")
-			.expect("write podman lock config");
+		std::fs::write(
+			Path::new(dir).join("containers.conf"),
+			"[engine]\ncgroup_manager = \"cgroupfs\"\nlock_type = \"file\"\n",
+		)
+		.expect("write podman lock config");
 		Self { dir: PathBuf::from(dir) }
 	}
 }
@@ -399,7 +402,9 @@ impl StoreGuard {
 /// lock backend is a per-user shared memory segment, which a store in a fresh temp
 /// dir resets as if after a reboot. Two concurrent stores sharing those can leave a
 /// podman stuck on a lock the other one owns. So each store gets its own runtime dir
-/// and file-based locks, which live in it.
+/// and file-based locks, which live in it. The private runtime dir also hides the
+/// user's systemd bus (`$XDG_RUNTIME_DIR/bus`), without which a build's `RUN` step
+/// fails under the systemd cgroup manager, hence `cgroupfs`.
 pub(crate) fn store_env(store: &str) -> [(&'static str, PathBuf); 3] {
 	let store = Path::new(store);
 	[
