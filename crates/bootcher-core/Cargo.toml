@@ -18,15 +18,14 @@ base64 = "0.22.1"
 jiff = "0.2"
 # Image-signing enroll: produce the cosign/sigstore "ENCRYPTED SIGSTORE PRIVATE
 # KEY" format podman's `--sign-by-sigstore-private-key` consumes (scrypt-KDF +
-# NaCl secretbox over the PKCS#8 PEM of a P-256 key). Pinned to one stable
-# RustCrypto generation (elliptic-curve 0.13 / aead 0.5) so they share deps.
+# NaCl secretbox over the PKCS#8 PEM of a P-256 key). p256 only produces the
+# key bytes the secretbox wraps, so the two RustCrypto generations need not match.
 crypto_secretbox = "0.1"
 duct = "1.1.1"
 fatfs = "0.3"
-getrandom = "0.2"
-p256 = { version = "0.13", features = ["pem", "pkcs8"] }
+getrandom = { version = "0.2", features = ["std"] }
+p256 = { version = "0.14", features = ["getrandom", "pem", "pkcs8"] }
 pem-rfc7468 = { version = "0.7", features = ["alloc"] }
-rand_core = { version = "0.6", features = ["getrandom"] }
 scrypt = { version = "0.11", default-features = false }
 include_dir = "0.7.4"
 indicatif = "0.18.4"

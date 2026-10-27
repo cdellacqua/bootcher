@@ -23,6 +23,7 @@ use base64::Engine;
 use crypto_secretbox::aead::Aead;
 use crypto_secretbox::{KeyInit, XSalsa20Poly1305};
 use p256::SecretKey;
+use p256::elliptic_curve::Generate;
 use p256::pkcs8::{EncodePrivateKey, EncodePublicKey};
 use pem_rfc7468::LineEnding;
 use serde::Serialize;
@@ -68,7 +69,7 @@ pub fn enroll(key_path: &Path, pub_path: &Path, force: bool) -> Result<()> {
 
 	// A fresh P-256 key. cosign/containers/image encrypt the PKCS#8 *DER* (the
 	// `x509.MarshalPKCS8PrivateKey` bytes), so the envelope wraps the DER, not PEM.
-	let secret = SecretKey::random(&mut rand_core::OsRng);
+	let secret = SecretKey::try_generate().context("generating the private key")?;
 	let pkcs8_der = secret.to_pkcs8_der().context("encoding the private key")?;
 	let public_pem =
 		secret.public_key().to_public_key_pem(LineEnding::LF).context("encoding the public key")?;
