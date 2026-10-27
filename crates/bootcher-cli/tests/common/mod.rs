@@ -369,19 +369,49 @@ pub(crate) fn run_dir(prefix: &str) -> tempfile::TempDir {
 pub(crate) const KEEP_STORE_ENV: &str = "BOOTCHER_E2E_KEEP_STORE";
 
 /// Owns a test's persistent podman store dir (the one its commands point
-/// `XDG_DATA_HOME` at). Constructing it readies the dir; dropping it removes the
-/// dir — wiping the accumulated images — unless [`KEEP_STORE_ENV`] is set. Held as
-/// a `Harness` field so the wipe runs at end of test, after the last podman call.
+/// `XDG_DATA_HOME` at, see [`store_env`]). Constructing it readies the dir; dropping
+/// it removes the dir — wiping the accumulated images — unless [`KEEP_STORE_ENV`] is
+/// set. Held as a `Harness` field so the wipe runs at end of test, after the last
+/// podman call.
 pub(crate) struct StoreGuard {
 	dir: PathBuf,
 }
 
 impl StoreGuard {
-	/// Create (if needed) the podman store dir at `dir` and guard it for cleanup.
+	/// Create (if needed) the podman store dir at `dir`, with the private runtime dir
+	/// and lock config [`store_env`] points podman at, and guard it for cleanup.
 	pub(crate) fn new(dir: &str) -> Self {
-		std::fs::create_dir_all(dir).expect("create podman store dir");
+		use std::os::unix::fs::PermissionsExt;
+		let run = Path::new(dir).join("run");
+		std::fs::create_dir_all(&run).expect("create podman store dir");
+		// podman wants its XDG_RUNTIME_DIR private to the user.
+		std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
+		std::fs::write(
+			Path::new(dir).join("containers.conf"),
+			"[engine]\ncgroup_manager = \"cgroupfs\"\nlock_type = \"file\"\n",
+		)
+		.expect("write podman lock config");
 		Self { dir: PathBuf::from(dir) }
 	}
+}
+
+/// The env that points podman at the test store `store`, isolated from any other
+/// store in use at the same time (e.g. a binary's tests running in parallel).
+/// `XDG_DATA_HOME` alone only separates the images: the runtime dir (podman's runroot
+/// and libpod temp dir) would still be the user's shared one, and libpod's default
+/// lock backend is a per-user shared memory segment, which a store in a fresh temp
+/// dir resets as if after a reboot. Two concurrent stores sharing those can leave a
+/// podman stuck on a lock the other one owns. So each store gets its own runtime dir
+/// and file-based locks, which live in it. The private runtime dir also hides the
+/// user's systemd bus (`$XDG_RUNTIME_DIR/bus`), without which a build's `RUN` step
+/// fails under the systemd cgroup manager, hence `cgroupfs`.
+pub(crate) fn store_env(store: &str) -> [(&'static str, PathBuf); 3] {
+	let store = Path::new(store);
+	[
+		("XDG_DATA_HOME", store.to_path_buf()),
+		("XDG_RUNTIME_DIR", store.join("run")),
+		("CONTAINERS_CONF_OVERRIDE", store.join("containers.conf")),
+	]
 }
 
 impl Drop for StoreGuard {
@@ -393,7 +423,11 @@ impl Drop for StoreGuard {
 		// rootless store's subuid-owned overlay files map to root, so a plain
 		// `rm -rf` can remove them (a bare `std::fs::remove_dir_all` would hit
 		// EACCES on those files wherever podman uses a subuid range).
-		bootcher_core::exec::best_effort(&duct::cmd!("podman", "unshare", "rm", "-rf", &self.dir));
+		let mut rm = duct::cmd!("podman", "unshare", "rm", "-rf", &self.dir);
+		for (k, v) in store_env(self.dir.to_str().unwrap()) {
+			rm = rm.env(k, v);
+		}
+		bootcher_core::exec::best_effort(&rm);
 	}
 }
 
@@ -434,7 +468,7 @@ pub(crate) fn built_disk(proj: &Path) -> PathBuf {
 }
 
 /// Base `bootcher` command rooted at the project with the env every harness shares —
-/// the throwaway `$HOME`, the e2e's own podman store (`XDG_DATA_HOME`), and (when
+/// the throwaway `$HOME`, the e2e's own podman store ([`store_env`]), and (when
 /// `Some`) the ssh-agent socket. Callers chain `.args(...)` and any test-specific
 /// `.env(...)` (signing passphrase, pull credential, cache home).
 pub(crate) fn bootcher_cmd(
@@ -444,7 +478,7 @@ pub(crate) fn bootcher_cmd(
 	agent_sock: Option<&Path>,
 ) -> AssertCommand {
 	let mut c = AssertCommand::cargo_bin("bootcher").unwrap();
-	c.current_dir(proj).env("HOME", home).env("XDG_DATA_HOME", store);
+	c.current_dir(proj).env("HOME", home).envs(store_env(store));
 	if let Some(sock) = agent_sock {
 		c.env("SSH_AUTH_SOCK", sock);
 	}
@@ -502,6 +536,23 @@ pub(crate) fn wait_for_ssh(
 
 // ----------------------------------------------------------------- ssh
 
+/// How long [`Ssh::capture`] keeps retrying a login that failed before authentication.
+const TRANSPORT_RETRY: Duration = Duration::from_mins(1);
+
+/// Did this ssh run fail before authentication, i.e. without ever starting the remote
+/// command? ssh reports its own failures as exit 255; these stderr markers are the
+/// connect/handshake ones, as opposed to `Permission denied` (a rejected key, which
+/// the rotation tests assert on) or a session dropped mid-command.
+fn pre_auth_failure(out: &Output) -> bool {
+	const MARKERS: [&str; 3] = [
+		"Connection timed out during banner exchange",
+		"kex_exchange_identification:",
+		"ssh: connect to host",
+	];
+	let stderr = String::from_utf8_lossy(&out.stderr);
+	out.status.code() == Some(255) && MARKERS.iter().any(|m| stderr.contains(m))
+}
+
 /// A borrow-only view of one ssh identity to the guest — the login user, forwarded
 /// port, key, and whether to share an ssh-agent. Every harness's `ssh_*` helpers
 /// funnel through this so the retry/transport handling lives in one place. Cheap to
@@ -535,9 +586,25 @@ impl Ssh<'_> {
 		c
 	}
 
-	/// Run `cmd` once over a fresh login, capturing its output (stdin nulled).
+	/// Run `cmd` over a fresh login, capturing its output (stdin nulled). A login that
+	/// fails *before* authentication (see [`pre_auth_failure`]) never ran `cmd`, so it's
+	/// retried for up to [`TRANSPORT_RETRY`]: on a busy host the guest's sshd can miss
+	/// the banner deadline while a podman build or push hogs the CPU. Anything past
+	/// that point — a rejected key, `cmd` failing, the session dropping mid-command —
+	/// is returned as is, so a non-idempotent `cmd` never runs twice.
 	pub(crate) fn capture(&self, cmd: &str) -> Output {
-		self.command(cmd).stdin(Stdio::null()).output().expect("ssh")
+		let deadline = Instant::now() + TRANSPORT_RETRY;
+		loop {
+			let out = self.command(cmd).stdin(Stdio::null()).output().expect("ssh");
+			if !pre_auth_failure(&out) || Instant::now() >= deadline {
+				return out;
+			}
+			eprintln!(
+				"ssh transport blip, retrying: {}",
+				String::from_utf8_lossy(&out.stderr).trim()
+			);
+			std::thread::sleep(Duration::from_secs(2));
+		}
 	}
 
 	/// `true` iff a single login runs `cmd` to a zero exit.
@@ -589,14 +656,21 @@ pub(crate) struct RegistryClient<'a> {
 }
 
 impl RegistryClient<'_> {
+	/// `podman <args>` under the client's env (project dir, `$HOME`, [`store_env`]).
+	fn podman(&self, args: &[&str]) -> duct::Expression {
+		let mut c = duct::cmd("podman", args).dir(self.proj).env("HOME", self.home);
+		for (k, v) in store_env(self.store) {
+			c = c.env(k, v);
+		}
+		c
+	}
+
 	/// `podman manifest inspect <ns>/<name>:<tag>`, returning its stdout (the OCI index
 	/// JSON) on success or `None` when the tag is absent / unreachable.
 	pub(crate) fn manifest_inspect(&self, tag: &str) -> Option<String> {
 		let reference = format!("{}/{}:{tag}", self.ns, self.name);
-		let out = duct::cmd!("podman", "manifest", "inspect", "--tls-verify=false", &reference)
-			.dir(self.proj)
-			.env("HOME", self.home)
-			.env("XDG_DATA_HOME", self.store)
+		let out = self
+			.podman(&["manifest", "inspect", "--tls-verify=false", &reference])
 			.stderr_null()
 			.unchecked()
 			.stdout_capture()
@@ -626,10 +700,7 @@ impl RegistryClient<'_> {
 	pub(crate) fn push_unsigned(&self) {
 		let reg_ref = format!("{}/{}:latest", self.ns, self.name);
 		let list = format!("localhost/{}:latest", self.name);
-		duct::cmd!("podman", "manifest", "push", "--all", &list, &reg_ref)
-			.dir(self.proj)
-			.env("HOME", self.home)
-			.env("XDG_DATA_HOME", self.store)
+		self.podman(&["manifest", "push", "--all", &list, &reg_ref])
 			.run()
 			.unwrap_or_else(|_| panic!("unsigned push to {reg_ref} failed"));
 	}
