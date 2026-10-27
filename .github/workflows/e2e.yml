@@ -94,9 +94,12 @@ jobs:
         run: cargo fetch --locked
       # Same command xtask's `e2e` runs per suite. KEEP_RUN leaves the run dir
       # (serial log, project, $HOME) behind for the failure upload below; the
-      # runner is thrown away anyway.
+      # runner is thrown away anyway. A suite takes ~15 min; the step timeout turns
+      # a hang into a step failure, which (unlike cancelling the run) still runs
+      # the upload.
       - name: Run ${{ matrix.suite }}
         if: steps.select.outputs.run == 'true'
+        timeout-minutes: 45
         env:
           BOOTCHER_E2E_KEEP_RUN: "1"
         run: cargo test --frozen -p bootcher-cli --features=e2e --test ${{ matrix.suite }} -- --nocapture
