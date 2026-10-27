@@ -47,14 +47,14 @@ jobs:
   audit:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Cache ~/.cargo/bin/ so the compiled cargo-audit binary is restored
       # across runs; the install step below then becomes a fast no-op. The
       # .crates.toml/.crates2.json ledger is required for `cargo install` to
       # recognize the tool as already installed and skip rebuilding it. No
       # target/ here — this job only runs cargo-audit, it doesn't build the
       # crate. Keyed on Cargo.lock so a dependency change re-resolves the tool.
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/bin/
