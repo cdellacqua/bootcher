@@ -43,7 +43,7 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Fetch dependencies
         run: cargo fetch --locked
       - name: Build
@@ -51,7 +51,7 @@ jobs:
       - name: Package
         run: tar -C target/release -czf bootcher-${{ matrix.target }}.tar.gz bootcher
       - name: Stash artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: bootcher-${{ matrix.target }}
           path: bootcher-${{ matrix.target }}.tar.gz
@@ -71,7 +71,7 @@ jobs:
       contents: write
     steps:
       - name: Collect artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: bootcher-*
           path: dist
@@ -96,7 +96,7 @@ jobs:
             echo "::notice::$TAG is not a final release — publishing it as a GitHub prerelease"
           fi
       - name: Publish release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: dist/*.tar.gz
           prerelease: ${{ steps.tag.outputs.prerelease }}
@@ -129,7 +129,7 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # ghcr.io requires a lowercase repo path; github.repository preserves the
       # owner's casing, so normalize it once into the job env.
       - name: Resolve image name
