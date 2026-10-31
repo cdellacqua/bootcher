@@ -10,6 +10,12 @@
 #   push to default branch → deploy to the default `latest` channel  (rolling / canary)
 #   push a v* tag          → deploy to the `stable` channel          (production fleet)
 #
+# A pipeline schedule on the default branch (see ../gitlab-ci.yml's header) refreshes
+# only `latest` with the base image's updates; rebuilding the default branch into
+# `stable` would ship unreleased commits. To patch stable without a new release, run a
+# pipeline (Build → Pipelines → Run pipeline) on the current `v*` tag: it rebuilds the
+# released source on today's base and publishes it to `stable`.
+#
 # THE MECHANISM (see ../../../docs/src/reference/bootcher-toml.md#channels). A channel
 # is a mutable registry tag `<registry>/<name>:<channel>` that a SUBSET of devices
 # tracks. `bootcher deploy --channel stable` pushes the multi-arch list under :stable

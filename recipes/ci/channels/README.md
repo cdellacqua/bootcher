@@ -10,6 +10,11 @@ publishes to:
 |---|---|---|
 | push to the default branch (`main`) | `latest` (bootcher's default — no flag) | rolling / **canary** fleet |
 | push a `v*` git tag | `stable` (`bootcher deploy --channel stable`) | **production** fleet |
+| weekly schedule / manual run on the default branch | `latest` | base-image updates for canary |
+| manual run on the current `v*` tag | `stable` | base-image updates for production, no new release |
+
+The schedule never rebuilds into `stable`: that would ship the default branch's unreleased
+commits to production. See [Weekly rebuilds](../README.md#weekly-rebuilds-for-base-image-updates).
 
 A channel is a mutable registry tag `<registry>/<name>:<channel>` that a *subset* of
 devices tracks; the same digest is **also** stamped with its immutable `:CalVer` tag

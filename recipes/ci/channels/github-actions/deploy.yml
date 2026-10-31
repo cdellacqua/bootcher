@@ -11,6 +11,12 @@
 #
 #   push to main  → deploy to the default `latest` channel  (rolling / canary fleet)
 #   push a v* tag → deploy to the `stable` channel          (production fleet)
+#   weekly / manual run → rebuild main HEAD to `latest`      (base-image updates)
+#
+# The weekly rebuild (see `schedule:`) only refreshes `latest`: rebuilding main into
+# `stable` would ship unreleased commits to production. To patch stable without a new
+# release, run the workflow manually and pick the current `v*` tag as its ref: that
+# rebuilds the released source on today's base and publishes it to `stable`.
 #
 # THE MECHANISM (see ../../../../docs/src/reference/bootcher-toml.md#channels). A channel
 # is a mutable registry tag `<registry>/<name>:<channel>` that a SUBSET of devices
@@ -54,6 +60,16 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+  # Weekly rebuild of main into `latest`, plus the same on demand — see the base recipe's
+  # `schedule:` comment for the reboot, rollback-depth and 60-day-inactivity caveats.
+  schedule:
+    - cron: "17 3 * * 6"
+  workflow_dispatch:
+
+# One run at a time (shared <image>:ci-<arch> scratch tags), queued rather than cancelled.
+concurrency:
+  group: bootcher-deploy
+  cancel-in-progress: false
 
 # No image ref to configure: each job derives it from bootcher.toml at runtime with
 # `bootcher info` (see the "Resolve image ref" steps), same as the base recipe. The scratch
@@ -68,16 +84,18 @@ env:
 jobs:
   # --- changes: did anything that affects the image actually change? ----------------
   # Identical to the base recipe: an allowlist of image inputs; a `v*` tag bypasses it
-  # in `build.if`. Adjust the list to your project.
+  # in `build.if`, and a scheduled/manual run (no push to diff) always builds. Adjust
+  # the list to your project.
   changes:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
     outputs:
-      image: ${{ steps.filter.outputs.image }}
+      image: ${{ github.event_name != 'push' || steps.filter.outputs.image == 'true' }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
+      - if: github.event_name == 'push'
+        uses: dorny/paths-filter@v3
         id: filter
         with:
           filters: |
