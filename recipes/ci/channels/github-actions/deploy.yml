@@ -60,8 +60,8 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
-  # Weekly rebuild of main into `latest`, plus the same on demand — see the base recipe's
-  # `schedule:` comment for the reboot, rollback-depth and 60-day-inactivity caveats.
+  # Weekly rebuild of main into `latest` when the base image moved, plus an unconditional
+  # one on demand — see the base recipe's `schedule:` comment for the caveats.
   schedule:
     - cron: "17 3 * * 6"
   workflow_dispatch:
@@ -84,14 +84,20 @@ env:
 jobs:
   # --- changes: did anything that affects the image actually change? ----------------
   # Identical to the base recipe: an allowlist of image inputs; a `v*` tag bypasses it
-  # in `build.if`, and a scheduled/manual run (no push to diff) always builds. Adjust
+  # in `build.if`. A manual run always builds; a scheduled one builds only if the base
+  # image moved since `latest` was published (the last step; see the base recipe). Adjust
   # the list to your project.
   changes:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+      packages: read # the base-image check reads the published image
     outputs:
-      image: ${{ github.event_name != 'push' || steps.filter.outputs.image == 'true' }}
+      # push → the path filter; schedule → the base-image check; manual → always.
+      image: >-
+        ${{ github.event_name == 'workflow_dispatch'
+        || (github.event_name == 'push' && steps.filter.outputs.image == 'true')
+        || (github.event_name == 'schedule' && steps.base.outputs.changed == 'true') }}
     steps:
       - uses: actions/checkout@v4
       - if: github.event_name == 'push'
@@ -105,6 +111,48 @@ jobs:
               - bootcher.toml
               - bootcher.ci.toml
               - .github/workflows/bootcher-deploy.yml
+      # Scheduled runs only: skip the rebuild when the base image hasn't moved since the
+      # published one was built. buildah stamps every built image with the base it came
+      # FROM (`org.opencontainers.image.base.name` — ARGs already resolved — and
+      # `.base.digest`, the per-arch manifest digest), and those annotations survive into
+      # the published members. So for each published arch, compare that digest with the
+      # base tag's current one for the same arch; any difference — or anything that can't
+      # be checked (first run, an image built before this check, a registry hiccup) —
+      # rebuilds, so a failure here never costs a security update. A manual run always
+      # rebuilds: use it for package updates your Containerfile layers on top, which are
+      # otherwise only picked up when the base itself moves. The ref comes from `bootcher
+      # info` (as in the other jobs), run from the published image; skopeo is on the runner.
+      # A private base image needs its own `skopeo login`.
+      - name: Check whether the base image moved
+        if: github.event_name == 'schedule'
+        id: base
+        run: |
+          set -eu
+          rebuild() { echo "rebuilding: $*"; echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0; }
+          IMAGE="$(docker run --rm -v "$PWD:/w" -w /w ghcr.io/cdellacqua/bootcher:latest \
+            --manifest bootcher.ci.toml info --format '{{ .Image }}')"
+          test -n "$IMAGE" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see README)"; exit 1; }
+          echo "$GITHUB_TOKEN" | skopeo login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          index="$(skopeo inspect --raw "docker://$IMAGE:latest")" \
+            || rebuild "no published $IMAGE:latest to compare against"
+          for digest in $(jq -r '.manifests[] | select(.platform.architecture != "unknown") | .digest' <<<"$index"); do
+            arch="$(jq -r --arg d "$digest" '.manifests[] | select(.digest == $d) | .platform.architecture' <<<"$index")"
+            annotations="$(skopeo inspect --raw "docker://$IMAGE@$digest" | jq -c '.annotations // {}')" \
+              || rebuild "$arch: can't read the published member"
+            base="$(jq -r '."org.opencontainers.image.base.name" // empty' <<<"$annotations")"
+            built="$(jq -r '."org.opencontainers.image.base.digest" // empty' <<<"$annotations")"
+            { [ -n "$base" ] && [ -n "$built" ]; } || rebuild "$arch: the published image records no base"
+            raw="$(skopeo inspect --raw "docker://$base")" || rebuild "$arch: can't inspect $base"
+            current="$(jq -r --arg a "$arch" 'first(.manifests[]? | select(.platform.architecture == $a) | .digest) // empty' <<<"$raw")"
+            [ -n "$current" ] || current="$(skopeo inspect --format '{{.Digest}}' "docker://$base")" \
+              || rebuild "$arch: can't inspect $base"
+            [ "$current" = "$built" ] || rebuild "$arch: $base moved ($built -> $current)"
+            echo "$arch: $base unchanged ($built)"
+          done
+          echo "base image unchanged since the last publish: skipping the rebuild"
+          echo "changed=false" >> "$GITHUB_OUTPUT"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # --- build: one container per arch, on a native-arch runner -----------------------
   # Same as the base recipe — channel-agnostic (it pushes the member to a scratch tag

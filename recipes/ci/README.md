@@ -194,18 +194,36 @@ your image when you rebuild. Without a rebuild, a fleet that sees no commits nev
 Fedora's security updates. So the pipeline also rebuilds on a schedule:
 
 - **GitHub** — `deploy.yml` has a weekly `schedule:` trigger plus `workflow_dispatch`
-  for an on-demand rebuild. The `changes` gate passes any non-push run through, since
-  there's no diff to filter. GitHub disables schedules in a public repo after 60 days
+  for an on-demand rebuild. GitHub disables schedules in a public repo after 60 days
   without activity, so re-enable it from the Actions tab if the repo goes quiet.
 - **GitLab** — add a pipeline schedule on the default branch (Build → Pipeline
-  schedules). No YAML change: `rules:changes` evaluates to true when there's no push to
-  diff.
+  schedules). `rules:changes` evaluates to true when there's no push to diff, so the
+  path gate lets it through.
 
-Every rebuild produces a new digest even when the base didn't change, so devices
-download it and **reboot** on their next `bootc-fetch-apply-updates.timer` run. Time the
-schedule ahead of the window you want that reboot in, or remove it if weekly reboots
-aren't acceptable. With weekly rebuilds, `KEEP_PREVIOUS` is roughly that many weeks of
-rollback.
+**A scheduled run only rebuilds when the base image moved.** Every rebuild produces a new
+digest, and devices download it and **reboot** on their next
+`bootc-fetch-apply-updates.timer` run, so rebuilding onto an unchanged base would cost a
+reboot for nothing. buildah stamps each built image with its base
+(`org.opencontainers.image.base.name` / `.base.digest` annotations, `ARG`s resolved),
+and those survive into the published per-arch members. The scheduled check compares
+each member's recorded base digest with the base tag's current digest for that arch,
+and skips the build if they all match. Anything it can't verify (first run, an image
+built before the check existed, a registry error) rebuilds, so a broken check never
+costs you a security update.
+
+- **GitHub** — the `changes` job runs the check on a schedule (skopeo is on the runner;
+  `bootcher info` runs from the published bootcher image) and gates `build` on it.
+- **GitLab** — a schedule-only `base-check` job runs it and hands `BASE_CHANGED` to
+  `build`/`deploy` as a dotenv report; with `false` they exit early, green. It needs
+  skopeo, which the bootcher image ships from v0.2.6.
+
+A **manual run always rebuilds**. Use it after a Fedora advisory, or for packages your
+`Containerfile` layers on top: those only refresh on a schedule when the base moves too,
+which for fedora-bootc is usually within the week.
+
+Time the schedule ahead of the window you want the reboot in. A private base image needs
+its own `skopeo login` in the check. With at most weekly rebuilds, `KEEP_PREVIOUS` is at
+least that many weeks of rollback.
 
 With [channels](channels/README.md), the schedule refreshes only `latest`. To patch
 `stable` without a release, run the pipeline manually on the current `v*` tag.
@@ -280,7 +298,8 @@ deploy. The build context is the **entire project root**, so the gate is an
 - the CI file itself, so editing the pipeline re-runs it
 
 **A `v*` tag always builds**, path filter or not — a tag is a deliberate release. So
-does a scheduled or manual run (see [Weekly rebuilds](#weekly-rebuilds-for-base-image-updates)).
+does a manual run, and a scheduled one does when the base image moved (see
+[Weekly rebuilds](#weekly-rebuilds-for-base-image-updates)).
 
 The gate is applied consistently across stages so the `needs` chain never breaks:
 `build` and `deploy` share it. On **GitLab**, `provision` inherits it transitively (it
@@ -297,7 +316,8 @@ context that ends up in the image belongs in the list.
   default-branch rule, no `changes:` on the tag rule), `!reference`d from both `.build`
   and `deploy`.
 - **GitHub** — a cheap `changes` pre-job (`dorny/paths-filter`, on a plain runner)
-  outputs a boolean (always true on a non-push run) that `build` gates on with
+  outputs a boolean (true on a manual run, the base-image check on a schedule) that
+  `build` gates on with
   `if: needs.changes.outputs.image == 'true' || startsWith(github.ref, 'refs/tags/')`.
 
 ## Requirements & troubleshooting

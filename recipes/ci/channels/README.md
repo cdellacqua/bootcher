@@ -10,7 +10,7 @@ publishes to:
 |---|---|---|
 | push to the default branch (`main`) | `latest` (bootcher's default — no flag) | rolling / **canary** fleet |
 | push a `v*` git tag | `stable` (`bootcher deploy --channel stable`) | **production** fleet |
-| weekly schedule / manual run on the default branch | `latest` | base-image updates for canary |
+| weekly schedule (if the base moved) / manual run on the default branch | `latest` | base-image updates for canary |
 | manual run on the current `v*` tag | `stable` | base-image updates for production, no new release |
 
 The schedule never rebuilds into `stable`: that would ship the default branch's unreleased
