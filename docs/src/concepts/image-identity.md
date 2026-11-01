@@ -22,6 +22,8 @@ On top of the tags, every built container is stamped with standard [OCI image la
 | `org.opencontainers.image.revision` | `git rev-parse HEAD` | The commit SHA, `-dirty`-suffixed when the work tree has uncommitted changes — so a label can't silently claim a clean commit the image wasn't built from. |
 | `org.opencontainers.image.version` | `git describe --tags --always --dirty` | A human description: the nearest tag (with commit distance/SHA when ahead of it), or a short SHA when the repo is untagged. |
 
+The same two keys are also written as manifest annotations on each per-arch image, so tools that read annotations rather than config labels (registry UIs, scanners, `skopeo inspect --raw`) see the same values.
+
 Detection is best-effort: both labels are omitted when the project isn't a git work tree, `git` isn't installed, or the repo has no commit yet — a non-git project just builds without provenance rather than failing. The labels are computed once on the build host and stamped identically whether the container is built in-process or on a remote/VM builder (which has no `.git` of its own).
 
 The same values are handed to lifecycle hooks as `revision` / `version` in [`BOOTCHER_METADATA`](../reference/bootcher-toml.md#bootcher_metadata), so a `build.post` or `disk.post` recipe can read them straight from the JSON.

@@ -77,13 +77,13 @@ pub fn run(manifest: &Manifest, target: Option<Arch>, job: &mut Scope) -> Result
 	let mut images = manifest.images_for(target);
 	let hooks = manifest.hooks();
 	// Detect git provenance once (the build context is the project root, shared by
-	// every arch) and stamp it as OCI labels on each arch's `podman build`, plus
-	// surface it to the hooks below. Best-effort: absent outside a git work tree, and
-	// warned about (never fatal) when git is there but can't be read.
+	// every arch) and stamp it as OCI labels and manifest annotations on each arch's
+	// `podman build`, plus surface it to the hooks below. Best-effort: absent outside a
+	// git work tree, and warned about (never fatal) when git is there but can't be read.
 	let provenance = crate::context::GitProvenance::detect(std::path::Path::new("."), job);
-	let labels = provenance.label_args();
+	let provenance_args = provenance.provenance_args();
 	for image in &mut images {
-		image.labels.clone_from(&labels);
+		image.provenance_args.clone_from(&provenance_args);
 	}
 	// The hook's `image_ref` names what the build leaves behind: the assembled list
 	// for a full run, or the lone member tag for a targeted (list-less) build, so a

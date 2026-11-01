@@ -1099,7 +1099,7 @@ impl Manifest {
 			registry: self.deploy.registry.as_ref().map(|r| r.namespace().to_owned()),
 			// Filled on the build path (see `jobs::build`); empty for the many
 			// non-build callers that only read a ref, so this never invokes git.
-			labels: Vec::new(),
+			provenance_args: Vec::new(),
 		}
 	}
 
@@ -1414,11 +1414,11 @@ pub struct ImageRef {
 	/// Registry namespace from the manifest, if any — the registry/LAN deploy
 	/// switch (see [`Manifest::registry_list_ref`]).
 	pub registry: Option<String>,
-	/// OCI provenance labels to stamp on the built container, as ready-to-splice
-	/// `--label <key>=<value>` argv tokens (from [`GitProvenance::label_args`]).
-	/// Empty unless the build path enriched it — [`Manifest::image`] leaves it empty
-	/// so reading an image ref never shells out to git.
-	pub labels: Vec<String>,
+	/// OCI provenance to stamp on the built container, as ready-to-splice
+	/// `--label`/`--annotation <key>=<value>` argv tokens (from
+	/// [`GitProvenance::provenance_args`]). Empty unless the build path enriched it —
+	/// [`Manifest::image`] leaves it empty so reading an image ref never shells out to git.
+	pub provenance_args: Vec<String>,
 }
 
 impl fmt::Display for ImageRef {
@@ -1484,8 +1484,8 @@ pub fn calver_now(short_sha: Option<&str>) -> String {
 /// Git provenance for the project tree at `dir` (the build context / project
 /// root): the commit a build came from and a human-readable description of it.
 /// Stamped onto the built container as the standard OCI `org.opencontainers.image.*`
-/// labels (so a device's `bootc status` can name what it's running) and surfaced
-/// in `BOOTCHER_METADATA` for hooks.
+/// labels and manifest annotations (so a device's `bootc status` can name what it's
+/// running) and surfaced in `BOOTCHER_METADATA` for hooks.
 ///
 /// Strictly best-effort: every field is `None` when it can't be resolved, and
 /// detection never fails a build. A project that doesn't live in git (`dir` isn't
@@ -1584,20 +1584,25 @@ impl GitProvenance {
 		})
 	}
 
-	/// The provenance as ready-to-splice `--label <key>=<value>` argv tokens — one
-	/// pair per field that resolved, empty when none did. Reused for both the argv
-	/// (in-process build) and shell-string (remote build) `podman build`
-	/// invocations, so the two backends stamp identical labels.
+	/// The provenance as ready-to-splice `podman build` argv tokens: for each field
+	/// that resolved, a `--label <key>=<value>` (image config) and a matching
+	/// `--annotation <key>=<value>` (image manifest); empty when none did. The
+	/// annotation matters because buildah copies the base image's manifest annotations
+	/// into the new image, so without it a Fedora base's own `version`/`revision`
+	/// would show through to anything reading annotations (registry UIs, scanners)
+	/// while the labels say otherwise. An unresolved field passes nothing, leaving the
+	/// base's value inherited. Reused for both the argv (in-process build) and
+	/// shell-string (remote build) invocations, so the two backends stamp identically.
 	#[must_use]
-	pub fn label_args(&self) -> Vec<String> {
+	pub fn provenance_args(&self) -> Vec<String> {
 		let mut out = Vec::new();
 		for (key, val) in [
 			("org.opencontainers.image.revision", &self.revision),
 			("org.opencontainers.image.version", &self.version),
 		] {
 			if let Some(val) = val {
-				out.push("--label".to_owned());
-				out.push(format!("{key}={val}"));
+				let kv = format!("{key}={val}");
+				out.extend(["--label".to_owned(), kv.clone(), "--annotation".to_owned(), kv]);
 			}
 		}
 		out
@@ -2076,7 +2081,7 @@ mod tests {
 		let (p, warning) = GitProvenance::resolve(dir.path());
 		assert_eq!(p.revision, None);
 		assert_eq!(p.version, None);
-		assert!(p.label_args().is_empty());
+		assert!(p.provenance_args().is_empty());
 		assert_eq!(warning, None, "not being in git is silent");
 	}
 
@@ -2126,24 +2131,37 @@ mod tests {
 	}
 
 	#[test]
-	fn provenance_label_args_emits_only_present_fields() {
-		// Both fields → two `--label k=v` pairs, revision before version.
+	fn provenance_args_emits_only_present_fields() {
+		// Both fields → a `--label k=v` + `--annotation k=v` pair each, revision first.
 		let both =
 			GitProvenance { revision: Some("abc123".into()), version: Some("v1.0.0".into()) };
 		assert_eq!(
-			both.label_args(),
+			both.provenance_args(),
 			[
 				"--label",
 				"org.opencontainers.image.revision=abc123",
+				"--annotation",
+				"org.opencontainers.image.revision=abc123",
 				"--label",
+				"org.opencontainers.image.version=v1.0.0",
+				"--annotation",
 				"org.opencontainers.image.version=v1.0.0",
 			]
 		);
-		// A single resolved field yields a single pair…
-		let rev_only = GitProvenance { revision: Some("abc123".into()), version: None };
-		assert_eq!(rev_only.label_args(), ["--label", "org.opencontainers.image.revision=abc123"]);
-		// …and nothing resolved (not a git tree) stamps no labels at all.
-		assert!(GitProvenance::default().label_args().is_empty());
+		// A single resolved field stamps only that key…
+		let ver_only = GitProvenance { revision: None, version: Some("v1.0.0".into()) };
+		assert_eq!(
+			ver_only.provenance_args(),
+			[
+				"--label",
+				"org.opencontainers.image.version=v1.0.0",
+				"--annotation",
+				"org.opencontainers.image.version=v1.0.0",
+			]
+		);
+		// …and nothing resolved (not a git tree) stamps nothing, so the base image's
+		// own annotations are inherited untouched.
+		assert!(GitProvenance::default().provenance_args().is_empty());
 	}
 
 	#[test]
