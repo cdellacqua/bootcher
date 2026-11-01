@@ -101,7 +101,7 @@ pub(crate) fn run(
 				.map(|disk_type| DiskTarget { image: image.clone(), disk_type })
 		})
 		.collect();
-	let provenance = crate::context::GitProvenance::detect(std::path::Path::new("."));
+	let provenance = crate::context::GitProvenance::detect(std::path::Path::new("."), job);
 	let mut meta = HookMetadata {
 		phase: Phase::Disk,
 		stage: Stage::Pre,

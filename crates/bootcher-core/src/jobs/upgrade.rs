@@ -84,7 +84,7 @@ pub(crate) fn run(
 		bail!("no target arches to deploy — set `[targets]` in bootcher.toml");
 	}
 	let remote_hosts: Vec<String> = remotes.iter().map(|s| s.host().to_owned()).collect();
-	let provenance = crate::context::GitProvenance::detect(std::path::Path::new("."));
+	let provenance = crate::context::GitProvenance::detect(std::path::Path::new("."), job);
 	// Compute the immutable CalVer tag now, while `provenance` is still whole (its
 	// fields are moved into `meta` just below). The commit suffix pins the tag to source.
 	let calver = crate::context::calver_now(provenance.short_sha().as_deref());
