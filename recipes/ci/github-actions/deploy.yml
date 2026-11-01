@@ -1,5 +1,7 @@
 # bootcher CI for GitHub Actions — BUILD + DEPLOY half, multi-arch (x86_64 + aarch64).
 #
+# Recipe docs: https://github.com/cdellacqua/bootcher/tree/main/recipes/ci
+#
 # Copy this to your bootcher project as `.github/workflows/bootcher-deploy.yml`. Its
 # sibling, `provision.yml`, is the disk-building half — see that file. They're split
 # because the disk build needs a MANUAL gate, and GitHub Free can't gate a job inside a
@@ -35,7 +37,7 @@
 # is a no-op. A `v*` tag always builds. See that job for the allowlist to tune.
 #
 # A weekly schedule rebuilds when the base image moved, so its security updates reach
-# the fleet without a commit; a manual run always rebuilds. See ../README.md.
+# the fleet without a commit; a manual run always rebuilds.
 #
 # Why split the build per arch? A multi-arch `bootcher deploy` on a single runner would
 # build the foreign arch under qemu-user emulation — slow and occasionally fragile.
@@ -84,7 +86,7 @@
 # Every job runs with `--manifest bootcher.ci.toml` — a committed override that
 # `extend`s bootcher.toml and forces podman onto the host network, sidestepping
 # nested-podman nftables failures in the privileged CI container. Copy
-# recipes/ci/bootcher.ci.toml to your project root beside bootcher.toml.
+# https://github.com/cdellacqua/bootcher/blob/main/recipes/ci/bootcher.ci.toml to your project root beside bootcher.toml.
 #
 # Repository secrets & variables (Settings → Secrets and variables → Actions):
 #   SIGN_KEY /       (optional) cosign private key + its passphrase — only if you
@@ -172,7 +174,7 @@ jobs:
           set -eu
           image="$(docker run --rm -v "$PWD:/w" -w /w ghcr.io/cdellacqua/bootcher:latest \
             --manifest bootcher.ci.toml info --format '{{ .Image }}')"
-          test -n "$image" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see README)"; exit 1; }
+          test -n "$image" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see https://github.com/cdellacqua/bootcher/tree/main/recipes/ci)"; exit 1; }
           echo "IMAGE=$image" >> "$GITHUB_ENV"
           echo "$GITHUB_TOKEN" | skopeo login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
         env:
@@ -304,7 +306,7 @@ jobs:
         run: |
           set -eu
           image="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')"
-          test -n "$image" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see README)"; exit 1; }
+          test -n "$image" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see https://github.com/cdellacqua/bootcher/tree/main/recipes/ci)"; exit 1; }
           echo "IMAGE=$image" >> "$GITHUB_ENV"
       - name: Build ${{ matrix.arch }}
         run: bootcher --manifest bootcher.ci.toml build --target "${{ matrix.arch }}"
@@ -372,7 +374,7 @@ jobs:
         run: |
           set -eu
           image="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')"
-          test -n "$image" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see README)"; exit 1; }
+          test -n "$image" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see https://github.com/cdellacqua/bootcher/tree/main/recipes/ci)"; exit 1; }
           {
             echo "IMAGE=$image"
             echo "NAME=$(bootcher --manifest bootcher.ci.toml info --format '{{ .Name }}')"

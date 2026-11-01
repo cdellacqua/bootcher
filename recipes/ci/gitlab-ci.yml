@@ -1,5 +1,7 @@
 # bootcher CI for GitLab — multi-arch (x86_64 + aarch64).
 #
+# Recipe docs: https://github.com/cdellacqua/bootcher/tree/main/recipes/ci
+#
 # Copy this to your bootcher project as `.gitlab-ci.yml` at the repo root. It builds
 # both architectures on native runners (no cross-arch emulation), assembles them into
 # one multi-arch image, and can produce a flashable disk per arch — in three stages:
@@ -31,7 +33,7 @@
 # no-op; a `v*` tag always builds. Tune the allowlist there to your project.
 #
 # Weekly rebuilds: add a pipeline schedule on the default branch (e.g. `17 3 * * 6`); it
-# rebuilds only if the base image moved (see `base-check` and README.md).
+# rebuilds only if the base image moved (see `base-check`).
 #
 # Why split the build per arch? A multi-arch `bootcher deploy` on a single runner would
 # build the foreign arch under qemu-user emulation — slow and occasionally fragile.
@@ -63,7 +65,7 @@
 # Every job runs with `--manifest bootcher.ci.toml` — a committed override that
 # `extend`s bootcher.toml and forces podman onto the host network, sidestepping
 # nested-podman nftables failures in the privileged job container. Copy
-# recipes/ci/bootcher.ci.toml to your repo root beside bootcher.toml.
+# https://github.com/cdellacqua/bootcher/blob/main/recipes/ci/bootcher.ci.toml to your repo root beside bootcher.toml.
 #
 # Runners: the aarch64 jobs need an arm64 runner — on GitLab.com a hosted
 # `saas-linux-*-arm64` (tagged below; the small size is on all tiers). All these jobs
@@ -201,7 +203,7 @@ base-check:
   before_script: [] # no container store needed: this job only reads registries
   script:
     - IMAGE="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')"
-    - test -n "$IMAGE" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see README)"; exit 1; }
+    - test -n "$IMAGE" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see https://github.com/cdellacqua/bootcher/tree/main/recipes/ci)"; exit 1; }
     - export IMAGE
     - echo "$CI_REGISTRY_PASSWORD" | skopeo login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
     - |
@@ -308,7 +310,7 @@ base-check:
     # :ci-<arch> scratch tag. Empty ⇒ LAN mode (no `[deploy] registry`); registry-mode only,
     # so fail fast before the multi-minute build.
     - IMAGE="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')"
-    - test -n "$IMAGE" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see README)"; exit 1; }
+    - test -n "$IMAGE" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see https://github.com/cdellacqua/bootcher/tree/main/recipes/ci)"; exit 1; }
     - bootcher --manifest bootcher.ci.toml build --target "$ARCH"
     # The build produced exactly one image tagged `:latest-<arch>`. Log in with the job
     # token and push it under a scratch tag ($IMAGE:ci-<arch>) that `deploy` pulls — the
@@ -344,8 +346,8 @@ build:aarch64:
 # pushes <registry>/<name>:latest (+ a CalVer tag). No container build, no disk step. The
 # scratch tags need no cleanup (they share layers with :latest and are overwritten each
 # run). To prune OLD CalVer releases as they accumulate, don't add a job — turn on the
-# project's built-in Container Registry cleanup policy (see the README's "Pruning old
-# published images"). The signing key is fetched here if enabled.
+# project's built-in Container Registry cleanup policy (see "Pruning old
+# published images" in the recipe docs). The signing key is fetched here if enabled.
 deploy:
   stage: deploy
   # Sequence behind both build jobs and gate on them. artifacts: false — the members
@@ -372,7 +374,7 @@ deploy:
     # NAME the local member basename `deploy --skip-build` retags to.
     - IMAGE="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')"
     - NAME="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Name }}')"
-    - test -n "$IMAGE" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see README)"; exit 1; }
+    - test -n "$IMAGE" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see https://github.com/cdellacqua/bootcher/tree/main/recipes/ci)"; exit 1; }
     - echo "$CI_REGISTRY_PASSWORD" | podman login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
     # Pull each per-arch member `build` pushed under its scratch tag and retag it to the
     # local name `deploy --skip-build` expects — localhost/<name>:latest-<arch> — so the

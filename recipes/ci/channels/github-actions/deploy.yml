@@ -1,12 +1,15 @@
 # bootcher CI with RELEASE CHANNELS — GitHub Actions BUILD + DEPLOY half, multi-arch.
 #
-# A channels-aware variant of ../../github-actions/deploy.yml. The job *shape* is
+# Base recipe: https://github.com/cdellacqua/bootcher/blob/main/recipes/ci/github-actions/deploy.yml
+# Recipe docs: https://github.com/cdellacqua/bootcher/tree/main/recipes/ci
+#
+# A channels-aware variant of the base recipe. The job *shape* is
 # identical — build (per-arch, native runners) → deploy (assemble + push) → cleanup (prune
 # old versions) — plus the loopback container store, the `changes` path gate, and the
 # runtime `bootcher info` image-ref derivation, so this header only covers what's
 # DIFFERENT: which channel each trigger publishes to. For the store relocation, the
 # per-arch split rationale, the cleanup mechanics, and the secrets, read
-# ../../github-actions/deploy.yml and ../../README.md; nothing there changes. The disk
+# the base recipe and the recipe docs; nothing there changes. The disk
 # build is the sibling provision.yml.
 #
 #   push to main             → deploy to the default `latest` channel (rolling / canary)
@@ -16,13 +19,13 @@
 #   manual run on main/a tag → rebuild it into `latest` / `stable`, unconditionally
 #
 # A refresh rebuilds the commit its channel currently ships on today's base, if the base
-# moved (see ../README.md).
+# moved.
 #
-# THE MECHANISM (see ../../../../docs/src/reference/bootcher-toml.md#channels). A channel
-# is a mutable registry tag `<registry>/<name>:<channel>` that a SUBSET of devices
-# tracks. `bootcher deploy --channel stable` pushes the multi-arch list under :stable
-# instead of :latest, so only devices whose bootc origin is :stable pick it up. Every
-# deploy ALSO stamps that same digest with its immutable :CalVer tag regardless of
+# THE MECHANISM (see https://cdellacqua.github.io/bootcher/book/reference/bootcher-toml.html#channels).
+# A channel is a mutable registry tag `<registry>/<name>:<channel>` that a SUBSET of
+# devices tracks. `bootcher deploy --channel stable` pushes the multi-arch list under
+# :stable instead of :latest, so only devices whose bootc origin is :stable pick it up.
+# Every deploy ALSO stamps that same digest with its immutable :CalVer tag regardless of
 # channel — so the version tag is the durable rollback/audit handle and the channel is
 # just a moving pointer to "what that audience sees now".
 #
@@ -52,7 +55,7 @@
 # The provision.yml sibling bakes whichever channel you pick into the disk, so a
 # stable-tracking or latest-tracking device is a matter of which channel you dispatch it
 # with. Secrets/variables and the `bootcher.ci.toml` override are unchanged — see
-# ../../README.md.
+# the recipe docs.
 
 name: bootcher deploy
 
@@ -140,7 +143,7 @@ jobs:
           set -eu
           image="$(docker run --rm -v "$PWD:/w" -w /w ghcr.io/cdellacqua/bootcher:latest \
             --manifest bootcher.ci.toml info --format '{{ .Image }}')"
-          test -n "$image" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see README)"; exit 1; }
+          test -n "$image" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see https://github.com/cdellacqua/bootcher/tree/main/recipes/ci)"; exit 1; }
           echo "IMAGE=$image" >> "$GITHUB_ENV"
           echo "$GITHUB_TOKEN" | skopeo login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
         env:
@@ -217,7 +220,7 @@ jobs:
 
   # --- build: one container per arch, on a native-arch runner -----------------------
   # Same as the base recipe — channel-agnostic (it pushes the member to a scratch tag
-  # <image>:ci-<arch>; see ../../github-actions/deploy.yml for why the registry, not a run
+  # <image>:ci-<arch>; see the base recipe for why the registry, not a run
   # artifact). The member is the same whether deploy later publishes it to :latest or
   # :stable; the channel is chosen only at push time, in `deploy`.
   build:
@@ -243,7 +246,7 @@ jobs:
           fetch-tags: true # so `git describe` still names the release
       # Real-fs container store (loopback ext4 so podman does one kernel overlay instead
       # of fuse-overlayfs-on-overlay). Self-skips on a real fs. Full rationale: the
-      # header of ../../github-actions/deploy.yml.
+      # header of the base recipe.
       - name: Prepare container store
         run: |
           set -eu
@@ -260,12 +263,12 @@ jobs:
           fi
           podman info --format 'podman store: {{.Store.GraphDriverName}} @ {{.Store.GraphRoot}}'
       - name: Resolve image ref
-        # Derive the ref from bootcher.toml (see ../../github-actions/deploy.yml): IMAGE is
+        # Derive the ref from bootcher.toml (see the base recipe): IMAGE is
         # the base for the :ci-<arch> scratch tags. Empty ⇒ LAN mode; registry-mode only.
         run: |
           set -eu
           image="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')"
-          test -n "$image" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see README)"; exit 1; }
+          test -n "$image" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see https://github.com/cdellacqua/bootcher/tree/main/recipes/ci)"; exit 1; }
           echo "IMAGE=$image" >> "$GITHUB_ENV"
       - name: Build ${{ matrix.arch }}
         run: bootcher --manifest bootcher.ci.toml build --target "${{ matrix.arch }}"
@@ -276,7 +279,7 @@ jobs:
       - name: Push image member to the registry
         # Push the just-built member under a scratch tag ($IMAGE:ci-<arch>) that `deploy`
         # pulls — the handoff goes through the registry, not a run artifact (see
-        # ../../github-actions/deploy.yml). Channel-agnostic: this scratch tag is unrelated
+        # the base recipe). Channel-agnostic: this scratch tag is unrelated
         # to the :latest/:stable channel tags. Unsigned; only the channel tag is signed.
         run: |
           set -eu
@@ -328,7 +331,7 @@ jobs:
         run: |
           set -eu
           image="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')"
-          test -n "$image" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see README)"; exit 1; }
+          test -n "$image" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see https://github.com/cdellacqua/bootcher/tree/main/recipes/ci)"; exit 1; }
           {
             echo "IMAGE=$image"
             echo "NAME=$(bootcher --manifest bootcher.ci.toml info --format '{{ .Name }}')"
@@ -352,7 +355,7 @@ jobs:
         # The members were pulled + retagged above; assemble + push under this run's
         # channel (`--channel` only when CHANNEL is set; empty → bootcher's `latest`).
         # `--skip-bootc-upgrade` leaves the rollout to each device's auto-update timer (see
-        # ../../README.md).
+        # the recipe docs).
         run: |
           set -eu
           if [ -n "${CHANNEL:-}" ]; then
@@ -367,7 +370,7 @@ jobs:
           BOOTCHER_SIGN_PASSPHRASE: ${{ secrets.SIGN_PASSPHRASE }}
 
   # --- cleanup: prune old published image versions ----------------------------------
-  # Identical to the base recipe's `cleanup` (see ../../github-actions/deploy.yml for the
+  # Identical to the base recipe's `cleanup` (see the base recipe for the
   # full multi-arch-safety and token rationale). Channels need no special handling: the
   # protected-tag set comes from `bootcher info --format '{{ .Channels }}'`, which reports
   # every declared channel (`latest` + `stable`), so a live channel pointer is never pruned
@@ -389,7 +392,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # org-owned package refused? use a CLEANUP_TOKEN PAT
           DRY_RUN: "false" # "true" = log the plan without deleting (validate a first run)
         run: |
-          # Identical to the base recipe's cleanup (see ../../github-actions/deploy.yml).
+          # Identical to the base recipe's cleanup (see the base recipe).
           # Channels need no special handling: `channels` comes from `bootcher info`, which
           # reports every declared channel, so a live channel pointer is a protected tag.
           import base64, json, os, subprocess, sys, urllib.error, urllib.request

@@ -1,7 +1,9 @@
 # bootcher CI for GitHub Actions — PROVISION half, multi-arch (x86_64 + aarch64).
 #
+# Recipe docs: https://github.com/cdellacqua/bootcher/tree/main/recipes/ci
+#
 # Copy this to your bootcher project as `.github/workflows/bootcher-provision.yml`. Its
-# sibling, `deploy.yml`, is the build→deploy half — read that file (and ../README.md)
+# sibling, `deploy.yml`, is the build→deploy half — read that file (and the recipe docs)
 # for the store relocation, the per-arch split rationale, and the registry setup; this
 # header only covers what's specific to the disk build.
 #
