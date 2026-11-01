@@ -7,14 +7,23 @@
 # publishes to. For the store relocation, the per-arch split rationale, and the CI/CD
 # variables, read ../gitlab-ci.yml and ../README.md; nothing there changes.
 #
-#   push to default branch → deploy to the default `latest` channel  (rolling / canary)
-#   push a v* tag          → deploy to the `stable` channel          (production fleet)
+#   push to default branch      → deploy to the default `latest` channel (rolling / canary)
+#   push a v* tag               → deploy to the `stable` channel         (production fleet)
+#   schedule                    → refresh `latest`                       (base updates)
+#   schedule, SCHEDULE_CHANNEL=<c> → refresh channel <c>                  (base updates)
+#   manual run on branch/a tag  → rebuild it into `latest` / `stable`, unconditionally
 #
-# A pipeline schedule on the default branch (see ../gitlab-ci.yml's header) refreshes
-# only `latest` with the base image's updates; rebuilding the default branch into
-# `stable` would ship unreleased commits. To patch stable without a new release, run a
-# pipeline (Build → Pipelines → Run pipeline) on the current `v*` tag: it rebuilds the
-# released source on today's base and publishes it to `stable`.
+# A refresh rebuilds the exact commit its channel currently ships — read from the
+# `org.opencontainers.image.revision` label bootcher stamps on every image — on today's
+# base. So it never ships unreleased source, and it works for any channel whatever feeds
+# it (tags, a branch, a hand-pushed rollback). Base-image refreshes take one pipeline
+# schedule per channel (Build → Pipeline schedules), all targeting the default branch,
+# staggered so the canary fleet runs a new Fedora base for a few days before production
+# gets it — e.g. `17 3 * * 6` (Saturday) plain for `latest`, and `17 3 * * 2` (Tuesday)
+# with the variable SCHEDULE_CHANNEL=stable. `base-check` resolves the commit and
+# `.build`/`deploy` check it out. Each scheduled pipeline skips the build when the base
+# hasn't moved since its channel was last published. Needs git and skopeo in the
+# bootcher image (bootcher v0.2.6+).
 #
 # THE MECHANISM (see ../../../docs/src/reference/bootcher-toml.md#channels). A channel
 # is a mutable registry tag `<registry>/<name>:<channel>` that a SUBSET of devices
@@ -115,8 +124,17 @@ stages: [build, deploy, provision]
 # costs a security update. The verdict travels to `.build` and `deploy` as BASE_CHANGED
 # (a dotenv report); with `false` they exit early, green. A pipeline you run by hand isn't
 # a schedule, so it always rebuilds: use it for package updates your Containerfile layers
-# on top, which are otherwise only picked up when the base itself moves. Needs skopeo in
-# the bootcher image (bootcher v0.2.6+). A private base image needs its own `skopeo login`.
+# on top, which are otherwise only picked up when the base itself moves. A private base
+# image needs its own `skopeo login`.
+#
+# Channels: a schedule with SCHEDULE_CHANNEL=<c> (see the header) compares against :<c>
+# instead of :latest. It also picks the commit to rebuild — the
+# `org.opencontainers.image.revision` label of the image the channel currently ships —
+# and hands it to `.build`/`deploy` as SOURCE_REV, alongside BASE_CHANGED. With no usable
+# label (an image built before bootcher v0.2.6 shipped git, or deployed from a dirty
+# tree), `latest` falls back to the default branch; any other channel fails the pipeline
+# rather than guess what to ship — publish it once the normal way (or with a manual run)
+# and the next refresh has a label to follow.
 base-check:
   stage: build
   rules:
@@ -128,9 +146,29 @@ base-check:
     - test -n "$IMAGE" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see README)"; exit 1; }
     - echo "$CI_REGISTRY_PASSWORD" | skopeo login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
     - |
-      rebuild() { echo "rebuilding: $*"; echo "BASE_CHANGED=true" > base.env; exit 0; }
-      index="$(skopeo inspect --raw "docker://$IMAGE:latest")" \
-        || rebuild "no published $IMAGE:latest to compare against"
+      : > base.env
+      rebuild() { echo "rebuilding: $*"; echo "BASE_CHANGED=true" >> base.env; exit 0; }
+      CHANNEL="${SCHEDULE_CHANNEL:-latest}"
+      if ! index="$(skopeo inspect --raw "docker://$IMAGE:$CHANNEL")"; then
+        if [ "$CHANNEL" != latest ]; then
+          echo "nothing published to $IMAGE:$CHANNEL yet: nothing to refresh"; echo "BASE_CHANGED=false" >> base.env; exit 0
+        fi
+        rebuild "no published $IMAGE:$CHANNEL to compare against"
+      fi
+      # The commit the channel ships (every arch member carries the same label).
+      first="$(printf '%s' "$index" | jq -r 'first(.manifests[] | select(.platform.architecture != "unknown") | .digest)')"
+      rev="$(skopeo inspect --config "docker://$IMAGE@$first" | jq -r '.config.Labels."org.opencontainers.image.revision" // empty')" || rev=''
+      case "$rev" in
+        ''|*-dirty)
+          if [ "$CHANNEL" != latest ]; then
+            echo "$IMAGE:$CHANNEL records no clean source revision ('$rev'), so there's no telling what to rebuild — publish it once with a normal deploy or a manual run"
+            exit 1
+          fi
+          echo "$IMAGE:$CHANNEL records no clean source revision ('$rev'): refreshing from $CI_COMMIT_REF_NAME" ;;
+        *)
+          echo "$IMAGE:$CHANNEL ships $rev"
+          echo "SOURCE_REV=$rev" >> base.env ;;
+      esac
       for digest in $(printf '%s' "$index" | jq -r '.manifests[] | select(.platform.architecture != "unknown") | .digest'); do
         arch="$(printf '%s' "$index" | jq -r --arg d "$digest" '.manifests[] | select(.digest == $d) | .platform.architecture')"
         annotations="$(skopeo inspect --raw "docker://$IMAGE@$digest")" \
@@ -146,10 +184,29 @@ base-check:
         echo "$arch: $base unchanged ($built)"
       done
       echo "base image unchanged since the last publish: skipping the rebuild"
-      echo "BASE_CHANGED=false" > base.env
+      echo "BASE_CHANGED=false" >> base.env
   artifacts:
     reports:
       dotenv: base.env
+
+# --- source checkout: rebuild the commit a refreshed channel ships ---------------
+# A refresh pipeline runs on the default branch; `base-check` hands over the commit the
+# channel currently ships as SOURCE_REV, so `.build` and `deploy` check it out first. The
+# tags pointing at it come along, so `git describe` stamps its release name as the
+# version label, as on a tag pipeline.
+.source-checkout:
+  script:
+    - |
+      if [ -n "${SOURCE_REV:-}" ]; then
+        git config --global --add safe.directory "$CI_PROJECT_DIR"
+        git fetch -q --depth 1 "$CI_REPOSITORY_URL" "$SOURCE_REV"
+        git checkout -q --detach FETCH_HEAD
+        # `^{}` lines are annotated tags peeled to their commit; plain lines lightweight tags.
+        for t in $(git ls-remote --tags "$CI_REPOSITORY_URL" | awk -v r="$SOURCE_REV" '$1 == r { sub("^refs/tags/", "", $2); sub("\\^\\{\\}$", "", $2); print $2 }' | sort -u); do
+          git fetch -q --depth 1 "$CI_REPOSITORY_URL" "+refs/tags/$t:refs/tags/$t"
+        done
+        echo "checked out $(git describe --tags --always)"
+      fi
 
 # --- build: one container per arch, on a native-arch runner -----------------------
 # Channel-agnostic: the per-arch member is the same whether deploy later publishes it to
@@ -167,6 +224,7 @@ base-check:
   script:
     # A schedule whose base image hasn't moved (see `base-check`) has nothing to build.
     - if [ "${BASE_CHANGED:-true}" = false ]; then echo "base image unchanged, nothing to build"; exit 0; fi
+    - !reference [.source-checkout, script]
     # Derive the image ref from bootcher.toml (see ../gitlab-ci.yml): IMAGE is the base for
     # the :ci-<arch> scratch tag. Empty ⇒ LAN mode; registry-mode only, so fail fast.
     - IMAGE="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')"
@@ -198,10 +256,11 @@ build:aarch64:
   tags: [saas-linux-small-arm64]
 
 # --- deploy: assemble the members and push to THIS PIPELINE's channel -------------
-# Same as the base recipe, except the channel is chosen by the trigger: a `v*` tag
-# publishes to `stable`, anything else (a default-branch push) to the default `latest`.
-# `$CI_COMMIT_TAG` is set only on a tag pipeline, so we add `--channel stable` then and
-# omit the flag otherwise — letting bootcher use its built-in `latest` default.
+# Same as the base recipe, except the channel is chosen by the trigger: a refresh
+# publishes to the channel it refreshes (SCHEDULE_CHANNEL), a `v*` tag to `stable`,
+# anything else (a default-branch push or plain schedule) to the default `latest`. We add
+# `--channel <c>` then and omit the flag otherwise — letting bootcher use its built-in
+# `latest` default.
 deploy:
   stage: deploy
   # artifacts: false — members travel through the Container Registry now (see `.build`).
@@ -219,6 +278,7 @@ deploy:
   script:
     # Nothing was built (see `base-check`), so there's nothing to publish.
     - if [ "${BASE_CHANGED:-true}" = false ]; then echo "base image unchanged, nothing to deploy"; exit 0; fi
+    - !reference [.source-checkout, script]
     # Derive the refs from bootcher.toml (see ../gitlab-ci.yml). IMAGE is the scratch-tag
     # base; NAME the local member basename `deploy --skip-build` retags to.
     - IMAGE="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')"
@@ -235,10 +295,14 @@ deploy:
         podman tag "$scratch" "localhost/${NAME}:latest-${arch}"
       done
     # Signing? Fetch the cosign key from Secure Files first (see ../gitlab-ci.yml).
-    # `--channel stable` on a tag pipeline; otherwise no flag → bootcher's `latest`.
-    # `--skip-bootc-upgrade` leaves the rollout to each device's auto-update timer.
+    # `--channel <c>` on a refresh of <c> or (stable) a tag pipeline; otherwise no flag →
+    # bootcher's `latest`. `--skip-bootc-upgrade` leaves the rollout to each device's
+    # auto-update timer. Map your own channels to triggers here.
     - |
-      if [ -n "${CI_COMMIT_TAG:-}" ]; then CHANNEL=stable; else CHANNEL=; fi
+      if [ "$CI_PIPELINE_SOURCE" = schedule ]; then CHANNEL="${SCHEDULE_CHANNEL:-}"
+      elif [ -n "${CI_COMMIT_TAG:-}" ]; then CHANNEL=stable
+      else CHANNEL=; fi
+      if [ "$CHANNEL" = latest ]; then CHANNEL=; fi
       if [ -n "$CHANNEL" ]; then
         echo "deploying to channel: $CHANNEL"
         bootcher --manifest bootcher.ci.toml deploy --skip-build --skip-bootc-upgrade --channel "$CHANNEL"

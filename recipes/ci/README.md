@@ -225,8 +225,8 @@ Time the schedule ahead of the window you want the reboot in. A private base ima
 its own `skopeo login` in the check. With at most weekly rebuilds, `KEEP_PREVIOUS` is at
 least that many weeks of rollback.
 
-With [channels](channels/README.md), the schedule refreshes only `latest`. To patch
-`stable` without a release, run the pipeline manually on the current `v*` tag.
+With [channels](channels/README.md), each channel gets its own staggered schedule, and a
+refresh rebuilds the commit that channel currently ships (from its image's revision label).
 
 ## Pruning old published images
 
