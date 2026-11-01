@@ -40,6 +40,10 @@ RUN cargo build --release --locked -p bootcher-cli
 # already compressed) before uploading it to a release/package registry. Baked in
 # here so the pipelines need no `dnf install` step — the published image is
 # self-sufficient for the recipes it ships.
+#
+# skopeo: lets CI pipelines read registry manifests directly (a published image's
+# annotations and labels, its base's per-arch digests); podman can't fetch a remote
+# image manifest.
 FROM quay.io/fedora/fedora:44
 RUN dnf install -y --setopt=install_weak_deps=False \
       podman \
@@ -63,6 +67,7 @@ RUN dnf install -y --setopt=install_weak_deps=False \
       unzip \
       zip \
       python3 \
+      skopeo \
  && dnf clean all
 
 COPY --from=builder /src/target/release/bootcher /usr/bin/bootcher
