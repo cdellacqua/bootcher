@@ -44,6 +44,11 @@ RUN cargo build --release --locked -p bootcher-cli
 # skopeo: lets CI pipelines read registry manifests directly (a published image's
 # annotations and labels, its base's per-arch digests); podman can't fetch a remote
 # image manifest.
+#
+# git-core: bootcher stamps git provenance (`org.opencontainers.image.revision` /
+# `.version` labels, the CalVer tag's commit suffix) by shelling out to git, which is
+# silently skipped without it — and actions/checkout falls back to a .git-less tarball
+# download when the job container has no git.
 FROM quay.io/fedora/fedora:44
 RUN dnf install -y --setopt=install_weak_deps=False \
       podman \
@@ -68,6 +73,7 @@ RUN dnf install -y --setopt=install_weak_deps=False \
       zip \
       python3 \
       skopeo \
+      git-core \
  && dnf clean all
 
 COPY --from=builder /src/target/release/bootcher /usr/bin/bootcher
