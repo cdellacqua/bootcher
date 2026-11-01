@@ -15,13 +15,8 @@
 #   Tuesday schedule         → refresh `stable`                       (base-image updates)
 #   manual run on main/a tag → rebuild it into `latest` / `stable`, unconditionally
 #
-# A refresh rebuilds the exact commit its channel currently ships — read from the
-# `org.opencontainers.image.revision` label bootcher stamps on every image — on today's
-# base. So it never ships unreleased source, and it works for any channel whatever feeds
-# it (tags, a branch, a hand-pushed rollback). The schedules are staggered so the canary
-# fleet runs a new Fedora base for a few days before production gets it; each skips the
-# build when the base hasn't moved since its channel was last published (see the
-# `changes` job). Adding a channel? Give it a cron line and an entry in SCHEDULES there.
+# A refresh rebuilds the commit its channel currently ships on today's base, if the base
+# moved (see ../README.md).
 #
 # THE MECHANISM (see ../../../../docs/src/reference/bootcher-toml.md#channels). A channel
 # is a mutable registry tag `<registry>/<name>:<channel>` that a SUBSET of devices
@@ -65,16 +60,13 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
-  # Weekly per-channel base-image refreshes, each skipped when the base hasn't moved (see
-  # the header and the base recipe's `schedule:` comment for the caveats). The `changes`
-  # job maps each cron string to its channel (SCHEDULES), so a retimed or added line must
-  # be mirrored there exactly.
+  # One base-image refresh per channel, mirrored in the `changes` job's SCHEDULES.
   schedule:
     - cron: "17 3 * * 6" # Saturday: latest
     - cron: "17 3 * * 2" # Tuesday: stable
   workflow_dispatch:
 
-# One run at a time (shared <image>:ci-<arch> scratch tags), queued rather than cancelled.
+# Runs share the <image>:ci-<arch> scratch tags: queue them, never overlap.
 concurrency:
   group: bootcher-deploy
   cancel-in-progress: false
@@ -86,17 +78,13 @@ concurrency:
 env:
   # cleanup keeps :latest/:stable + this many previous immutable CalVer releases; older
   # ones (and the per-arch layers only they referenced) are pruned after a successful
-  # deploy. CalVer tags are shared across channels, so one knob covers both fleets; with
-  # both schedules firing, that's up to two releases a week.
+  # deploy. CalVer tags are shared across channels, so one knob covers both fleets.
   KEEP_PREVIOUS: "5"
 
 jobs:
   # --- changes: did anything that affects the image actually change? ----------------
-  # Like the base recipe: an allowlist of image inputs; a `v*` tag bypasses it in
-  # `build.if`. A manual run always builds; a scheduled one builds only if the base image
-  # moved since its channel was last published (the last step; see the base recipe).
-  # Adjust the list to your project. It also decides which channel this run publishes to,
-  # and which commit build/deploy check out (outputs `channel` and `ref`).
+  # Like the base recipe (adjust the allowlist to your project), plus it picks this run's
+  # channel and, for a refresh, the commit to rebuild.
   changes:
     runs-on: ubuntu-24.04
     permissions:
@@ -104,12 +92,12 @@ jobs:
       packages: read # the base-image check reads the published image
     outputs:
       channel: ${{ steps.channel.outputs.channel }}
-      ref: ${{ steps.base.outputs.ref }}
+      ref: ${{ steps.base.outputs.SOURCE_REV }}
       # push → the path filter; schedule → the base-image check; manual → always.
       image: >-
         ${{ github.event_name == 'workflow_dispatch'
         || (github.event_name == 'push' && steps.filter.outputs.image == 'true')
-        || (github.event_name == 'schedule' && steps.base.outputs.changed == 'true') }}
+        || (github.event_name == 'schedule' && steps.base.outputs.BASE_CHANGED == 'true') }}
     steps:
       - uses: actions/checkout@v4
       - if: github.event_name == 'push'
@@ -123,10 +111,8 @@ jobs:
               - bootcher.toml
               - bootcher.ci.toml
               - .github/workflows/bootcher-deploy.yml
-      # Which channel this run publishes to. A schedule → the channel SCHEDULES maps its
-      # cron string to (one `<channel> <cron>` per line, mirroring `schedule:`). A tag ref
-      # (a `v*` push, or a manual run on a tag) → `stable`. Anything else → empty, i.e.
-      # bootcher's default `latest`. Map your own channels to triggers here.
+      # A schedule → its channel per SCHEDULES (`<channel> <cron>`, mirroring `schedule:`);
+      # a tag ref → `stable`; anything else → empty, bootcher's default `latest`.
       - name: Resolve channel
         id: channel
         run: |
@@ -147,80 +133,82 @@ jobs:
           SCHEDULES: |
             latest 17 3 * * 6
             stable 17 3 * * 2
-      # Scheduled runs only: skip the rebuild when the base image hasn't moved since the
-      # published one was built. buildah stamps every built image with the base it came
-      # FROM (`org.opencontainers.image.base.name` — ARGs already resolved — and
-      # `.base.digest`, the per-arch manifest digest), and those annotations survive into
-      # the published members. So for each published arch, compare that digest with the
-      # base tag's current one for the same arch; any difference — or anything that can't
-      # be checked (first run, an image built before this check, a registry hiccup) —
-      # rebuilds, so a failure here never costs a security update. A manual run always
-      # rebuilds: use it for package updates your Containerfile layers on top, which are
-      # otherwise only picked up when the base itself moves. The ref comes from `bootcher
-      # info` (as in the other jobs), run from the published image; skopeo is on the runner.
-      # A private base image needs its own `skopeo login`.
-      #
-      # It also picks the commit to rebuild: the `org.opencontainers.image.revision` label
-      # of the image the channel currently ships, so the refresh is the same source on a
-      # new base. With no usable label (an image built before bootcher v0.2.6 shipped git,
-      # or deployed from a dirty tree), `latest` falls back to the triggering ref (main);
-      # any other channel fails the run rather than guess what to ship — publish it once
-      # the normal way (or with a manual run) and the next refresh has a label to follow.
+      # Scheduled runs: compare the base digest buildah recorded in each published member
+      # with the base tag's current one; anything uncheckable rebuilds. Also emits the commit
+      # the channel ships (SOURCE_REV), for a refresh to rebuild. A private base image needs
+      # its own `skopeo login`.
+      - name: Resolve image ref
+        if: github.event_name == 'schedule'
+        run: |
+          set -eu
+          image="$(docker run --rm -v "$PWD:/w" -w /w ghcr.io/cdellacqua/bootcher:latest \
+            --manifest bootcher.ci.toml info --format '{{ .Image }}')"
+          test -n "$image" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see README)"; exit 1; }
+          echo "IMAGE=$image" >> "$GITHUB_ENV"
+          echo "$GITHUB_TOKEN" | skopeo login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Check whether the base image moved
         if: github.event_name == 'schedule'
         id: base
-        run: |
-          set -eu
-          rebuild() { echo "rebuilding: $*"; echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0; }
-          IMAGE="$(docker run --rm -v "$PWD:/w" -w /w ghcr.io/cdellacqua/bootcher:latest \
-            --manifest bootcher.ci.toml info --format '{{ .Image }}')"
-          test -n "$IMAGE" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see README)"; exit 1; }
-          TAG="$IMAGE:${CHANNEL:-latest}" # the channel this run refreshes
-          echo "$GITHUB_TOKEN" | skopeo login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-          if ! index="$(skopeo inspect --raw "docker://$TAG")"; then
-            test -z "$CHANNEL" || { echo "nothing published to $TAG yet: nothing to refresh"; echo "changed=false" >> "$GITHUB_OUTPUT"; exit 0; }
-            rebuild "no published $TAG to compare against"
-          fi
-          # The commit the channel ships (every arch member carries the same label).
-          first="$(jq -r 'first(.manifests[] | select(.platform.architecture != "unknown") | .digest)' <<<"$index")"
-          rev="$(skopeo inspect --config "docker://$IMAGE@$first" | jq -r '.config.Labels."org.opencontainers.image.revision" // empty')" || rev=''
-          case "$rev" in
-            ''|*-dirty)
-              if [ -n "$CHANNEL" ]; then
-                echo "::error::$TAG records no clean source revision ('$rev'), so there's no telling what to rebuild — publish it once with a normal deploy or a manual run"
-                exit 1
-              fi
-              echo "$TAG records no clean source revision ('$rev'): refreshing from $GITHUB_REF" ;;
-            *)
-              echo "$TAG ships $rev"
-              echo "ref=$rev" >> "$GITHUB_OUTPUT" ;;
-          esac
-          for digest in $(jq -r '.manifests[] | select(.platform.architecture != "unknown") | .digest' <<<"$index"); do
-            arch="$(jq -r --arg d "$digest" '.manifests[] | select(.digest == $d) | .platform.architecture' <<<"$index")"
-            annotations="$(skopeo inspect --raw "docker://$IMAGE@$digest" | jq -c '.annotations // {}')" \
-              || rebuild "$arch: can't read the published member"
-            base="$(jq -r '."org.opencontainers.image.base.name" // empty' <<<"$annotations")"
-            built="$(jq -r '."org.opencontainers.image.base.digest" // empty' <<<"$annotations")"
-            { [ -n "$base" ] && [ -n "$built" ]; } || rebuild "$arch: the published image records no base"
-            raw="$(skopeo inspect --raw "docker://$base")" || rebuild "$arch: can't inspect $base"
-            current="$(jq -r --arg a "$arch" 'first(.manifests[]? | select(.platform.architecture == $a) | .digest) // empty' <<<"$raw")"
-            [ -n "$current" ] || current="$(skopeo inspect --format '{{.Digest}}' "docker://$base")" \
-              || rebuild "$arch: can't inspect $base"
-            [ "$current" = "$built" ] || rebuild "$arch: $base moved ($built -> $current)"
-            echo "$arch: $base unchanged ($built)"
-          done
-          echo "base image unchanged since the last publish: skipping the rebuild"
-          echo "changed=false" >> "$GITHUB_OUTPUT"
+        shell: python3 {0}
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CHANNEL: ${{ steps.channel.outputs.channel }}
+        run: |
+          import json, os, subprocess, sys
+
+          image, channel = os.environ["IMAGE"], os.environ.get("CHANNEL") or "latest"
+          out = open(os.environ.get("GITHUB_OUTPUT") or "base.env", "a")
+
+          def inspect(*args):
+              run = subprocess.run(["skopeo", "inspect", *args], capture_output=True, text=True, check=True)
+              return json.loads(run.stdout)
+
+          def arch_of(manifest):
+              return manifest.get("platform", {}).get("architecture", "unknown")
+
+          def done(changed, why):
+              print(why)
+              out.write(f"BASE_CHANGED={str(changed).lower()}\n")
+              sys.exit(0)
+
+          try:
+              index = inspect("--raw", f"docker://{image}:{channel}")
+          except subprocess.CalledProcessError:
+              done(channel == "latest", f"nothing published to {image}:{channel} yet")
+          members = {m["digest"]: arch_of(m) for m in index["manifests"] if arch_of(m) != "unknown"}
+
+          # The commit the channel ships: a refresh rebuilds it on the new base.
+          try:
+              labels = inspect("--config", f"docker://{image}@{next(iter(members))}")["config"].get("Labels") or {}
+          except subprocess.CalledProcessError:
+              labels = {}
+          rev = labels.get("org.opencontainers.image.revision", "")
+          if rev and not rev.endswith("-dirty"):
+              print(f"{image}:{channel} ships {rev}")
+              out.write(f"SOURCE_REV={rev}\n")
+          elif channel != "latest":
+              sys.exit(f"{image}:{channel} records no clean source revision ({rev!r}); publish it once with a normal deploy")
+
+          for digest, arch in members.items():
+              try:
+                  annotations = inspect("--raw", f"docker://{image}@{digest}").get("annotations", {})
+                  base = annotations["org.opencontainers.image.base.name"]
+                  built = annotations["org.opencontainers.image.base.digest"]
+                  current = next((m["digest"] for m in inspect("--raw", f"docker://{base}").get("manifests", [])
+                                  if arch_of(m) == arch), None) or inspect(f"docker://{base}")["Digest"]
+              except (subprocess.CalledProcessError, KeyError) as e:
+                  done(True, f"{arch}: can't check the base ({e!r}), rebuilding")
+              if current != built:
+                  done(True, f"{arch}: {base} moved ({built} -> {current}), rebuilding")
+              print(f"{arch}: {base} unchanged")
+          done(False, "base image unchanged since the last publish, skipping the rebuild")
 
   # --- build: one container per arch, on a native-arch runner -----------------------
   # Same as the base recipe — channel-agnostic (it pushes the member to a scratch tag
   # <image>:ci-<arch>; see ../../github-actions/deploy.yml for why the registry, not a run
   # artifact). The member is the same whether deploy later publishes it to :latest or
-  # :stable; the channel is chosen only at push time, in `deploy`. On a refresh it checks
-  # out the commit `changes` resolved (empty otherwise: the triggering ref).
+  # :stable; the channel is chosen only at push time, in `deploy`.
   build:
     needs: [changes]
     if: needs.changes.outputs.image == 'true' || startsWith(github.ref, 'refs/tags/')
@@ -240,10 +228,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.changes.outputs.ref }}
-          # Tags too, so a refresh checked out by commit still gets its release name from
-          # `git describe` (the version label), as on a tag push.
-          fetch-tags: true
+          ref: ${{ needs.changes.outputs.ref }} # a refresh's commit; empty → the trigger's
+          fetch-tags: true # so `git describe` still names the release
       # Real-fs container store (loopback ext4 so podman does one kernel overlay instead
       # of fuse-overlayfs-on-overlay). Self-skips on a real fs. Full rationale: the
       # header of ../../github-actions/deploy.yml.
@@ -290,12 +276,10 @@ jobs:
           podman push "$scratch"
 
   # --- deploy: assemble the members and push to THIS RUN's channel ------------------
-  # Same as the base recipe, except it publishes to the channel `changes` resolved: the
-  # refreshed channel on a schedule, `stable` for a tag ref, otherwise empty — then we
-  # omit the flag entirely, so bootcher uses its built-in `latest` default (and never has
-  # to be told a channel for the common case).
+  # Same as the base recipe, except it publishes to the channel `changes` resolved (empty
+  # → no flag → bootcher's `latest` default).
   deploy:
-    needs: [changes, build] # build waits for every matrix arch; changes has the channel
+    needs: [changes, build]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -306,7 +290,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.changes.outputs.ref }} # same source build built
+          ref: ${{ needs.changes.outputs.ref }}
           fetch-tags: true
       - name: Prepare container store
         run: |
@@ -355,9 +339,9 @@ jobs:
       #   env: { SIGN_KEY: "${{ secrets.SIGN_KEY }}" }
       - name: Deploy to channel
         # The members were pulled + retagged above; assemble + push under this run's
-        # channel. `--channel` is added only for `stable`; otherwise CHANNEL is empty and
-        # falls through to bootcher's `latest` default. `--skip-bootc-upgrade`
-        # leaves the rollout to each device's auto-update timer (see ../../README.md).
+        # channel (`--channel` only when CHANNEL is set; empty → bootcher's `latest`).
+        # `--skip-bootc-upgrade` leaves the rollout to each device's auto-update timer (see
+        # ../../README.md).
         run: |
           set -eu
           if [ -n "${CHANNEL:-}" ]; then

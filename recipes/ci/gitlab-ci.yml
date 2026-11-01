@@ -30,15 +30,9 @@
 # input changed (Containerfile, sysroot/, the manifests), so a docs-only push is a
 # no-op; a `v*` tag always builds. Tune the allowlist there to your project.
 #
-# Weekly rebuilds: `FROM` a floating fedora-bootc tag only moves when you rebuild, so add
-# a pipeline schedule (Build → Pipeline schedules → New schedule, e.g. `17 3 * * 6`, on
-# the default branch) to pull the base image's security updates with nothing changed
-# here. `rules:changes` evaluates to true when there's no push to diff, so the path gate
-# lets a scheduled pipeline through; the `base-check` job then skips the build unless the
-# base image actually moved. Every rebuild is a new digest, so devices download it and
-# reboot on their next bootc-fetch-apply-updates run — time the schedule ahead of the
-# window you want that in. The manual provision jobs show up in scheduled pipelines too;
-# leave them unstarted.
+# Weekly rebuilds: add a pipeline schedule on the default branch (e.g. `17 3 * * 6`); it
+# rebuilds only if the base image moved (see `base-check` and README.md). The manual
+# provision jobs show up in scheduled pipelines too; leave them unstarted.
 #
 # Why split the build per arch? A multi-arch `bootcher deploy` on a single runner would
 # build the foreign arch under qemu-user emulation — slow and occasionally fragile.
@@ -196,19 +190,9 @@ stages: [build, deploy, provision]
           - .gitlab-ci.yml
 
 # --- base-check: did the base image move since the last publish? (schedules only) --
-# A scheduled pipeline (see the header) exists to pick up base-image updates, so it's
-# pointless — and costs every device a download and reboot — when the base hasn't moved.
-# buildah stamps every built image with the base it came FROM
-# (`org.opencontainers.image.base.name` — ARGs already resolved — and `.base.digest`,
-# the per-arch manifest digest), and those annotations survive into the published
-# members. So for each published arch, compare that digest with the base tag's current
-# one for the same arch. Any difference — or anything that can't be checked (first run, an
-# image built before this check, a registry hiccup) — rebuilds, so a failure here never
-# costs a security update. The verdict travels to `.build` and `deploy` as BASE_CHANGED
-# (a dotenv report); with `false` they exit early, green. A pipeline you run by hand isn't
-# a schedule, so it always rebuilds: use it for package updates your Containerfile layers
-# on top, which are otherwise only picked up when the base itself moves. Needs skopeo in
-# the bootcher image (bootcher v0.2.6+). A private base image needs its own `skopeo login`.
+# Compares the base digest buildah recorded in each published member with the base
+# tag's current one; anything uncheckable rebuilds. Hands BASE_CHANGED to
+# `.build`/`deploy` as a dotenv report. A private base image needs its own `skopeo login`.
 base-check:
   stage: build
   rules:
@@ -218,27 +202,59 @@ base-check:
   script:
     - IMAGE="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')"
     - test -n "$IMAGE" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see README)"; exit 1; }
+    - export IMAGE
     - echo "$CI_REGISTRY_PASSWORD" | skopeo login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
     - |
-      rebuild() { echo "rebuilding: $*"; echo "BASE_CHANGED=true" > base.env; exit 0; }
-      index="$(skopeo inspect --raw "docker://$IMAGE:latest")" \
-        || rebuild "no published $IMAGE:latest to compare against"
-      for digest in $(printf '%s' "$index" | jq -r '.manifests[] | select(.platform.architecture != "unknown") | .digest'); do
-        arch="$(printf '%s' "$index" | jq -r --arg d "$digest" '.manifests[] | select(.digest == $d) | .platform.architecture')"
-        annotations="$(skopeo inspect --raw "docker://$IMAGE@$digest")" \
-          || rebuild "$arch: can't read the published member"
-        base="$(printf '%s' "$annotations" | jq -r '.annotations."org.opencontainers.image.base.name" // empty')"
-        built="$(printf '%s' "$annotations" | jq -r '.annotations."org.opencontainers.image.base.digest" // empty')"
-        { [ -n "$base" ] && [ -n "$built" ]; } || rebuild "$arch: the published image records no base"
-        raw="$(skopeo inspect --raw "docker://$base")" || rebuild "$arch: can't inspect $base"
-        current="$(printf '%s' "$raw" | jq -r --arg a "$arch" 'first(.manifests[]? | select(.platform.architecture == $a) | .digest) // empty')"
-        [ -n "$current" ] || current="$(skopeo inspect --format '{{.Digest}}' "docker://$base")" \
-          || rebuild "$arch: can't inspect $base"
-        [ "$current" = "$built" ] || rebuild "$arch: $base moved ($built -> $current)"
-        echo "$arch: $base unchanged ($built)"
-      done
-      echo "base image unchanged since the last publish: skipping the rebuild"
-      echo "BASE_CHANGED=false" > base.env
+      python3 - <<'EOF'
+      import json, os, subprocess, sys
+
+      image, channel = os.environ["IMAGE"], os.environ.get("CHANNEL") or "latest"
+      out = open(os.environ.get("GITHUB_OUTPUT") or "base.env", "a")
+
+      def inspect(*args):
+          run = subprocess.run(["skopeo", "inspect", *args], capture_output=True, text=True, check=True)
+          return json.loads(run.stdout)
+
+      def arch_of(manifest):
+          return manifest.get("platform", {}).get("architecture", "unknown")
+
+      def done(changed, why):
+          print(why)
+          out.write(f"BASE_CHANGED={str(changed).lower()}\n")
+          sys.exit(0)
+
+      try:
+          index = inspect("--raw", f"docker://{image}:{channel}")
+      except subprocess.CalledProcessError:
+          done(channel == "latest", f"nothing published to {image}:{channel} yet")
+      members = {m["digest"]: arch_of(m) for m in index["manifests"] if arch_of(m) != "unknown"}
+
+      # The commit the channel ships: a refresh rebuilds it on the new base.
+      try:
+          labels = inspect("--config", f"docker://{image}@{next(iter(members))}")["config"].get("Labels") or {}
+      except subprocess.CalledProcessError:
+          labels = {}
+      rev = labels.get("org.opencontainers.image.revision", "")
+      if rev and not rev.endswith("-dirty"):
+          print(f"{image}:{channel} ships {rev}")
+          out.write(f"SOURCE_REV={rev}\n")
+      elif channel != "latest":
+          sys.exit(f"{image}:{channel} records no clean source revision ({rev!r}); publish it once with a normal deploy")
+
+      for digest, arch in members.items():
+          try:
+              annotations = inspect("--raw", f"docker://{image}@{digest}").get("annotations", {})
+              base = annotations["org.opencontainers.image.base.name"]
+              built = annotations["org.opencontainers.image.base.digest"]
+              current = next((m["digest"] for m in inspect("--raw", f"docker://{base}").get("manifests", [])
+                              if arch_of(m) == arch), None) or inspect(f"docker://{base}")["Digest"]
+          except (subprocess.CalledProcessError, KeyError) as e:
+              done(True, f"{arch}: can't check the base ({e!r}), rebuilding")
+          if current != built:
+              done(True, f"{arch}: {base} moved ({built} -> {current}), rebuilding")
+          print(f"{arch}: {base} unchanged")
+      done(False, "base image unchanged since the last publish, skipping the rebuild")
+      EOF
   artifacts:
     reports:
       dotenv: base.env
@@ -253,12 +269,10 @@ base-check:
   stage: build
   # Gate on image-affecting changes (see `.image-rules` above); tags always build.
   rules: !reference [.image-rules, rules]
-  # On a schedule, wait for base-check's verdict (absent otherwise, hence optional).
   needs:
     - job: base-check
       optional: true
   script:
-    # A schedule whose base image hasn't moved (see `base-check`) has nothing to build.
     - if [ "${BASE_CHANGED:-true}" = false ]; then echo "base image unchanged, nothing to build"; exit 0; fi
     # Derive the image ref from bootcher.toml (see the header): IMAGE is the base for the
     # :ci-<arch> scratch tag. Empty ⇒ LAN mode (no `[deploy] registry`); registry-mode only,
@@ -307,7 +321,7 @@ deploy:
   # Sequence behind both build jobs and gate on them. artifacts: false — the members
   # travel through the Container Registry now (see `.build`), not job artifacts.
   needs:
-    - job: base-check # carries BASE_CHANGED on a schedule
+    - job: base-check
       optional: true
     - job: "build:x86_64"
       artifacts: false
@@ -322,7 +336,6 @@ deploy:
   # variables:
   #   BOOTCHER_SIGN_PASSPHRASE: ""
   script:
-    # Nothing was built (see `base-check`), so there's nothing to publish.
     - if [ "${BASE_CHANGED:-true}" = false ]; then echo "base image unchanged, nothing to deploy"; exit 0; fi
     # Derive the refs from bootcher.toml (see the header). IMAGE is the scratch-tag base;
     # NAME the local member basename `deploy --skip-build` retags to.
