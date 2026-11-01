@@ -71,6 +71,11 @@ jobs:
       CHANNEL: ${{ inputs.channel }}
     steps:
       - uses: actions/checkout@v4
+      # The runner creates the workspace as its own user, but this job runs as root: hand
+      # it the checkout, or git refuses it ("dubious ownership") and the image loses its
+      # git provenance (revision/version labels, the CalVer tag's commit suffix).
+      - name: Own the checkout
+        run: chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
       - name: Prepare container store
         run: |
           set -eu
