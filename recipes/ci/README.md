@@ -207,9 +207,15 @@ reboot for nothing. buildah stamps each built image with its base
 (`org.opencontainers.image.base.name` / `.base.digest` annotations, `ARG`s resolved),
 and those survive into the published per-arch members. The scheduled check compares
 each member's recorded base digest with the base tag's current digest for that arch,
-and skips the build if they all match. Anything it can't verify (first run, an image
-built before the check existed, a registry error) rebuilds, so a broken check never
-costs you a security update.
+and skips the build if they all match. Anything it can't verify about the base (first
+run, an image built before the check existed, a base it can't inspect) rebuilds, so a
+broken check never costs you a security update. If it can't read the published image at
+all (an expired token, a registry outage), the run fails instead of skipping quietly.
+
+A refresh rebuilds **the commit `:latest` currently ships** (its
+`org.opencontainers.image.revision` label) rather than whatever the default branch points
+at. Normally those are the same source; if `:latest` has no label, the default branch
+it is.
 
 - **GitHub** — the `changes` job runs the check on a schedule (skopeo is on the runner;
   `bootcher info` runs from the published bootcher image) and gates `build` on it.
@@ -217,13 +223,16 @@ costs you a security update.
   `build`/`deploy` as a dotenv report; with `false` they exit early, green. It needs
   skopeo, which the bootcher image ships from v0.2.6.
 
-A **manual run always rebuilds**. Use it after a Fedora advisory, or for packages your
+A **manual run always rebuilds** (on GitHub, only from the default branch or a `v*`
+tag). Use it after a Fedora advisory, or for packages your
 `Containerfile` layers on top: those only refresh on a schedule when the base moves too,
 which for fedora-bootc is usually within the week.
 
 Time the schedule ahead of the window you want the reboot in. A private base image needs
-its own `skopeo login` in the check. With at most weekly rebuilds, `KEEP_PREVIOUS` is at
-least that many weeks of rollback.
+its own `skopeo login` in the check. Refreshes and pushes share `KEEP_PREVIOUS`, so with
+weekly refreshes it covers at most that many weeks of rollback, and fewer with several
+channels or frequent pushes. Scheduled pipelines don't offer the GitLab `provision` jobs:
+provision from a push or tag pipeline.
 
 With [channels](channels/README.md), each channel gets its own staggered schedule, and a
 refresh rebuilds the commit that channel currently ships (from its image's revision label).

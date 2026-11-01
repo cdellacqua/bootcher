@@ -51,8 +51,8 @@
 # overwritten every run. Tradeoff: `build` now needs `packages: write` (it previously
 # needed no registry credentials). This is CI-only — the scratch tags and login live in
 # the workflow, so `bootcher build`/`deploy` on a dev box are untouched. NOTE: the stable
-# <image>:ci-<arch> tag assumes serial pushes, which the workflow's `concurrency` group
-# enforces (overlapping runs queue instead of clobbering each other's member).
+# <image>:ci-<arch> tag assumes serial pushes; two overlapping runs could clobber each
+# other's member — fine for a low-traffic repo, otherwise scope the tag with the run id.
 #
 # Both jobs run inside the published bootcher image (ghcr.io/cdellacqua/bootcher —
 # multi-arch, bundles podman + qemu), so there's nothing to install; they need a
@@ -102,12 +102,7 @@ on:
   # new build on their update timer: time this ahead of that window.
   schedule:
     - cron: "17 3 * * 6"
-  workflow_dispatch: # an unconditional rebuild on demand
-
-# Runs share the <image>:ci-<arch> scratch tags: queue them, never overlap.
-concurrency:
-  group: bootcher-deploy
-  cancel-in-progress: false
+  workflow_dispatch: # an unconditional rebuild of main or a `v*` tag, on demand
 
 # No image ref to configure: every job derives it from bootcher.toml at runtime with
 # `bootcher info --format` (see the "Resolve image ref" steps), so the `<registry>/<name>`
@@ -146,9 +141,12 @@ jobs:
       contents: read
       packages: read # the base-image check reads the published image
     outputs:
-      # push → the path filter; schedule → the base-image check; manual → always.
+      ref: ${{ steps.base.outputs.SOURCE_REV }} # a refresh's commit; empty → the trigger's
+      # push → the path filter; schedule → the base-image check; manual → always, but only
+      # on main or a `v*` tag (anything else would publish an arbitrary branch).
       image: >-
-        ${{ github.event_name == 'workflow_dispatch'
+        ${{ (github.event_name == 'workflow_dispatch'
+        && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))
         || (github.event_name == 'push' && steps.filter.outputs.image == 'true')
         || (github.event_name == 'schedule' && steps.base.outputs.BASE_CHANGED == 'true') }}
     steps:
@@ -165,8 +163,9 @@ jobs:
               - bootcher.ci.toml
               - .github/workflows/bootcher-deploy.yml
       # Scheduled runs: compare the base digest buildah recorded in each published member
-      # with the base tag's current one; anything uncheckable rebuilds. A private base image
-      # needs its own `skopeo login`.
+      # with the base tag's current one; anything uncheckable rebuilds. Also emits the commit
+      # :latest ships (SOURCE_REV), which build/deploy rebuild. A private base image needs
+      # its own `skopeo login`.
       - name: Resolve image ref
         if: github.event_name == 'schedule'
         run: |
@@ -189,44 +188,58 @@ jobs:
           out = open(os.environ.get("GITHUB_OUTPUT") or "base.env", "a")
 
           def inspect(*args):
-              run = subprocess.run(["skopeo", "inspect", *args], capture_output=True, text=True, check=True)
+              run = subprocess.run(["skopeo", "inspect", *args], capture_output=True, text=True)
+              if run.returncode:
+                  raise LookupError(run.stderr.strip())
               return json.loads(run.stdout)
-
-          def arch_of(manifest):
-              return manifest.get("platform", {}).get("architecture", "unknown")
 
           def done(changed, why):
               print(why)
               out.write(f"BASE_CHANGED={str(changed).lower()}\n")
               sys.exit(0)
 
+          def fail(why):
+              sys.exit(f"{image}:{channel}: {why}")
+
           try:
-              index = inspect("--raw", f"docker://{image}:{channel}")
-          except subprocess.CalledProcessError:
+              top = inspect("--raw", f"docker://{image}:{channel}")
+          except LookupError as e:
+              if "manifest unknown" not in str(e):
+                  fail(f"can't read it: {e}")
               done(channel == "latest", f"nothing published to {image}:{channel} yet")
-          members = {m["digest"]: arch_of(m) for m in index["manifests"] if arch_of(m) != "unknown"}
+
+          # A list's per-arch members (attestations have no real platform), or a lone image.
+          if "manifests" in top:
+              refs = [f"{image}@{m['digest']}" for m in top["manifests"]
+                      if m.get("platform", {}).get("architecture", "unknown") != "unknown"]
+          else:
+              refs = [f"{image}:{channel}"]
 
           # The commit the channel ships: a refresh rebuilds it on the new base.
           try:
-              labels = inspect("--config", f"docker://{image}@{next(iter(members))}")["config"].get("Labels") or {}
-          except subprocess.CalledProcessError:
+              labels = inspect("--config", f"docker://{refs[0]}")["config"].get("Labels") or {}
+          except (LookupError, IndexError, KeyError, ValueError):
               labels = {}
           rev = labels.get("org.opencontainers.image.revision", "")
           if rev and not rev.endswith("-dirty"):
               print(f"{image}:{channel} ships {rev}")
               out.write(f"SOURCE_REV={rev}\n")
           elif channel != "latest":
-              sys.exit(f"{image}:{channel} records no clean source revision ({rev!r}); publish it once with a normal deploy")
+              fail(f"no clean source revision recorded ({rev!r}); publish it once with a normal deploy")
+          if not refs:
+              done(True, f"{image}:{channel} lists no image to check, rebuilding")
 
-          for digest, arch in members.items():
+          for ref in refs:
               try:
-                  annotations = inspect("--raw", f"docker://{image}@{digest}").get("annotations", {})
+                  arch = inspect("--config", f"docker://{ref}")["architecture"]
+                  annotations = inspect("--raw", f"docker://{ref}").get("annotations", {})
                   base = annotations["org.opencontainers.image.base.name"]
                   built = annotations["org.opencontainers.image.base.digest"]
                   current = next((m["digest"] for m in inspect("--raw", f"docker://{base}").get("manifests", [])
-                                  if arch_of(m) == arch), None) or inspect(f"docker://{base}")["Digest"]
-              except (subprocess.CalledProcessError, KeyError) as e:
-                  done(True, f"{arch}: can't check the base ({e!r}), rebuilding")
+                                  if m.get("platform", {}).get("architecture") == arch), None) \
+                      or inspect(f"docker://{base}")["Digest"]
+              except (LookupError, KeyError, ValueError) as e:
+                  done(True, f"{ref}: can't check the base ({e!r}), rebuilding")
               if current != built:
                   done(True, f"{arch}: {base} moved ({built} -> {current}), rebuilding")
               print(f"{arch}: {base} unchanged")
@@ -242,7 +255,7 @@ jobs:
     # Gate on the change filter (see the `changes` job); a `v*` tag always builds.
     # deploy needs this job, so a skip here cascades and skips it too.
     needs: [changes]
-    if: needs.changes.outputs.image == 'true' || startsWith(github.ref, 'refs/tags/')
+    if: needs.changes.outputs.image == 'true' || startsWith(github.ref, 'refs/tags/v')
     strategy:
       fail-fast: false
       matrix:
@@ -258,6 +271,9 @@ jobs:
       options: --privileged # podman builds the container image (nested)
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.changes.outputs.ref }}
+          fetch-tags: true # so `git describe` still names the release
       # Real-fs container store (see the header note): a loopback ext4 so podman does
       # one kernel overlay instead of fuse-overlayfs-on-overlay. Self-skips when the
       # store is already on a real fs.
@@ -315,7 +331,7 @@ jobs:
   # <registry>/<name>:latest (+ a CalVer tag). No container build, no disk step. Needs
   # `packages: write` (and the signing key, if enabled) to push :latest.
   deploy:
-    needs: [build] # waits for every matrix arch
+    needs: [changes, build] # build waits for every matrix arch
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -325,6 +341,9 @@ jobs:
       options: --privileged
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.changes.outputs.ref }}
+          fetch-tags: true # so `git describe` still names the release
       # Real-fs container store (see the header note): a loopback ext4 so podman does
       # one kernel overlay instead of fuse-overlayfs-on-overlay. Self-skips when the
       # store is already on a real fs.
