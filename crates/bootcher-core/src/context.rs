@@ -1487,10 +1487,14 @@ pub fn calver_now(short_sha: Option<&str>) -> String {
 /// labels (so a device's `bootc status` can name what it's running) and surfaced
 /// in `BOOTCHER_METADATA` for hooks.
 ///
-/// Strictly best-effort: every field is `None` when it can't be resolved — `dir`
-/// isn't a git work tree, `git` isn't installed, or the repo has no commit yet —
-/// so a project that doesn't live in git just builds without provenance rather
-/// than failing. This is the one place bootcher consults git; it never gates a build.
+/// Strictly best-effort: every field is `None` when it can't be resolved, and
+/// detection never fails a build. A project that doesn't live in git (`dir` isn't
+/// a git work tree) just builds without provenance, silently. Anything else that
+/// loses provenance — git refusing the repo (e.g. "dubious ownership" when the
+/// checkout belongs to another uid), a corrupt or commit-less repo, or no `git`
+/// binary while a `.git` is present — is reported as one `warning:` line on the
+/// job, quoting git's own error, so it can't pass for "not in git". This is the
+/// one place bootcher consults git; it never gates a build.
 #[derive(Clone, Debug, Default)]
 pub struct GitProvenance {
 	/// Full commit SHA (`git rev-parse HEAD`), suffixed `-dirty` when the work tree
@@ -1505,15 +1509,62 @@ pub struct GitProvenance {
 
 impl GitProvenance {
 	/// Detect the provenance of the work tree at `dir` (the build context). Runs a
-	/// few quiet `git` queries; any failure leaves the corresponding field `None`
-	/// (see the type docs). Called once on the build path, not from
+	/// few `git` queries; any failure leaves the corresponding field `None`, and a
+	/// failure other than "not a git repository" prints a single warning through
+	/// `job` (see the type docs). Called once on the build path, not from
 	/// [`Manifest::image`], so merely reading an image ref never shells out to git.
 	#[must_use]
-	pub fn detect(dir: &Path) -> Self {
-		let revision = git_capture(dir, &["rev-parse", "HEAD"])
-			.map(|sha| if git_dirty(dir) { format!("{sha}-dirty") } else { sha });
-		let version = git_capture(dir, &["describe", "--tags", "--always", "--dirty"]);
-		Self { revision, version }
+	pub fn detect(dir: &Path, job: &crate::progress::Scope) -> Self {
+		let (provenance, warning) = Self::resolve(dir);
+		if let Some(warning) = warning {
+			job.println(warning);
+		}
+		provenance
+	}
+
+	/// The detection itself, returning the warning line (if any) instead of
+	/// printing it, so tests can assert on it without a progress scope. Only the
+	/// first failure is reported: the later queries usually fail for the same reason.
+	fn resolve(dir: &Path) -> (Self, Option<String>) {
+		let mut failure: Option<String> = None;
+		let mut note = |e: GitError| {
+			if let GitError::Failed(reason) = e {
+				failure.get_or_insert(reason);
+			}
+		};
+		let revision = match git_run(dir, &["rev-parse", "HEAD"]) {
+			Ok(sha) if !sha.is_empty() => match git_run(dir, &["status", "--porcelain"]) {
+				Ok(status) if status.is_empty() => Some(sha),
+				Ok(_) => Some(format!("{sha}-dirty")),
+				// rev-parse worked but status didn't: keep the commit, without `-dirty`
+				// since we can't tell, and warn rather than read the failure as "clean".
+				Err(e) => {
+					note(e);
+					Some(sha)
+				}
+			},
+			Ok(_) => None,
+			Err(e) => {
+				note(e);
+				None
+			}
+		};
+		let version = match git_run(dir, &["describe", "--tags", "--always", "--dirty"]) {
+			Ok(v) => (!v.is_empty()).then_some(v),
+			Err(e) => {
+				note(e);
+				None
+			}
+		};
+		let warning = failure.map(|reason| {
+			let consequence = if revision.is_none() && version.is_none() {
+				"images will carry no revision/version labels"
+			} else {
+				"image revision/version labels may be incomplete or lack a -dirty marker"
+			};
+			format!("warning: git provenance unavailable ({reason}); {consequence}")
+		});
+		(Self { revision, version }, warning)
 	}
 
 	/// The abbreviated commit for use as the `CalVer` tag suffix (see [`calver_now`]):
@@ -1553,31 +1604,59 @@ impl GitProvenance {
 	}
 }
 
-/// Run `git -C <dir> <args>`, returning trimmed stdout, or `None` on any failure
-/// (not a git work tree, `git` missing, empty repo, non-zero exit). git's stderr is
-/// discarded — provenance detection is silent and best-effort. An empty result is
-/// also `None`, so a clean `git status --porcelain` reads as "no output".
-fn git_capture(dir: &Path, args: &[&str]) -> Option<String> {
-	let mut full: Vec<OsString> = vec!["-C".into(), dir.into()];
-	full.extend(args.iter().map(OsString::from));
-	duct::cmd("git", full)
-		.stderr_null()
-		.stdout_capture()
-		.unchecked()
-		.run()
-		.ok()
-		.filter(|o| o.status.success())
-		.and_then(|o| {
-			let s = String::from_utf8_lossy(&o.stdout).trim().to_owned();
-			(!s.is_empty()).then_some(s)
-		})
+/// Why a provenance `git` query produced nothing.
+#[derive(Debug, PartialEq, Eq)]
+enum GitError {
+	/// `dir` isn't in a git work tree (or there's neither `git` nor a `.git`): a
+	/// legitimate setup, so provenance is skipped silently.
+	NotARepo,
+	/// Anything else (git refused or failed, or isn't installed next to a `.git`),
+	/// carrying a one-line reason for the warning.
+	Failed(String),
 }
 
-/// Whether the work tree at `dir` has uncommitted changes (`git status --porcelain`
-/// is non-empty). Only consulted once `rev-parse HEAD` has confirmed `dir` is a git
-/// repo, so a `false` here always means "clean", never "not git".
-fn git_dirty(dir: &Path) -> bool {
-	git_capture(dir, &["status", "--porcelain"]).is_some()
+/// Run `git -C <dir> <args>`, returning trimmed stdout (possibly empty, so a clean
+/// `git status --porcelain` is `Ok("")`). Runs under `LC_ALL=C` so git's stderr is
+/// the untranslated text the failure classification matches on.
+fn git_run(dir: &Path, args: &[&str]) -> Result<String, GitError> {
+	let mut full: Vec<OsString> = vec!["-C".into(), dir.into()];
+	full.extend(args.iter().map(OsString::from));
+	let out = match duct::cmd("git", full)
+		.env("LC_ALL", "C")
+		.stdout_capture()
+		.stderr_capture()
+		.unchecked()
+		.run()
+	{
+		Ok(out) => out,
+		// git couldn't be spawned at all. Only worth a warning when the project
+		// evidently is in git; with no `.git` anywhere up the tree there was nothing
+		// to read anyway.
+		Err(e) => {
+			let abs = std::path::absolute(dir).unwrap_or_else(|_| dir.to_owned());
+			return if abs.ancestors().any(|a| a.join(".git").exists()) {
+				Err(GitError::Failed(format!("couldn't run git: {e}")))
+			} else {
+				Err(GitError::NotARepo)
+			};
+		}
+	};
+	if out.status.success() {
+		Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+	} else {
+		Err(classify_git_failure(&String::from_utf8_lossy(&out.stderr)))
+	}
+}
+
+/// Classify a non-zero `git` exit from its stderr: git's "not a git repository"
+/// (with or without the filesystem-boundary variant) is [`GitError::NotARepo`];
+/// anything else is a failure reported by git's first non-empty stderr line.
+fn classify_git_failure(stderr: &str) -> GitError {
+	if stderr.contains("not a git repository") {
+		return GitError::NotARepo;
+	}
+	let first = stderr.lines().map(str::trim).find(|l| !l.is_empty());
+	GitError::Failed(first.unwrap_or("git exited with an error and no message").to_owned())
 }
 
 #[cfg(test)]
@@ -1926,7 +2005,7 @@ mod tests {
 	}
 
 	/// Run `git -C dir <args>` in a test, asserting it succeeds — the setup half of
-	/// the provenance tests (the production [`git_capture`] is the read half).
+	/// the provenance tests (the production [`git_run`] is the read half).
 	fn git(dir: &Path, args: &[&str]) {
 		let mut full: Vec<OsString> = vec!["-C".into(), dir.into()];
 		full.extend(args.iter().map(OsString::from));
@@ -1950,16 +2029,18 @@ mod tests {
 		git(dir, &["tag", "v1.0.0"]);
 
 		// Clean tree: revision is the full HEAD sha (no `-dirty`), version is the tag.
-		let head = git_capture(dir, &["rev-parse", "HEAD"]).expect("HEAD sha");
-		let clean = GitProvenance::detect(dir);
+		let head = git_run(dir, &["rev-parse", "HEAD"]).expect("HEAD sha");
+		let (clean, warning) = GitProvenance::resolve(dir);
 		assert_eq!(clean.revision.as_deref(), Some(head.as_str()));
 		assert_eq!(clean.version.as_deref(), Some("v1.0.0"));
+		assert_eq!(warning, None, "a healthy repo warns about nothing");
 
 		// Dirty the work tree: both fields gain the `-dirty` suffix.
 		fs::write(dir.join("Containerfile"), "FROM scratch\nRUN true\n").unwrap();
-		let dirty = GitProvenance::detect(dir);
+		let (dirty, warning) = GitProvenance::resolve(dir);
 		assert_eq!(dirty.revision.as_deref(), Some(format!("{head}-dirty").as_str()));
 		assert_eq!(dirty.version.as_deref(), Some("v1.0.0-dirty"));
+		assert_eq!(warning, None);
 	}
 
 	#[test]
@@ -1975,8 +2056,9 @@ mod tests {
 		git(dir, &["commit", "-qm", "init"]);
 		// No tag: revision is still the full HEAD sha, but `git describe --always`
 		// falls back to the abbreviated sha — which is a prefix of the full revision.
-		let head = git_capture(dir, &["rev-parse", "HEAD"]).expect("HEAD sha");
-		let p = GitProvenance::detect(dir);
+		let head = git_run(dir, &["rev-parse", "HEAD"]).expect("HEAD sha");
+		let (p, warning) = GitProvenance::resolve(dir);
+		assert_eq!(warning, None);
 		assert_eq!(p.revision.as_deref(), Some(head.as_str()));
 		let version = p.version.expect("describe falls back to a short sha");
 		assert!(!version.is_empty(), "version is the abbreviated sha, not empty");
@@ -1988,12 +2070,59 @@ mod tests {
 
 	#[test]
 	fn provenance_is_empty_outside_a_git_tree() {
-		// A bare temp dir (no `git init`) resolves nothing — provenance is best-effort.
+		// A bare temp dir (no `git init`) resolves nothing — provenance is best-effort,
+		// and a project outside git is a legitimate setup, so nothing is warned either.
 		let dir = tempfile::TempDir::new().unwrap();
-		let p = GitProvenance::detect(dir.path());
+		let (p, warning) = GitProvenance::resolve(dir.path());
 		assert_eq!(p.revision, None);
 		assert_eq!(p.version, None);
 		assert!(p.label_args().is_empty());
+		assert_eq!(warning, None, "not being in git is silent");
+	}
+
+	#[test]
+	fn provenance_warns_in_a_repo_without_commits() {
+		// `git init` with no commit: git is clearly in use but HEAD resolves to nothing,
+		// so the labels are lost — that must be reported, quoting git's own error.
+		let repo = tempfile::TempDir::new().unwrap();
+		git(repo.path(), &["init", "-q"]);
+		let (p, warning) = GitProvenance::resolve(repo.path());
+		assert_eq!(p.revision, None);
+		assert_eq!(p.version, None);
+		let warning = warning.expect("an empty repo warns");
+		assert!(warning.starts_with("warning: git provenance unavailable (fatal: "), "{warning}");
+		assert!(warning.ends_with("; images will carry no revision/version labels"), "{warning}");
+	}
+
+	#[test]
+	fn git_failure_classification() {
+		// "Not a git repository" (incl. the filesystem-boundary wording) is silent.
+		assert_eq!(
+			classify_git_failure(
+				"fatal: not a git repository (or any of the parent directories): .git\n"
+			),
+			GitError::NotARepo
+		);
+		assert_eq!(
+			classify_git_failure(
+				"fatal: not a git repository (or any parent up to mount point /)\n\
+				 Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).\n"
+			),
+			GitError::NotARepo
+		);
+		// Dubious ownership (root building another uid's checkout) is a failure,
+		// reported by its first line only — not the multi-line safe.directory hint.
+		assert_eq!(
+			classify_git_failure(
+				"fatal: detected dubious ownership in repository at '/__w/x'\n\
+				 To add an exception for this directory, call:\n\
+				 \n\
+				 \tgit config --global --add safe.directory /__w/x\n"
+			),
+			GitError::Failed("fatal: detected dubious ownership in repository at '/__w/x'".into())
+		);
+		// No stderr at all still yields a reason rather than an empty pair of parens.
+		assert!(matches!(classify_git_failure(""), GitError::Failed(r) if !r.is_empty()));
 	}
 
 	#[test]

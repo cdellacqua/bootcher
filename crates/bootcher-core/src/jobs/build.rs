@@ -78,8 +78,9 @@ pub fn run(manifest: &Manifest, target: Option<Arch>, job: &mut Scope) -> Result
 	let hooks = manifest.hooks();
 	// Detect git provenance once (the build context is the project root, shared by
 	// every arch) and stamp it as OCI labels on each arch's `podman build`, plus
-	// surface it to the hooks below. Best-effort: absent outside a git work tree.
-	let provenance = crate::context::GitProvenance::detect(std::path::Path::new("."));
+	// surface it to the hooks below. Best-effort: absent outside a git work tree, and
+	// warned about (never fatal) when git is there but can't be read.
+	let provenance = crate::context::GitProvenance::detect(std::path::Path::new("."), job);
 	let labels = provenance.label_args();
 	for image in &mut images {
 		image.labels.clone_from(&labels);

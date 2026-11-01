@@ -292,7 +292,7 @@ pub(crate) fn run(
 	let files = provisioning.files();
 	let max_workers = manifest.concurrency().takeover;
 
-	let provenance = crate::context::GitProvenance::detect(std::path::Path::new("."));
+	let provenance = crate::context::GitProvenance::detect(std::path::Path::new("."), job);
 	// Compute the immutable CalVer tag now, while `provenance` is still whole (its
 	// fields are moved into `meta` just below).
 	let calver = crate::context::calver_now(provenance.short_sha().as_deref());
