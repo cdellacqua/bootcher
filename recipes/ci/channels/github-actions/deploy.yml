@@ -1,22 +1,31 @@
 # bootcher CI with RELEASE CHANNELS — GitHub Actions BUILD + DEPLOY half, multi-arch.
 #
-# A channels-aware variant of ../../github-actions/deploy.yml. The job *shape* is
+# Base recipe: https://github.com/cdellacqua/bootcher/blob/main/recipes/ci/github-actions/deploy.yml
+# Recipe docs: https://github.com/cdellacqua/bootcher/tree/main/recipes/ci
+#
+# A channels-aware variant of the base recipe. The job *shape* is
 # identical — build (per-arch, native runners) → deploy (assemble + push) → cleanup (prune
 # old versions) — plus the loopback container store, the `changes` path gate, and the
 # runtime `bootcher info` image-ref derivation, so this header only covers what's
 # DIFFERENT: which channel each trigger publishes to. For the store relocation, the
 # per-arch split rationale, the cleanup mechanics, and the secrets, read
-# ../../github-actions/deploy.yml and ../../README.md; nothing there changes. The disk
+# the base recipe and the recipe docs; nothing there changes. The disk
 # build is the sibling provision.yml.
 #
-#   push to main  → deploy to the default `latest` channel  (rolling / canary fleet)
-#   push a v* tag → deploy to the `stable` channel          (production fleet)
+#   push to main             → deploy to the default `latest` channel (rolling / canary)
+#   push a v* tag            → deploy to the `stable` channel         (production fleet)
+#   Saturday schedule        → refresh `latest`                       (base-image updates)
+#   Tuesday schedule         → refresh `stable`                       (base-image updates)
+#   manual run on main/a tag → rebuild it into `latest` / `stable`, unconditionally
 #
-# THE MECHANISM (see ../../../../docs/src/reference/bootcher-toml.md#channels). A channel
-# is a mutable registry tag `<registry>/<name>:<channel>` that a SUBSET of devices
-# tracks. `bootcher deploy --channel stable` pushes the multi-arch list under :stable
-# instead of :latest, so only devices whose bootc origin is :stable pick it up. Every
-# deploy ALSO stamps that same digest with its immutable :CalVer tag regardless of
+# A refresh rebuilds the commit its channel currently ships on today's base, if the base
+# moved.
+#
+# THE MECHANISM (see https://cdellacqua.github.io/bootcher/book/reference/bootcher-toml.html#channels).
+# A channel is a mutable registry tag `<registry>/<name>:<channel>` that a SUBSET of
+# devices tracks. `bootcher deploy --channel stable` pushes the multi-arch list under
+# :stable instead of :latest, so only devices whose bootc origin is :stable pick it up.
+# Every deploy ALSO stamps that same digest with its immutable :CalVer tag regardless of
 # channel — so the version tag is the durable rollback/audit handle and the channel is
 # just a moving pointer to "what that audience sees now".
 #
@@ -46,7 +55,7 @@
 # The provision.yml sibling bakes whichever channel you pick into the disk, so a
 # stable-tracking or latest-tracking device is a matter of which channel you dispatch it
 # with. Secrets/variables and the `bootcher.ci.toml` override are unchanged — see
-# ../../README.md.
+# the recipe docs.
 
 name: bootcher deploy
 
@@ -54,6 +63,11 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+  # One base-image refresh per channel, mirrored in the `changes` job's SCHEDULES.
+  schedule:
+    - cron: "17 3 * * 6" # Saturday: latest
+    - cron: "17 3 * * 2" # Tuesday: stable
+  workflow_dispatch: # an unconditional rebuild of main or a `v*` tag, on demand
 
 # No image ref to configure: each job derives it from bootcher.toml at runtime with
 # `bootcher info` (see the "Resolve image ref" steps), same as the base recipe. The scratch
@@ -67,17 +81,27 @@ env:
 
 jobs:
   # --- changes: did anything that affects the image actually change? ----------------
-  # Identical to the base recipe: an allowlist of image inputs; a `v*` tag bypasses it
-  # in `build.if`. Adjust the list to your project.
+  # Like the base recipe (adjust the allowlist to your project), plus it picks this run's
+  # channel and, for a refresh, the commit to rebuild.
   changes:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+      packages: read # the base-image check reads the published image
     outputs:
-      image: ${{ steps.filter.outputs.image }}
+      channel: ${{ steps.channel.outputs.channel }}
+      ref: ${{ steps.base.outputs.SOURCE_REV }}
+      # push → the path filter; schedule → the base-image check; manual → always, but only
+      # on main or a `v*` tag (anything else would publish an arbitrary branch).
+      image: >-
+        ${{ (github.event_name == 'workflow_dispatch'
+        && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))
+        || (github.event_name == 'push' && steps.filter.outputs.image == 'true')
+        || (github.event_name == 'schedule' && steps.base.outputs.BASE_CHANGED == 'true') }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
+      - if: github.event_name == 'push'
+        uses: dorny/paths-filter@v3
         id: filter
         with:
           filters: |
@@ -87,15 +111,121 @@ jobs:
               - bootcher.toml
               - bootcher.ci.toml
               - .github/workflows/bootcher-deploy.yml
+      # A schedule → its channel per SCHEDULES (`<channel> <cron>`, mirroring `schedule:`);
+      # a tag ref → `stable`; anything else → empty, bootcher's default `latest`.
+      - name: Resolve channel
+        id: channel
+        run: |
+          set -eu
+          channel=''
+          if [ "$GITHUB_EVENT_NAME" = schedule ]; then
+            while read -r ch cron; do
+              if [ "$cron" = "$SCHEDULE" ]; then channel="$ch"; fi
+            done <<< "$SCHEDULES"
+            test -n "$channel" || { echo "::error::no SCHEDULES entry for cron '$SCHEDULE'"; exit 1; }
+            if [ "$channel" = latest ]; then channel=''; fi
+          elif [ "${GITHUB_REF#refs/tags/v}" != "$GITHUB_REF" ]; then
+            channel=stable
+          fi
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+        env:
+          SCHEDULE: ${{ github.event.schedule }}
+          SCHEDULES: |
+            latest 17 3 * * 6
+            stable 17 3 * * 2
+      # Scheduled runs: compare the base digest buildah recorded in each published member
+      # with the base tag's current one; anything uncheckable rebuilds. Also emits the commit
+      # the channel ships (SOURCE_REV), for a refresh to rebuild. A private base image needs
+      # its own `skopeo login`.
+      - name: Resolve image ref
+        if: github.event_name == 'schedule'
+        run: |
+          set -eu
+          image="$(docker run --rm -v "$PWD:/w" -w /w ghcr.io/cdellacqua/bootcher:latest \
+            --manifest bootcher.ci.toml info --format '{{ .Image }}')"
+          test -n "$image" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see https://github.com/cdellacqua/bootcher/tree/main/recipes/ci)"; exit 1; }
+          echo "IMAGE=$image" >> "$GITHUB_ENV"
+          echo "$GITHUB_TOKEN" | skopeo login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Check whether the base image moved
+        if: github.event_name == 'schedule'
+        id: base
+        shell: python3 {0}
+        env:
+          CHANNEL: ${{ steps.channel.outputs.channel }}
+        run: |
+          import json, os, subprocess, sys
+
+          image, channel = os.environ["IMAGE"], os.environ.get("CHANNEL") or "latest"
+          out = open(os.environ.get("GITHUB_OUTPUT") or "base.env", "a")
+
+          def inspect(*args):
+              run = subprocess.run(["skopeo", "inspect", *args], capture_output=True, text=True)
+              if run.returncode:
+                  raise LookupError(run.stderr.strip())
+              return json.loads(run.stdout)
+
+          def done(changed, why):
+              print(why)
+              out.write(f"BASE_CHANGED={str(changed).lower()}\n")
+              sys.exit(0)
+
+          def fail(why):
+              sys.exit(f"{image}:{channel}: {why}")
+
+          try:
+              top = inspect("--raw", f"docker://{image}:{channel}")
+          except LookupError as e:
+              if "manifest unknown" not in str(e):
+                  fail(f"can't read it: {e}")
+              done(channel == "latest", f"nothing published to {image}:{channel} yet")
+
+          # A list's per-arch members (attestations have no real platform), or a lone image.
+          if "manifests" in top:
+              refs = [f"{image}@{m['digest']}" for m in top["manifests"]
+                      if m.get("platform", {}).get("architecture", "unknown") != "unknown"]
+          else:
+              refs = [f"{image}:{channel}"]
+
+          # The commit the channel ships: a refresh rebuilds it on the new base.
+          try:
+              labels = inspect("--config", f"docker://{refs[0]}")["config"].get("Labels") or {}
+          except (LookupError, IndexError, KeyError, ValueError):
+              labels = {}
+          rev = labels.get("org.opencontainers.image.revision", "")
+          if rev and not rev.endswith("-dirty"):
+              print(f"{image}:{channel} ships {rev}")
+              out.write(f"SOURCE_REV={rev}\n")
+          elif channel != "latest":
+              fail(f"no clean source revision recorded ({rev!r}); publish it once with a normal deploy")
+          if not refs:
+              done(True, f"{image}:{channel} lists no image to check, rebuilding")
+
+          for ref in refs:
+              try:
+                  arch = inspect("--config", f"docker://{ref}")["architecture"]
+                  annotations = inspect("--raw", f"docker://{ref}").get("annotations", {})
+                  base = annotations["org.opencontainers.image.base.name"]
+                  built = annotations["org.opencontainers.image.base.digest"]
+                  current = next((m["digest"] for m in inspect("--raw", f"docker://{base}").get("manifests", [])
+                                  if m.get("platform", {}).get("architecture") == arch), None) \
+                      or inspect(f"docker://{base}")["Digest"]
+              except (LookupError, KeyError, ValueError) as e:
+                  done(True, f"{ref}: can't check the base ({e!r}), rebuilding")
+              if current != built:
+                  done(True, f"{arch}: {base} moved ({built} -> {current}), rebuilding")
+              print(f"{arch}: {base} unchanged")
+          done(False, "base image unchanged since the last publish, skipping the rebuild")
 
   # --- build: one container per arch, on a native-arch runner -----------------------
   # Same as the base recipe — channel-agnostic (it pushes the member to a scratch tag
-  # <image>:ci-<arch>; see ../../github-actions/deploy.yml for why the registry, not a run
+  # <image>:ci-<arch>; see the base recipe for why the registry, not a run
   # artifact). The member is the same whether deploy later publishes it to :latest or
   # :stable; the channel is chosen only at push time, in `deploy`.
   build:
     needs: [changes]
-    if: needs.changes.outputs.image == 'true' || startsWith(github.ref, 'refs/tags/')
+    if: needs.changes.outputs.image == 'true' || startsWith(github.ref, 'refs/tags/v')
     strategy:
       fail-fast: false
       matrix:
@@ -111,9 +241,17 @@ jobs:
       options: --privileged
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.changes.outputs.ref }} # a refresh's commit; empty → the trigger's
+          fetch-tags: true # so `git describe` still names the release
+      # The runner creates the workspace as its own user, but this job runs as root: hand
+      # it the checkout, or git refuses it ("dubious ownership") and the image loses its
+      # git provenance (revision/version labels, the CalVer tag's commit suffix).
+      - name: Own the checkout
+        run: chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
       # Real-fs container store (loopback ext4 so podman does one kernel overlay instead
       # of fuse-overlayfs-on-overlay). Self-skips on a real fs. Full rationale: the
-      # header of ../../github-actions/deploy.yml.
+      # header of the base recipe.
       - name: Prepare container store
         run: |
           set -eu
@@ -130,12 +268,12 @@ jobs:
           fi
           podman info --format 'podman store: {{.Store.GraphDriverName}} @ {{.Store.GraphRoot}}'
       - name: Resolve image ref
-        # Derive the ref from bootcher.toml (see ../../github-actions/deploy.yml): IMAGE is
+        # Derive the ref from bootcher.toml (see the base recipe): IMAGE is
         # the base for the :ci-<arch> scratch tags. Empty ⇒ LAN mode; registry-mode only.
         run: |
           set -eu
           image="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')"
-          test -n "$image" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see README)"; exit 1; }
+          test -n "$image" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see https://github.com/cdellacqua/bootcher/tree/main/recipes/ci)"; exit 1; }
           echo "IMAGE=$image" >> "$GITHUB_ENV"
       - name: Build ${{ matrix.arch }}
         run: bootcher --manifest bootcher.ci.toml build --target "${{ matrix.arch }}"
@@ -146,7 +284,7 @@ jobs:
       - name: Push image member to the registry
         # Push the just-built member under a scratch tag ($IMAGE:ci-<arch>) that `deploy`
         # pulls — the handoff goes through the registry, not a run artifact (see
-        # ../../github-actions/deploy.yml). Channel-agnostic: this scratch tag is unrelated
+        # the base recipe). Channel-agnostic: this scratch tag is unrelated
         # to the :latest/:stable channel tags. Unsigned; only the channel tag is signed.
         run: |
           set -eu
@@ -157,13 +295,10 @@ jobs:
           podman push "$scratch"
 
   # --- deploy: assemble the members and push to THIS RUN's channel ------------------
-  # Same as the base recipe, except the channel is chosen by the trigger: a `v*` tag
-  # publishes to `stable`, anything else (a main push) to the default `latest`. The
-  # `CHANNEL` env resolves to `stable` only on a tag ref; when it's empty we omit the
-  # flag entirely, so bootcher uses its built-in `latest` default (and never has to be
-  # told a channel for the common case).
+  # Same as the base recipe, except it publishes to the channel `changes` resolved (empty
+  # → no flag → bootcher's `latest` default).
   deploy:
-    needs: [build] # waits for every matrix arch
+    needs: [changes, build]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -173,6 +308,14 @@ jobs:
       options: --privileged
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.changes.outputs.ref }}
+          fetch-tags: true
+      # The runner creates the workspace as its own user, but this job runs as root: hand
+      # it the checkout, or git refuses it ("dubious ownership") and the image loses its
+      # git provenance (revision/version labels, the CalVer tag's commit suffix).
+      - name: Own the checkout
+        run: chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
       - name: Prepare container store
         run: |
           set -eu
@@ -198,7 +341,7 @@ jobs:
         run: |
           set -eu
           image="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')"
-          test -n "$image" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see README)"; exit 1; }
+          test -n "$image" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see https://github.com/cdellacqua/bootcher/tree/main/recipes/ci)"; exit 1; }
           {
             echo "IMAGE=$image"
             echo "NAME=$(bootcher --manifest bootcher.ci.toml info --format '{{ .Name }}')"
@@ -220,9 +363,9 @@ jobs:
       #   env: { SIGN_KEY: "${{ secrets.SIGN_KEY }}" }
       - name: Deploy to channel
         # The members were pulled + retagged above; assemble + push under this run's
-        # channel. `--channel` is added only on a tag (CHANNEL=stable); a main push leaves
-        # it empty and falls through to bootcher's `latest` default. `--skip-bootc-upgrade`
-        # leaves the rollout to each device's auto-update timer (see ../../README.md).
+        # channel (`--channel` only when CHANNEL is set; empty → bootcher's `latest`).
+        # `--skip-bootc-upgrade` leaves the rollout to each device's auto-update timer (see
+        # the recipe docs).
         run: |
           set -eu
           if [ -n "${CHANNEL:-}" ]; then
@@ -233,12 +376,11 @@ jobs:
             bootcher --manifest bootcher.ci.toml deploy --skip-build --skip-bootc-upgrade
           fi
         env:
-          # tag (refs/tags/v*) → stable; main push → empty → bootcher's default `latest`.
-          CHANNEL: ${{ startsWith(github.ref, 'refs/tags/v') && 'stable' || '' }}
+          CHANNEL: ${{ needs.changes.outputs.channel }} # stable, or empty → `latest`
           BOOTCHER_SIGN_PASSPHRASE: ${{ secrets.SIGN_PASSPHRASE }}
 
   # --- cleanup: prune old published image versions ----------------------------------
-  # Identical to the base recipe's `cleanup` (see ../../github-actions/deploy.yml for the
+  # Identical to the base recipe's `cleanup` (see the base recipe for the
   # full multi-arch-safety and token rationale). Channels need no special handling: the
   # protected-tag set comes from `bootcher info --format '{{ .Channels }}'`, which reports
   # every declared channel (`latest` + `stable`), so a live channel pointer is never pruned
@@ -260,7 +402,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # org-owned package refused? use a CLEANUP_TOKEN PAT
           DRY_RUN: "false" # "true" = log the plan without deleting (validate a first run)
         run: |
-          # Identical to the base recipe's cleanup (see ../../github-actions/deploy.yml).
+          # Identical to the base recipe's cleanup (see the base recipe).
           # Channels need no special handling: `channels` comes from `bootcher info`, which
           # reports every declared channel, so a live channel pointer is a protected tag.
           import base64, json, os, subprocess, sys, urllib.error, urllib.request

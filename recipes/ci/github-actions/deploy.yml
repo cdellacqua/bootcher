@@ -1,5 +1,7 @@
 # bootcher CI for GitHub Actions — BUILD + DEPLOY half, multi-arch (x86_64 + aarch64).
 #
+# Recipe docs: https://github.com/cdellacqua/bootcher/tree/main/recipes/ci
+#
 # Copy this to your bootcher project as `.github/workflows/bootcher-deploy.yml`. Its
 # sibling, `provision.yml`, is the disk-building half — see that file. They're split
 # because the disk build needs a MANUAL gate, and GitHub Free can't gate a job inside a
@@ -33,6 +35,9 @@
 # A `changes` pre-job path-filters the run: build/deploy fire only when an image input
 # changed (Containerfile, sysroot/, the manifests, this workflow), so a docs-only push
 # is a no-op. A `v*` tag always builds. See that job for the allowlist to tune.
+#
+# A weekly schedule rebuilds when the base image moved, so its security updates reach
+# the fleet without a commit; a manual run always rebuilds.
 #
 # Why split the build per arch? A multi-arch `bootcher deploy` on a single runner would
 # build the foreign arch under qemu-user emulation — slow and occasionally fragile.
@@ -81,7 +86,7 @@
 # Every job runs with `--manifest bootcher.ci.toml` — a committed override that
 # `extend`s bootcher.toml and forces podman onto the host network, sidestepping
 # nested-podman nftables failures in the privileged CI container. Copy
-# recipes/ci/bootcher.ci.toml to your project root beside bootcher.toml.
+# https://github.com/cdellacqua/bootcher/blob/main/recipes/ci/bootcher.ci.toml to your project root beside bootcher.toml.
 #
 # Repository secrets & variables (Settings → Secrets and variables → Actions):
 #   SIGN_KEY /       (optional) cosign private key + its passphrase — only if you
@@ -95,6 +100,11 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+  # Weekly base-image refresh, skipped when the base hasn't moved. Devices reboot into a
+  # new build on their update timer: time this ahead of that window.
+  schedule:
+    - cron: "17 3 * * 6"
+  workflow_dispatch: # an unconditional rebuild of main or a `v*` tag, on demand
 
 # No image ref to configure: every job derives it from bootcher.toml at runtime with
 # `bootcher info --format` (see the "Resolve image ref" steps), so the `<registry>/<name>`
@@ -120,6 +130,8 @@ jobs:
   # diffs the push. dorny/paths-filter handles the awkward cases (first commit on a
   # branch, force-push) that a hand-rolled `git diff` gets wrong. Tags bypass it
   # entirely in `build.if` below — a `v*` tag is a deliberate release and always builds.
+  # Only a push has a diff to filter: a scheduled run builds if the base moved, a manual
+  # one always.
   #
   # Adjust the `image:` list to YOUR project: if the Containerfile `COPY`s other paths,
   # or a hook script lives outside sysroot/, add them — anything in the build context
@@ -129,11 +141,20 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+      packages: read # the base-image check reads the published image
     outputs:
-      image: ${{ steps.filter.outputs.image }}
+      ref: ${{ steps.base.outputs.SOURCE_REV }} # a refresh's commit; empty → the trigger's
+      # push → the path filter; schedule → the base-image check; manual → always, but only
+      # on main or a `v*` tag (anything else would publish an arbitrary branch).
+      image: >-
+        ${{ (github.event_name == 'workflow_dispatch'
+        && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))
+        || (github.event_name == 'push' && steps.filter.outputs.image == 'true')
+        || (github.event_name == 'schedule' && steps.base.outputs.BASE_CHANGED == 'true') }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
+      - if: github.event_name == 'push'
+        uses: dorny/paths-filter@v3
         id: filter
         with:
           filters: |
@@ -143,6 +164,88 @@ jobs:
               - bootcher.toml
               - bootcher.ci.toml
               - .github/workflows/bootcher-deploy.yml
+      # Scheduled runs: compare the base digest buildah recorded in each published member
+      # with the base tag's current one; anything uncheckable rebuilds. Also emits the commit
+      # :latest ships (SOURCE_REV), which build/deploy rebuild. A private base image needs
+      # its own `skopeo login`.
+      - name: Resolve image ref
+        if: github.event_name == 'schedule'
+        run: |
+          set -eu
+          image="$(docker run --rm -v "$PWD:/w" -w /w ghcr.io/cdellacqua/bootcher:latest \
+            --manifest bootcher.ci.toml info --format '{{ .Image }}')"
+          test -n "$image" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see https://github.com/cdellacqua/bootcher/tree/main/recipes/ci)"; exit 1; }
+          echo "IMAGE=$image" >> "$GITHUB_ENV"
+          echo "$GITHUB_TOKEN" | skopeo login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Check whether the base image moved
+        if: github.event_name == 'schedule'
+        id: base
+        shell: python3 {0}
+        run: |
+          import json, os, subprocess, sys
+
+          image, channel = os.environ["IMAGE"], os.environ.get("CHANNEL") or "latest"
+          out = open(os.environ.get("GITHUB_OUTPUT") or "base.env", "a")
+
+          def inspect(*args):
+              run = subprocess.run(["skopeo", "inspect", *args], capture_output=True, text=True)
+              if run.returncode:
+                  raise LookupError(run.stderr.strip())
+              return json.loads(run.stdout)
+
+          def done(changed, why):
+              print(why)
+              out.write(f"BASE_CHANGED={str(changed).lower()}\n")
+              sys.exit(0)
+
+          def fail(why):
+              sys.exit(f"{image}:{channel}: {why}")
+
+          try:
+              top = inspect("--raw", f"docker://{image}:{channel}")
+          except LookupError as e:
+              if "manifest unknown" not in str(e):
+                  fail(f"can't read it: {e}")
+              done(channel == "latest", f"nothing published to {image}:{channel} yet")
+
+          # A list's per-arch members (attestations have no real platform), or a lone image.
+          if "manifests" in top:
+              refs = [f"{image}@{m['digest']}" for m in top["manifests"]
+                      if m.get("platform", {}).get("architecture", "unknown") != "unknown"]
+          else:
+              refs = [f"{image}:{channel}"]
+
+          # The commit the channel ships: a refresh rebuilds it on the new base.
+          try:
+              labels = inspect("--config", f"docker://{refs[0]}")["config"].get("Labels") or {}
+          except (LookupError, IndexError, KeyError, ValueError):
+              labels = {}
+          rev = labels.get("org.opencontainers.image.revision", "")
+          if rev and not rev.endswith("-dirty"):
+              print(f"{image}:{channel} ships {rev}")
+              out.write(f"SOURCE_REV={rev}\n")
+          elif channel != "latest":
+              fail(f"no clean source revision recorded ({rev!r}); publish it once with a normal deploy")
+          if not refs:
+              done(True, f"{image}:{channel} lists no image to check, rebuilding")
+
+          for ref in refs:
+              try:
+                  arch = inspect("--config", f"docker://{ref}")["architecture"]
+                  annotations = inspect("--raw", f"docker://{ref}").get("annotations", {})
+                  base = annotations["org.opencontainers.image.base.name"]
+                  built = annotations["org.opencontainers.image.base.digest"]
+                  current = next((m["digest"] for m in inspect("--raw", f"docker://{base}").get("manifests", [])
+                                  if m.get("platform", {}).get("architecture") == arch), None) \
+                      or inspect(f"docker://{base}")["Digest"]
+              except (LookupError, KeyError, ValueError) as e:
+                  done(True, f"{ref}: can't check the base ({e!r}), rebuilding")
+              if current != built:
+                  done(True, f"{arch}: {base} moved ({built} -> {current}), rebuilding")
+              print(f"{arch}: {base} unchanged")
+          done(False, "base image unchanged since the last publish, skipping the rebuild")
 
   # --- build: one container per arch, on a native-arch runner ---------------------
   # `build --target <arch>` builds only that arch and stops at the per-arch member tag
@@ -154,7 +257,7 @@ jobs:
     # Gate on the change filter (see the `changes` job); a `v*` tag always builds.
     # deploy needs this job, so a skip here cascades and skips it too.
     needs: [changes]
-    if: needs.changes.outputs.image == 'true' || startsWith(github.ref, 'refs/tags/')
+    if: needs.changes.outputs.image == 'true' || startsWith(github.ref, 'refs/tags/v')
     strategy:
       fail-fast: false
       matrix:
@@ -170,6 +273,14 @@ jobs:
       options: --privileged # podman builds the container image (nested)
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.changes.outputs.ref }}
+          fetch-tags: true # so `git describe` still names the release
+      # The runner creates the workspace as its own user, but this job runs as root: hand
+      # it the checkout, or git refuses it ("dubious ownership") and the image loses its
+      # git provenance (revision/version labels, the CalVer tag's commit suffix).
+      - name: Own the checkout
+        run: chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
       # Real-fs container store (see the header note): a loopback ext4 so podman does
       # one kernel overlay instead of fuse-overlayfs-on-overlay. Self-skips when the
       # store is already on a real fs.
@@ -200,7 +311,7 @@ jobs:
         run: |
           set -eu
           image="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')"
-          test -n "$image" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see README)"; exit 1; }
+          test -n "$image" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see https://github.com/cdellacqua/bootcher/tree/main/recipes/ci)"; exit 1; }
           echo "IMAGE=$image" >> "$GITHUB_ENV"
       - name: Build ${{ matrix.arch }}
         run: bootcher --manifest bootcher.ci.toml build --target "${{ matrix.arch }}"
@@ -227,7 +338,7 @@ jobs:
   # <registry>/<name>:latest (+ a CalVer tag). No container build, no disk step. Needs
   # `packages: write` (and the signing key, if enabled) to push :latest.
   deploy:
-    needs: [build] # waits for every matrix arch
+    needs: [changes, build] # build waits for every matrix arch
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -237,6 +348,14 @@ jobs:
       options: --privileged
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.changes.outputs.ref }}
+          fetch-tags: true # so `git describe` still names the release
+      # The runner creates the workspace as its own user, but this job runs as root: hand
+      # it the checkout, or git refuses it ("dubious ownership") and the image loses its
+      # git provenance (revision/version labels, the CalVer tag's commit suffix).
+      - name: Own the checkout
+        run: chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
       # Real-fs container store (see the header note): a loopback ext4 so podman does
       # one kernel overlay instead of fuse-overlayfs-on-overlay. Self-skips when the
       # store is already on a real fs.
@@ -265,7 +384,7 @@ jobs:
         run: |
           set -eu
           image="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')"
-          test -n "$image" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see README)"; exit 1; }
+          test -n "$image" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see https://github.com/cdellacqua/bootcher/tree/main/recipes/ci)"; exit 1; }
           {
             echo "IMAGE=$image"
             echo "NAME=$(bootcher --manifest bootcher.ci.toml info --format '{{ .Name }}')"

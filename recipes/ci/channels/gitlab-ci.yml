@@ -1,20 +1,30 @@
 # bootcher CI with RELEASE CHANNELS — GitLab CI, multi-arch (x86_64 + aarch64).
 #
-# A channels-aware variant of ../gitlab-ci.yml. The pipeline *shape* is identical —
+# Base recipe: https://github.com/cdellacqua/bootcher/blob/main/recipes/ci/gitlab-ci.yml
+# Recipe docs: https://github.com/cdellacqua/bootcher/tree/main/recipes/ci
+#
+# A channels-aware variant of the base recipe. The pipeline *shape* is identical —
 # build (per-arch, native runners) → deploy (assemble + push) → provision (per-arch
 # disks), the loopback container store in `before_script`, and the `.image-rules` path
 # gate — so this header only covers what's DIFFERENT: which channel each trigger
 # publishes to. For the store relocation, the per-arch split rationale, and the CI/CD
-# variables, read ../gitlab-ci.yml and ../README.md; nothing there changes.
+# variables, read the base recipe and the recipe docs; nothing there changes.
 #
-#   push to default branch → deploy to the default `latest` channel  (rolling / canary)
-#   push a v* tag          → deploy to the `stable` channel          (production fleet)
+#   push to default branch      → deploy to the default `latest` channel (rolling / canary)
+#   push a v* tag               → deploy to the `stable` channel         (production fleet)
+#   schedule                    → refresh `latest`                       (base updates)
+#   schedule, SCHEDULE_CHANNEL=<c> → refresh channel <c>                  (base updates)
+#   manual run on branch/a tag  → rebuild it into `latest` / `stable`, unconditionally
 #
-# THE MECHANISM (see ../../../docs/src/reference/bootcher-toml.md#channels). A channel
-# is a mutable registry tag `<registry>/<name>:<channel>` that a SUBSET of devices
-# tracks. `bootcher deploy --channel stable` pushes the multi-arch list under :stable
-# instead of :latest, so only devices whose bootc origin is :stable pick it up. Every
-# deploy ALSO stamps that same digest with its immutable :CalVer tag regardless of
+# One pipeline schedule per channel on the default branch, the non-`latest` ones with
+# SCHEDULE_CHANNEL=<channel>. A refresh rebuilds the commit its channel currently ships
+# on today's base, if the base moved.
+#
+# THE MECHANISM (see https://cdellacqua.github.io/bootcher/book/reference/bootcher-toml.html#channels).
+# A channel is a mutable registry tag `<registry>/<name>:<channel>` that a SUBSET of
+# devices tracks. `bootcher deploy --channel stable` pushes the multi-arch list under
+# :stable instead of :latest, so only devices whose bootc origin is :stable pick it up.
+# Every deploy ALSO stamps that same digest with its immutable :CalVer tag regardless of
 # channel — so the version tag is the durable rollback/audit handle and the channel is
 # just a moving pointer to "what that audience sees now".
 #
@@ -49,7 +59,7 @@
 # pipeline yields stable-tracking disks and a branch pipeline latest-tracking ones.
 #
 # CI/CD variables, Secure Files (signing), and the `bootcher.ci.toml` override are
-# unchanged — see ../README.md.
+# unchanged — see the recipe docs.
 
 default:
   image:
@@ -58,7 +68,7 @@ default:
   before_script:
     # Real-fs container store (loopback ext4 so podman does one kernel overlay instead
     # of fuse-overlayfs-on-overlay). Self-skips on a real fs. Full rationale: the header
-    # of ../gitlab-ci.yml.
+    # of the base recipe.
     - |
       set -eu
       if [ "$(stat -f -c %T / 2>/dev/null)" = "overlayfs" ]; then
@@ -75,7 +85,7 @@ default:
       podman info --format 'podman store: {{.Store.GraphDriverName}} @ {{.Store.GraphRoot}}'
 
 # No image ref to configure: the build/deploy jobs derive it from bootcher.toml at runtime
-# with `bootcher info --format '{{ .Image }}'` (see ../gitlab-ci.yml). Channel-agnostic:
+# with `bootcher info --format '{{ .Image }}'` (see the base recipe). Channel-agnostic:
 # the scratch tag it builds is a CI-internal handoff, unrelated to the :latest/:stable
 # channel tags `deploy` publishes.
 
@@ -97,26 +107,131 @@ stages: [build, deploy, provision]
           - bootcher.ci.toml
           - .gitlab-ci.yml
 
+# --- base-check: did the base image move since the last publish? (schedules only) --
+# Compares the base digest buildah recorded in each published member with the base
+# tag's current one; anything uncheckable rebuilds. Hands BASE_CHANGED (and SOURCE_REV,
+# the commit the channel ships) to `.build`/`deploy` as a dotenv report. A private base
+# image needs its own `skopeo login`.
+base-check:
+  stage: build
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+  needs: []
+  before_script: [] # no container store needed: this job only reads registries
+  script:
+    - IMAGE="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')"
+    - test -n "$IMAGE" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see https://github.com/cdellacqua/bootcher/tree/main/recipes/ci)"; exit 1; }
+    - export IMAGE CHANNEL="${SCHEDULE_CHANNEL:-}"
+    - echo "$CI_REGISTRY_PASSWORD" | skopeo login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
+    - |
+      python3 - <<'EOF'
+      import json, os, subprocess, sys
+
+      image, channel = os.environ["IMAGE"], os.environ.get("CHANNEL") or "latest"
+      out = open(os.environ.get("GITHUB_OUTPUT") or "base.env", "a")
+
+      def inspect(*args):
+          run = subprocess.run(["skopeo", "inspect", *args], capture_output=True, text=True)
+          if run.returncode:
+              raise LookupError(run.stderr.strip())
+          return json.loads(run.stdout)
+
+      def done(changed, why):
+          print(why)
+          out.write(f"BASE_CHANGED={str(changed).lower()}\n")
+          sys.exit(0)
+
+      def fail(why):
+          sys.exit(f"{image}:{channel}: {why}")
+
+      try:
+          top = inspect("--raw", f"docker://{image}:{channel}")
+      except LookupError as e:
+          if "manifest unknown" not in str(e):
+              fail(f"can't read it: {e}")
+          done(channel == "latest", f"nothing published to {image}:{channel} yet")
+
+      # A list's per-arch members (attestations have no real platform), or a lone image.
+      if "manifests" in top:
+          refs = [f"{image}@{m['digest']}" for m in top["manifests"]
+                  if m.get("platform", {}).get("architecture", "unknown") != "unknown"]
+      else:
+          refs = [f"{image}:{channel}"]
+
+      # The commit the channel ships: a refresh rebuilds it on the new base.
+      try:
+          labels = inspect("--config", f"docker://{refs[0]}")["config"].get("Labels") or {}
+      except (LookupError, IndexError, KeyError, ValueError):
+          labels = {}
+      rev = labels.get("org.opencontainers.image.revision", "")
+      if rev and not rev.endswith("-dirty"):
+          print(f"{image}:{channel} ships {rev}")
+          out.write(f"SOURCE_REV={rev}\n")
+      elif channel != "latest":
+          fail(f"no clean source revision recorded ({rev!r}); publish it once with a normal deploy")
+      if not refs:
+          done(True, f"{image}:{channel} lists no image to check, rebuilding")
+
+      for ref in refs:
+          try:
+              arch = inspect("--config", f"docker://{ref}")["architecture"]
+              annotations = inspect("--raw", f"docker://{ref}").get("annotations", {})
+              base = annotations["org.opencontainers.image.base.name"]
+              built = annotations["org.opencontainers.image.base.digest"]
+              current = next((m["digest"] for m in inspect("--raw", f"docker://{base}").get("manifests", [])
+                              if m.get("platform", {}).get("architecture") == arch), None) \
+                  or inspect(f"docker://{base}")["Digest"]
+          except (LookupError, KeyError, ValueError) as e:
+              done(True, f"{ref}: can't check the base ({e!r}), rebuilding")
+          if current != built:
+              done(True, f"{arch}: {base} moved ({built} -> {current}), rebuilding")
+          print(f"{arch}: {base} unchanged")
+      done(False, "base image unchanged since the last publish, skipping the rebuild")
+      EOF
+  artifacts:
+    reports:
+      dotenv: base.env
+
+# --- source checkout: a refresh rebuilds the commit its channel ships (SOURCE_REV) -
+.source-checkout:
+  script:
+    - |
+      if [ -n "${SOURCE_REV:-}" ]; then
+        git config --global --add safe.directory "$CI_PROJECT_DIR"
+        git fetch -q --depth 1 "$CI_REPOSITORY_URL" "$SOURCE_REV"
+        git checkout -q --detach FETCH_HEAD
+        # Tags on that commit (annotated ones peeled), so `git describe` names the release.
+        for t in $(git ls-remote --tags "$CI_REPOSITORY_URL" | awk -v r="$SOURCE_REV" '$1 == r { sub("^refs/tags/", "", $2); sub("\\^\\{\\}$", "", $2); print $2 }' | sort -u); do
+          git fetch -q --depth 1 "$CI_REPOSITORY_URL" "+refs/tags/$t:refs/tags/$t"
+        done
+        echo "checked out $(git describe --tags --always)"
+      fi
+
 # --- build: one container per arch, on a native-arch runner -----------------------
 # Channel-agnostic: the per-arch member is the same whether deploy later publishes it to
 # :latest or :stable (the channel is chosen only at push time, in `deploy`). As in the
 # base recipe, the member is pushed to the Container Registry under a scratch tag
 # (<image>:ci-<arch>) that `deploy` pulls — not a job artifact (GitLab.com caps those at
-# 1 GB, which a non-trivial image blows past even zstd'd). See ../gitlab-ci.yml for why.
+# 1 GB, which a non-trivial image blows past even zstd'd). See the base recipe for why.
 .build:
   stage: build
   rules: !reference [.image-rules, rules]
+  needs:
+    - job: base-check
+      optional: true
   script:
-    # Derive the image ref from bootcher.toml (see ../gitlab-ci.yml): IMAGE is the base for
+    - if [ "${BASE_CHANGED:-true}" = false ]; then echo "base image unchanged, nothing to build"; exit 0; fi
+    - !reference [.source-checkout, script]
+    # Derive the image ref from bootcher.toml (see the base recipe): IMAGE is the base for
     # the :ci-<arch> scratch tag. Empty ⇒ LAN mode; registry-mode only, so fail fast.
     - IMAGE="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')"
-    - test -n "$IMAGE" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see README)"; exit 1; }
+    - test -n "$IMAGE" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see https://github.com/cdellacqua/bootcher/tree/main/recipes/ci)"; exit 1; }
     - bootcher --manifest bootcher.ci.toml build --target "$ARCH"
     # Log in with the job token and push the just-built member under a scratch tag
     # ($IMAGE:ci-<arch>) that `deploy` pulls. The scratch tag shares layers with the
     # :latest/:stable list deploy later publishes, so it costs ~no extra storage and is
     # overwritten each run. Unsigned — a CI-internal intermediate; only the channel tag is
-    # signed (in deploy). See ../gitlab-ci.yml for the full rationale.
+    # signed (in deploy). See the base recipe for the full rationale.
     - echo "$CI_REGISTRY_PASSWORD" | podman login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
     - |
       img="$(podman images --format '{{.Repository}}:{{.Tag}}' | grep ":latest-${ARCH}\$" | head -n1)"
@@ -138,14 +253,14 @@ build:aarch64:
   tags: [saas-linux-small-arm64]
 
 # --- deploy: assemble the members and push to THIS PIPELINE's channel -------------
-# Same as the base recipe, except the channel is chosen by the trigger: a `v*` tag
-# publishes to `stable`, anything else (a default-branch push) to the default `latest`.
-# `$CI_COMMIT_TAG` is set only on a tag pipeline, so we add `--channel stable` then and
-# omit the flag otherwise — letting bootcher use its built-in `latest` default.
+# Same as the base recipe, except the trigger picks the channel: a refresh its
+# SCHEDULE_CHANNEL, a `v*` tag `stable`, anything else bootcher's default `latest`.
 deploy:
   stage: deploy
   # artifacts: false — members travel through the Container Registry now (see `.build`).
   needs:
+    - job: base-check
+      optional: true
     - job: "build:x86_64"
       artifacts: false
     - job: "build:aarch64"
@@ -155,11 +270,13 @@ deploy:
   # variables:
   #   BOOTCHER_SIGN_PASSPHRASE: ""
   script:
-    # Derive the refs from bootcher.toml (see ../gitlab-ci.yml). IMAGE is the scratch-tag
+    - if [ "${BASE_CHANGED:-true}" = false ]; then echo "base image unchanged, nothing to deploy"; exit 0; fi
+    - !reference [.source-checkout, script]
+    # Derive the refs from bootcher.toml (see the base recipe). IMAGE is the scratch-tag
     # base; NAME the local member basename `deploy --skip-build` retags to.
     - IMAGE="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')"
     - NAME="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Name }}')"
-    - test -n "$IMAGE" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see README)"; exit 1; }
+    - test -n "$IMAGE" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see https://github.com/cdellacqua/bootcher/tree/main/recipes/ci)"; exit 1; }
     - echo "$CI_REGISTRY_PASSWORD" | podman login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
     # Pull each per-arch member `build` pushed under its scratch tag and retag it to the
     # local name `deploy --skip-build` expects (localhost/<name>:latest-<arch>). Keep this
@@ -170,11 +287,14 @@ deploy:
         podman pull "$scratch"
         podman tag "$scratch" "localhost/${NAME}:latest-${arch}"
       done
-    # Signing? Fetch the cosign key from Secure Files first (see ../gitlab-ci.yml).
-    # `--channel stable` on a tag pipeline; otherwise no flag → bootcher's `latest`.
-    # `--skip-bootc-upgrade` leaves the rollout to each device's auto-update timer.
+    # Signing? Fetch the cosign key from Secure Files first (see the base recipe).
+    # Map your own channels to triggers here. `--skip-bootc-upgrade` leaves the rollout to
+    # each device's auto-update timer.
     - |
-      if [ -n "${CI_COMMIT_TAG:-}" ]; then CHANNEL=stable; else CHANNEL=; fi
+      if [ "$CI_PIPELINE_SOURCE" = schedule ]; then CHANNEL="${SCHEDULE_CHANNEL:-}"
+      elif [ -n "${CI_COMMIT_TAG:-}" ]; then CHANNEL=stable
+      else CHANNEL=; fi
+      if [ "$CHANNEL" = latest ]; then CHANNEL=; fi
       if [ -n "$CHANNEL" ]; then
         echo "deploying to channel: $CHANNEL"
         bootcher --manifest bootcher.ci.toml deploy --skip-build --skip-bootc-upgrade --channel "$CHANNEL"
@@ -204,6 +324,8 @@ deploy:
     # Manual on BOTH a tag and the default branch (the base recipe is default-branch
     # only). `when: manual` must live inside the rule, and `allow_failure: true` keeps
     # this optional job from blocking the pipeline — play it from the UI for a disk.
+    - if: $CI_PIPELINE_SOURCE == "schedule" # a refresh, not a release to provision from
+      when: never
     - if: $CI_COMMIT_TAG
       when: manual
       allow_failure: true
@@ -224,7 +346,7 @@ deploy:
       echo "provisioning a disk that tracks the '$CHANNEL' channel"
       bootcher --manifest bootcher.ci.toml provision --ssh-key admin_key --target "$ARCH" --disk "$DISK" --skip-build --channel "$CHANNEL"
     # Publish output/ to the generic Package Registry, versioned by channel + commit + arch
-    # so stable and latest disks never collide. See ../gitlab-ci.yml for the packaging: one
+    # so stable and latest disks never collide. See the base recipe for the packaging: one
     # store-mode .zip of the zstd-compressed disk, uploaded from a file so curl can --retry.
     - |
       if (set -o pipefail) 2>/dev/null; then set -o pipefail; fi

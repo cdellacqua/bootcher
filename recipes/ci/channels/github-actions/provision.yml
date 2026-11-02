@@ -1,10 +1,13 @@
 # bootcher CI with RELEASE CHANNELS — GitHub Actions PROVISION half, multi-arch.
 #
-# A channels-aware variant of ../../github-actions/provision.yml. The job *shape* is
+# Base recipe: https://github.com/cdellacqua/bootcher/blob/main/recipes/ci/github-actions/provision.yml
+# Recipe docs: https://github.com/cdellacqua/bootcher/tree/main/recipes/ci
+#
+# A channels-aware variant of the base recipe. The job *shape* is
 # identical — a per-arch matrix that builds a disk with `--skip-build` and publishes it
 # to a per-commit GitHub Release — so this header only covers what's DIFFERENT: the disk
 # TRACKS a channel. For the store relocation, the `workflow_dispatch` manual-gate
-# rationale, and the secrets, read ../../github-actions/provision.yml and ../../README.md.
+# rationale, and the secrets, read the base recipe and the recipe docs.
 #
 # WHICH CHANNEL. This workflow takes a `channel` input (latest | stable) when you launch
 # it. `provision --channel <c>` sets the disk's bootc origin to <registry>/<name>:<c> and
@@ -26,7 +29,7 @@
 #   bootcher provision --ssh-key admin_key                    # → follows :latest
 #
 # Secrets & variables (ADMIN_SSH_PUBKEY, PULL_USER/PULL_TOKEN) are unchanged — see
-# ../../github-actions/provision.yml and ../../README.md.
+# the base recipe and the recipe docs.
 
 name: bootcher provision
 
@@ -68,6 +71,11 @@ jobs:
       CHANNEL: ${{ inputs.channel }}
     steps:
       - uses: actions/checkout@v4
+      # The runner creates the workspace as its own user, but this job runs as root: hand
+      # it the checkout, or git refuses it ("dubious ownership") and the image loses its
+      # git provenance (revision/version labels, the CalVer tag's commit suffix).
+      - name: Own the checkout
+        run: chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
       - name: Prepare container store
         run: |
           set -eu

@@ -1,5 +1,7 @@
 # bootcher CI for GitLab — multi-arch (x86_64 + aarch64).
 #
+# Recipe docs: https://github.com/cdellacqua/bootcher/tree/main/recipes/ci
+#
 # Copy this to your bootcher project as `.gitlab-ci.yml` at the repo root. It builds
 # both architectures on native runners (no cross-arch emulation), assembles them into
 # one multi-arch image, and can produce a flashable disk per arch — in three stages:
@@ -29,6 +31,9 @@
 # The pipeline is path-gated (see `.image-rules`): build/deploy run only when an image
 # input changed (Containerfile, sysroot/, the manifests), so a docs-only push is a
 # no-op; a `v*` tag always builds. Tune the allowlist there to your project.
+#
+# Weekly rebuilds: add a pipeline schedule on the default branch (e.g. `17 3 * * 6`); it
+# rebuilds only if the base image moved (see `base-check`).
 #
 # Why split the build per arch? A multi-arch `bootcher deploy` on a single runner would
 # build the foreign arch under qemu-user emulation — slow and occasionally fragile.
@@ -60,7 +65,7 @@
 # Every job runs with `--manifest bootcher.ci.toml` — a committed override that
 # `extend`s bootcher.toml and forces podman onto the host network, sidestepping
 # nested-podman nftables failures in the privileged job container. Copy
-# recipes/ci/bootcher.ci.toml to your repo root beside bootcher.toml.
+# https://github.com/cdellacqua/bootcher/blob/main/recipes/ci/bootcher.ci.toml to your repo root beside bootcher.toml.
 #
 # Runners: the aarch64 jobs need an arm64 runner — on GitLab.com a hosted
 # `saas-linux-*-arm64` (tagged below; the small size is on all tiers). All these jobs
@@ -185,6 +190,106 @@ stages: [build, deploy, provision]
           - bootcher.ci.toml
           - .gitlab-ci.yml
 
+# --- base-check: did the base image move since the last publish? (schedules only) --
+# Compares the base digest buildah recorded in each published member with the base
+# tag's current one; anything uncheckable rebuilds. Hands BASE_CHANGED (and SOURCE_REV,
+# the commit :latest ships) to `.build`/`deploy` as a dotenv report. A private base image
+# needs its own `skopeo login`.
+base-check:
+  stage: build
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+  needs: []
+  before_script: [] # no container store needed: this job only reads registries
+  script:
+    - IMAGE="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')"
+    - test -n "$IMAGE" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see https://github.com/cdellacqua/bootcher/tree/main/recipes/ci)"; exit 1; }
+    - export IMAGE
+    - echo "$CI_REGISTRY_PASSWORD" | skopeo login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
+    - |
+      python3 - <<'EOF'
+      import json, os, subprocess, sys
+
+      image, channel = os.environ["IMAGE"], os.environ.get("CHANNEL") or "latest"
+      out = open(os.environ.get("GITHUB_OUTPUT") or "base.env", "a")
+
+      def inspect(*args):
+          run = subprocess.run(["skopeo", "inspect", *args], capture_output=True, text=True)
+          if run.returncode:
+              raise LookupError(run.stderr.strip())
+          return json.loads(run.stdout)
+
+      def done(changed, why):
+          print(why)
+          out.write(f"BASE_CHANGED={str(changed).lower()}\n")
+          sys.exit(0)
+
+      def fail(why):
+          sys.exit(f"{image}:{channel}: {why}")
+
+      try:
+          top = inspect("--raw", f"docker://{image}:{channel}")
+      except LookupError as e:
+          if "manifest unknown" not in str(e):
+              fail(f"can't read it: {e}")
+          done(channel == "latest", f"nothing published to {image}:{channel} yet")
+
+      # A list's per-arch members (attestations have no real platform), or a lone image.
+      if "manifests" in top:
+          refs = [f"{image}@{m['digest']}" for m in top["manifests"]
+                  if m.get("platform", {}).get("architecture", "unknown") != "unknown"]
+      else:
+          refs = [f"{image}:{channel}"]
+
+      # The commit the channel ships: a refresh rebuilds it on the new base.
+      try:
+          labels = inspect("--config", f"docker://{refs[0]}")["config"].get("Labels") or {}
+      except (LookupError, IndexError, KeyError, ValueError):
+          labels = {}
+      rev = labels.get("org.opencontainers.image.revision", "")
+      if rev and not rev.endswith("-dirty"):
+          print(f"{image}:{channel} ships {rev}")
+          out.write(f"SOURCE_REV={rev}\n")
+      elif channel != "latest":
+          fail(f"no clean source revision recorded ({rev!r}); publish it once with a normal deploy")
+      if not refs:
+          done(True, f"{image}:{channel} lists no image to check, rebuilding")
+
+      for ref in refs:
+          try:
+              arch = inspect("--config", f"docker://{ref}")["architecture"]
+              annotations = inspect("--raw", f"docker://{ref}").get("annotations", {})
+              base = annotations["org.opencontainers.image.base.name"]
+              built = annotations["org.opencontainers.image.base.digest"]
+              current = next((m["digest"] for m in inspect("--raw", f"docker://{base}").get("manifests", [])
+                              if m.get("platform", {}).get("architecture") == arch), None) \
+                  or inspect(f"docker://{base}")["Digest"]
+          except (LookupError, KeyError, ValueError) as e:
+              done(True, f"{ref}: can't check the base ({e!r}), rebuilding")
+          if current != built:
+              done(True, f"{arch}: {base} moved ({built} -> {current}), rebuilding")
+          print(f"{arch}: {base} unchanged")
+      done(False, "base image unchanged since the last publish, skipping the rebuild")
+      EOF
+  artifacts:
+    reports:
+      dotenv: base.env
+
+# --- source checkout: a refresh rebuilds the commit :latest ships (SOURCE_REV) --
+.source-checkout:
+  script:
+    - |
+      if [ -n "${SOURCE_REV:-}" ]; then
+        git config --global --add safe.directory "$CI_PROJECT_DIR"
+        git fetch -q --depth 1 "$CI_REPOSITORY_URL" "$SOURCE_REV"
+        git checkout -q --detach FETCH_HEAD
+        # Tags on that commit (annotated ones peeled), so `git describe` names the release.
+        for t in $(git ls-remote --tags "$CI_REPOSITORY_URL" | awk -v r="$SOURCE_REV" '$1 == r { sub("^refs/tags/", "", $2); sub("\\^\\{\\}$", "", $2); print $2 }' | sort -u); do
+          git fetch -q --depth 1 "$CI_REPOSITORY_URL" "+refs/tags/$t:refs/tags/$t"
+        done
+        echo "checked out $(git describe --tags --always)"
+      fi
+
 # --- build: one container per arch, on a native-arch runner -----------------------
 # `build --target <arch>` builds only that arch and stops at the per-arch member tag
 # localhost/<name>:latest-<arch> (no multi-arch list — `deploy` assembles that). The
@@ -195,12 +300,17 @@ stages: [build, deploy, provision]
   stage: build
   # Gate on image-affecting changes (see `.image-rules` above); tags always build.
   rules: !reference [.image-rules, rules]
+  needs:
+    - job: base-check
+      optional: true
   script:
+    - if [ "${BASE_CHANGED:-true}" = false ]; then echo "base image unchanged, nothing to build"; exit 0; fi
+    - !reference [.source-checkout, script]
     # Derive the image ref from bootcher.toml (see the header): IMAGE is the base for the
     # :ci-<arch> scratch tag. Empty ⇒ LAN mode (no `[deploy] registry`); registry-mode only,
     # so fail fast before the multi-minute build.
     - IMAGE="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')"
-    - test -n "$IMAGE" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see README)"; exit 1; }
+    - test -n "$IMAGE" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see https://github.com/cdellacqua/bootcher/tree/main/recipes/ci)"; exit 1; }
     - bootcher --manifest bootcher.ci.toml build --target "$ARCH"
     # The build produced exactly one image tagged `:latest-<arch>`. Log in with the job
     # token and push it under a scratch tag ($IMAGE:ci-<arch>) that `deploy` pulls — the
@@ -236,13 +346,15 @@ build:aarch64:
 # pushes <registry>/<name>:latest (+ a CalVer tag). No container build, no disk step. The
 # scratch tags need no cleanup (they share layers with :latest and are overwritten each
 # run). To prune OLD CalVer releases as they accumulate, don't add a job — turn on the
-# project's built-in Container Registry cleanup policy (see the README's "Pruning old
-# published images"). The signing key is fetched here if enabled.
+# project's built-in Container Registry cleanup policy (see "Pruning old
+# published images" in the recipe docs). The signing key is fetched here if enabled.
 deploy:
   stage: deploy
   # Sequence behind both build jobs and gate on them. artifacts: false — the members
   # travel through the Container Registry now (see `.build`), not job artifacts.
   needs:
+    - job: base-check
+      optional: true
     - job: "build:x86_64"
       artifacts: false
     - job: "build:aarch64"
@@ -256,11 +368,13 @@ deploy:
   # variables:
   #   BOOTCHER_SIGN_PASSPHRASE: ""
   script:
+    - if [ "${BASE_CHANGED:-true}" = false ]; then echo "base image unchanged, nothing to deploy"; exit 0; fi
+    - !reference [.source-checkout, script]
     # Derive the refs from bootcher.toml (see the header). IMAGE is the scratch-tag base;
     # NAME the local member basename `deploy --skip-build` retags to.
     - IMAGE="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')"
     - NAME="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Name }}')"
-    - test -n "$IMAGE" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see README)"; exit 1; }
+    - test -n "$IMAGE" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see https://github.com/cdellacqua/bootcher/tree/main/recipes/ci)"; exit 1; }
     - echo "$CI_REGISTRY_PASSWORD" | podman login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
     # Pull each per-arch member `build` pushed under its scratch tag and retag it to the
     # local name `deploy --skip-build` expects — localhost/<name>:latest-<arch> — so the
@@ -306,6 +420,8 @@ deploy:
     # `rules` is present (a matched rule with no `when` defaults to on_success), so it
     # would otherwise run automatically. `allow_failure: true` keeps this optional job
     # from blocking the pipeline — start it from the UI when you need a disk.
+    - if: $CI_PIPELINE_SOURCE == "schedule" # a refresh, not a release to provision from
+      when: never
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: manual
       allow_failure: true

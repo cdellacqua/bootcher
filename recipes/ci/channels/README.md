@@ -10,6 +10,32 @@ publishes to:
 |---|---|---|
 | push to the default branch (`main`) | `latest` (bootcher's default — no flag) | rolling / **canary** fleet |
 | push a `v*` git tag | `stable` (`bootcher deploy --channel stable`) | **production** fleet |
+| Saturday schedule (if the base moved) | `latest` | base-image updates for canary |
+| Tuesday schedule (if the base moved) | `stable` | base-image updates for production, no new release |
+| manual run on the default branch / a `v*` tag | `latest` / `stable` | an unconditional rebuild |
+
+Each channel gets its own weekly base-image refresh, staggered so the canary fleet runs a
+new Fedora base for a few days before production does. A refresh rebuilds **the exact
+commit the channel currently ships**, read from the `org.opencontainers.image.revision`
+label bootcher stamps on every image, on today's base. It never ships unreleased source,
+and it works however a channel is fed: tags, a branch, or a rollback pushed by hand. It
+moves `:<channel>` and adds a new CalVer tag; nothing immutable is overwritten. Each
+refresh skips the build when the base hasn't moved since that channel was last published.
+
+If the published image has no usable label (built before bootcher v0.2.6 shipped git, or
+deployed from a dirty tree), `latest` falls back to the default branch. Any other channel
+fails the run rather than guess what to ship. Publish it once the normal way and the
+next refresh has a label to follow.
+
+- **GitHub** — one cron line per channel, mirrored in the `changes` job's `SCHEDULES`
+  table (`<channel> <cron>` per line), which maps the firing cron to its channel.
+- **GitLab** — one pipeline schedule per channel on the default branch. The non-`latest`
+  ones set the variable `SCHEDULE_CHANNEL=<channel>`. Needs git and skopeo in the bootcher
+  image (v0.2.6+).
+
+When you add a channel (below), give it a schedule too. See
+[Weekly rebuilds](../README.md#weekly-rebuilds-for-base-image-updates) for the
+base-image check itself.
 
 A channel is a mutable registry tag `<registry>/<name>:<channel>` that a *subset* of
 devices tracks; the same digest is **also** stamped with its immutable `:CalVer` tag
