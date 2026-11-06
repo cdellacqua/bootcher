@@ -4,14 +4,11 @@ Stdlib `unittest` only; run with `python3 -m unittest discover recipes/ci/tests`
 (`cargo xtask test` does). Not part of what users copy into their repo.
 """
 
-import importlib.util
-import pathlib
 import unittest
 
-_SCRIPT = pathlib.Path(__file__).resolve().parent.parent / "scripts" / "ghcr_cleanup.py"
-_spec = importlib.util.spec_from_file_location("ghcr_cleanup", _SCRIPT)
-cleanup = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(cleanup)
+from support import load_script
+
+cleanup = load_script("ghcr_cleanup")
 
 
 def digest(label):

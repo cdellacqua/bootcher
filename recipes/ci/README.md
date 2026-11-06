@@ -83,8 +83,9 @@ and on GitHub [`ghcr_cleanup.py`](scripts/ghcr_cleanup.py)), so copy the whole
 [`scripts/`](scripts/) directory into your repo as `ci/` alongside the workflow file(s).
 Each script's docstring says what it does and which environment variables it reads;
 they're yours to adapt like the workflows. [`tests/`](tests/) holds bootcher's own
-tests for them (stdlib `unittest`); you don't need to copy it, but it's a starting
-point if you change the cleanup's keep/delete logic (`plan()` in `ghcr_cleanup.py`).
+tests for them (stdlib `unittest`, with a fake `skopeo`); you don't need to copy it,
+but it's a starting point if you change a script's decision logic (`check()` in the
+two checks, `plan()` in `ghcr_cleanup.py`).
 
 **Release channels?** For a workflow where the default branch publishes the rolling
 `latest` channel and a `v*` git tag promotes to a `stable` channel for a production

@@ -249,8 +249,9 @@ fn exit_code(status: ExitStatus) -> u8 {
 fn test(sh: &Shell, cargo: &Path, flags: &[OsString]) -> Result<()> {
 	cmd!(sh, "{cargo} test {flags...}").run()?;
 	// The CI recipes' Python scripts (recipes/ci/scripts) carry their own stdlib
-	// unittest suite; run it here so `cargo xtask ci` gates it too.
-	cmd!(sh, "python3 -m unittest discover -s recipes/ci/tests").run()?;
+	// unittest suite; run it here so `cargo xtask ci` gates it too. -B: leave no
+	// __pycache__ behind in the tree.
+	cmd!(sh, "python3 -B -m unittest discover -s recipes/ci/tests").run()?;
 	Ok(())
 }
 
