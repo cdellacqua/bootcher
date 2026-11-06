@@ -8,7 +8,18 @@ import subprocess
 import sys
 import tempfile
 
-SCRIPTS = pathlib.Path(__file__).resolve().parent.parent / "scripts"
+
+def _find_scripts():
+    """The scripts' directory: `../scripts` in bootcher's repo, `../ci` in a repo that
+    copied them to `ci/` with `tests/` beside it, or `..` with `tests/` inside `ci/`."""
+    here = pathlib.Path(__file__).resolve().parent
+    for candidate in (here.parent / "scripts", here.parent / "ci", here.parent):
+        if (candidate / "base_check.py").exists():
+            return candidate
+    raise FileNotFoundError(f"no CI scripts found next to {here}")
+
+
+SCRIPTS = _find_scripts()
 
 
 def load_script(name):
@@ -20,7 +31,8 @@ def load_script(name):
 
 
 # A stand-in for `skopeo`: answers `skopeo inspect <args>` from a JSON table mapping
-# the space-joined args to {"json": ...} (printed) or {"error": ...} (exit 1).
+# the space-joined args to {"json": ...} (printed as JSON), {"raw": "..."} (printed
+# as is) or {"error": ...} (exit 1).
 _FAKE_SKOPEO = """#!/usr/bin/env python3
 import json, os, sys
 table = json.load(open(os.environ["FAKE_SKOPEO_TABLE"]))
@@ -28,7 +40,7 @@ reply = table.get(" ".join(sys.argv[2:]), {"error": "manifest unknown"})
 if "error" in reply:
     sys.stderr.write(reply["error"] + "\\n")
     sys.exit(1)
-print(json.dumps(reply["json"]))
+print(reply["raw"] if "raw" in reply else json.dumps(reply["json"]))
 """
 
 
@@ -53,9 +65,10 @@ def run_script(name, *, files=None, skopeo=None, env=None):
         work.mkdir()
         for rel, content in (files or {}).items():
             (work / rel).write_text(content)
-        full_env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}",
+        # A minimal env, so the caller's CHANNEL, GITHUB_OUTPUT, ... can't leak in.
+        full_env = {k: os.environ[k] for k in ("HOME", "LANG", "LC_ALL") if k in os.environ}
+        full_env.update(PATH=f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
                         FAKE_SKOPEO_TABLE=str(table))
-        full_env.pop("GITHUB_OUTPUT", None)
         full_env.update({k: v.replace("{dir}", str(work)) for k, v in (env or {}).items()})
         run = subprocess.run([sys.executable, "-B", str(SCRIPTS / f"{name}.py")], cwd=work,
                              env=full_env, capture_output=True, text=True)
