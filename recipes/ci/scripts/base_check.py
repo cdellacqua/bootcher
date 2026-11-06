@@ -27,7 +27,8 @@ Exits 0 with BASE_CHANGED set, or non-zero (no BASE_CHANGED) when the published 
 can't be read, or when a non-`latest` channel records no clean source revision.
 
 The decision lives in `check()`, which takes the registry lookups as a function;
-bootcher's repo tests it in `recipes/ci/tests/`.
+bootcher's repo tests it in
+https://github.com/cdellacqua/bootcher/tree/main/recipes/ci/tests
 """
 
 import json, os, subprocess, sys

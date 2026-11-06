@@ -75,7 +75,8 @@ enum Cmd {
 		#[arg(default_value = "bootcher:dev")]
 		tag: String,
 	},
-	/// Run the test suite.
+	/// Run the test suite: `cargo test`, then the CI recipe scripts' Python
+	/// unittest suite (needs `python3`, stdlib only).
 	Test,
 	/// Everything CI runs (invoked by .github/workflows/verify.yml so the two
 	/// can't drift): fmt check, clippy, doc, test. Locally it also runs a

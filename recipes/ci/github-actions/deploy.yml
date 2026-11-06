@@ -41,7 +41,7 @@
 # is a no-op. A `v*` tag always builds. See that job for the allowlist to tune.
 #
 # A weekly schedule rebuilds when the base image moved, so its security updates reach
-# the fleet without a commit; a manual run always rebuilds.
+# the fleet without a commit; a manual run of main or a `v*` tag always rebuilds.
 #
 # Why split the build per arch? A multi-arch `bootcher deploy` on a single runner would
 # build the foreign arch under qemu-user emulation — slow and occasionally fragile.
@@ -142,10 +142,13 @@ jobs:
   # that ends up in the image belongs here. This workflow file is included so a pipeline
   # edit re-runs it; provision.yml is manual (workflow_dispatch), so it isn't listed. Nor
   # is ci/: its scripts don't change the image. An edited cleanup script runs at the
-  # next deploy (a manual run always deploys). The base and release checks run only on
-  # the schedule, which can't be triggered by hand: test an edit by running the script
-  # locally (both only read registries; base_check.py needs IMAGE, plus CHANNEL for a
-  # channel).
+  # next deploy, e.g. a manual run of main or a `v*` tag; set the cleanup step's
+  # DRY_RUN to "true" for that first run so trying the edit deletes nothing. The base
+  # and release checks run only on the schedule, which can't be triggered by hand: test
+  # an edit by running the script locally, from the repo root and after `skopeo login`
+  # for a private image (both only read registries; base_check.py needs IMAGE, plus
+  # CHANNEL for a channel, and GITHUB_OUTPUT=/dev/stdout to print its results instead of
+  # appending them to a base.env file). The recipe README has the details.
   changes:
     runs-on: ubuntu-24.04
     permissions:

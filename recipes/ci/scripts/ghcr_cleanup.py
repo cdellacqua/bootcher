@@ -16,11 +16,14 @@ with the child manifests those kept lists reference (resolved from the registry)
 deletes only versions outside that set. cosign signatures and attachments
 (`sha256-<digest>.sig|.att|.sbom`, also their own versions) aren't releases: each is
 kept exactly when the image or arch member it belongs to is kept. Channels need no
-special handling: every declared channel is a protected tag. Any unhandled error aborts
-before deleting (fail closed), and it refuses to delete every version.
+special handling: every declared channel is a protected tag. It refuses to delete every
+version. An error while gathering and deciding (reading the package and its versions,
+resolving the kept lists) aborts before anything is deleted; an error during the
+deletions stops the run with the earlier deletions done. A re-run picks up where it
+left off: it lists the package again and recomputes the plan from what is left.
 
 The keep/delete decision lives in `plan()`, which does no I/O; bootcher's repo tests
-it in `recipes/ci/tests/`.
+it in https://github.com/cdellacqua/bootcher/tree/main/recipes/ci/tests
 
 Reads:
   GH_TOKEN           token with `packages: write` (GITHUB_TOKEN works for a package
@@ -80,6 +83,8 @@ def plan(versions, keep, channels, children_of):
     # Keep the signatures of every kept image, arch members included.
     keep_all |= {v["name"] for v in versions if subject(v) in keep_all}
     doomed = [v for v in versions if v["name"] not in keep_all]
+    # Either condition alone suffices today; the second is a deliberate backstop in case
+    # the keep-set logic above is ever wrong (keep names that match no version).
     if not keep_all or len(doomed) >= len(versions):
         raise Refused(f"cleanup: refusing to delete all {len(versions)} version(s) "
                       "(keep-set empty) — aborting")

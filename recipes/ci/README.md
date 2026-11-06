@@ -83,9 +83,12 @@ and on GitHub [`ghcr_cleanup.py`](scripts/ghcr_cleanup.py)), so copy the whole
 [`scripts/`](scripts/) directory into your repo as `ci/` alongside the workflow file(s).
 Each script's docstring says what it does and which environment variables it reads;
 they're yours to adapt like the workflows. [`tests/`](tests/) holds bootcher's own
-tests for them (stdlib `unittest`, with a fake `skopeo`); you don't need to copy it,
-but it's a starting point if you change a script's decision logic (`check()` in the
-two checks, `plan()` in `ghcr_cleanup.py`).
+tests for them (stdlib `unittest`, with a fake `skopeo` and a fake GitHub API); you
+don't need to copy it, but it's a starting point if you change a script's decision
+logic (`check()` in the two checks, `plan()` in `ghcr_cleanup.py`). To use it, copy it
+to your repo root beside `ci/` (it finds the scripts in `../ci`, or in its parent
+directory if you put it inside `ci/`) and run
+`python3 -B -m unittest discover -s tests` (or `-s ci/tests`) from the repo root.
 
 **Release channels?** For a workflow where the default branch publishes the rolling
 `latest` channel and a `v*` git tag promotes to a `stable` channel for a production
@@ -335,14 +338,11 @@ deploy. The build context is the **entire project root**, so the gate is an
 - `sysroot/**` — the overlay baked into the image
 - `bootcher.toml` and `bootcher.ci.toml` — a registry/`[targets]`/`[hooks]` change re-images too
 - the CI file itself, so editing the pipeline re-runs it (not the `ci/` scripts: they
-  don't change the image). An edited cleanup script runs at the next deploy, manual
-  runs included. The base and release checks run only on a schedule, which GitHub can't
-  trigger by hand: test an edit by running the script locally (both only read
-  registries; `base_check.py` needs `IMAGE`, plus `CHANNEL` for a channel), or on
-  GitLab with the schedule's Run button (a real refresh).
+  don't change the image; see [testing an edited script](#testing-an-edited-ci-script)).
 
 **A `v*` tag always builds**, path filter or not — a tag is a deliberate release. So
-does a manual run, and a scheduled one does when the base image moved (see
+does a manual run of the default branch or a `v*` tag, and a scheduled one does when the
+base image moved (see
 [Weekly rebuilds](#weekly-rebuilds-for-base-image-updates)).
 
 The gate is applied consistently across stages so the `needs` chain never breaks:
@@ -360,9 +360,35 @@ context that ends up in the image belongs in the list.
   default-branch rule, no `changes:` on the tag rule), `!reference`d from both `.build`
   and `deploy`.
 - **GitHub** — a cheap `changes` pre-job (`dorny/paths-filter`, on a plain runner)
-  outputs a boolean (true on a manual run, the base-image check on a schedule) that
+  outputs a boolean (true on a manual run of the default branch or a `v*` tag, the
+  base-image check on a schedule) that
   `build` gates on with
   `if: needs.changes.outputs.image == 'true' || startsWith(github.ref, 'refs/tags/')`.
+
+### Testing an edited CI script
+
+An edited `ci/ghcr_cleanup.py` (GitHub) runs at the next deploy: a push that passes the
+path filter, or a manual run of the default branch or a `v*` tag (a manual run of any
+other branch builds and deploys nothing). Set the cleanup step's `DRY_RUN` to `"true"`
+for that first run, so trying the edit logs what it would delete instead of deleting
+live versions; check the plan, then set it back to `"false"`.
+
+The base and release checks run only on a schedule, which GitHub can't trigger by hand
+(on GitLab the schedule's Run button can, and that's a real refresh). Both only read
+registries, so the simplest test is to run the script locally. Run it from your repo
+root (`release_check.py` reads `./Containerfile`), with `skopeo` installed and, if the
+image (or a mirrored base) is private, logged in with `skopeo login <registry>` first:
+
+```sh
+python3 ci/release_check.py
+IMAGE="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')" \
+  GITHUB_OUTPUT=/dev/stdout python3 ci/base_check.py
+```
+
+`base_check.py` needs `IMAGE`, plus `CHANNEL` to check a channel other than `latest`.
+Without `GITHUB_OUTPUT` it appends its results (`BASE_CHANGED`, `SOURCE_REV`) to a
+`base.env` file in the current directory, GitLab's dotenv report, which you don't want
+left behind in your repo; `GITHUB_OUTPUT=/dev/stdout` prints them instead.
 
 ## Requirements & troubleshooting
 
