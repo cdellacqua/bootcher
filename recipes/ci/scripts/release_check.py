@@ -28,8 +28,8 @@ import json, os, re, subprocess, sys
 PIN = re.compile(r"^\s*ARG FEDORA_VERSION=(\d+)\s*$", re.M)
 STABLE = "docker://quay.io/fedora/fedora-bootc:latest"
 
-WARNING = os.environ.get("WARNING_PREFIX", "warning: ")
-BEHIND = int(os.environ.get("BEHIND_EXIT_CODE", "0"))
+WARNING = os.environ.get("WARNING_PREFIX") or "warning: "
+BEHIND = int(os.environ.get("BEHIND_EXIT_CODE") or "0")
 
 match = PIN.search(open("Containerfile").read())
 if not match:

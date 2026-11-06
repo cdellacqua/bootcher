@@ -179,8 +179,10 @@ stages: [build, deploy, provision]
 # Adjust the list to YOUR project: if the Containerfile `COPY`s other paths, or a
 # [hooks] script lives outside sysroot/, add them — anything in the build context that
 # ends up in the image belongs here. `.gitlab-ci.yml` is included so a pipeline edit
-# re-runs itself. ci/ isn't: its scripts don't change the image, and the checks only run
-# on a schedule anyway (run a pipeline by hand to exercise an edited one).
+# re-runs itself. ci/ isn't: its scripts don't change the image. The base and release
+# checks run only on a schedule: test an edit with the schedule's Run (play) button,
+# which is a real refresh, or by running the script locally (both only read
+# registries; base_check.py needs IMAGE).
 .image-rules:
   rules:
     - if: $CI_COMMIT_TAG

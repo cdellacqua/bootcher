@@ -239,16 +239,17 @@ tag). Use it after a Fedora advisory, or for packages your
 which for fedora-bootc is usually within the week.
 
 **A scheduled run also checks the Fedora release.** The scaffold pins one Fedora release
-(`ARG FEDORA_VERSION` in the `Containerfile`), and that release's tag stops moving at end
-of life. From then on the base never moves, every scheduled run skips the rebuild, and the
-fleet stops getting security updates while the pipeline stays green. The `release-check`
-job compares it with the release `fedora-bootc:latest` currently points at (skopeo plus
-[`ci/release_check.py`](scripts/release_check.py)) on each schedule: it warns while the pin is one release behind and
-fails once it is two behind (at or within weeks of end of life). It gates nothing, so the
-failure is the alert: bump `FEDORA_VERSION`, push, and the normal pipeline rebuilds onto
-the new release. The script reads the pin from `ARG FEDORA_VERSION` and the current
-release from `quay.io/fedora/fedora-bootc:latest`; adapt the two settings at its top if
-your Containerfile pins differently or you pull from a mirror.
+(`ARG FEDORA_VERSION` in the `Containerfile`), and that release's tag stops moving at
+end of life. From then on the base never moves, every scheduled run skips the rebuild,
+and the fleet stops getting security updates while the pipeline stays green. The
+`release-check` job compares it with the release `fedora-bootc:latest` currently points
+at (skopeo plus [`ci/release_check.py`](scripts/release_check.py)) on each schedule: it
+warns while the pin is one release behind and fails once it is two behind (at or within
+weeks of end of life). It gates nothing, so the failure is the alert: bump
+`FEDORA_VERSION`, push, and the normal pipeline rebuilds onto the new release. The
+script reads the pin from `ARG FEDORA_VERSION` and the current release from
+`quay.io/fedora/fedora-bootc:latest`; adapt the two settings at its top if your
+Containerfile pins differently or you pull from a mirror.
 
 Time the schedule ahead of the window you want the reboot in. A private base image needs
 its own `skopeo login` in the check. Refreshes and pushes share `KEEP_PREVIOUS`, so with
@@ -265,20 +266,20 @@ Every push publishes a new `:latest` list and a fresh immutable `:<CalVer>` tag,
 package accrues one release per deploy. Left alone it grows without bound.
 
 **GitHub** — the `deploy.yml` `cleanup` job (runs after a successful deploy, with
-[`ci/ghcr_cleanup.py`](scripts/ghcr_cleanup.py)) keeps
-`:latest` + the newest `KEEP_PREVIOUS` CalVer releases and deletes the rest. Tune
-`KEEP_PREVIOUS` (an `env` at the top of the workflow; `0` keeps only `:latest`). The
-prune is **multi-arch-safe** — the footgun it sidesteps: GHCR stores each arch's child
-manifest as its own package *version*, usually untagged, so the obvious "keep the N most
-recent versions, delete the rest" deletes the arch members of the release you meant to
-keep and leaves a `:latest` that won't pull. The job instead deletes by **digest**: it
-computes the digests to keep (the kept releases, plus any version tagged with a channel —
-`latest` and your `[deploy] channels` — or a `ci-<arch>` scratch tag), extends that set
-with the child manifests those kept lists reference (read from the registry), and deletes
-only versions outside it. With signing on, each cosign signature (`sha256-<digest>.sig`,
-again its own version) follows its image: it's kept exactly when the list or arch member
-it signs is kept, and never takes up a `KEEP_PREVIOUS` slot. It refuses to run if that
-would delete everything.
+[`ci/ghcr_cleanup.py`](scripts/ghcr_cleanup.py)) keeps `:latest` + the newest
+`KEEP_PREVIOUS` CalVer releases and deletes the rest. Tune `KEEP_PREVIOUS` (an `env` at
+the top of the workflow; `0` keeps only `:latest`). The prune is **multi-arch-safe** —
+the footgun it sidesteps: GHCR stores each arch's child manifest as its own package
+*version*, usually untagged, so the obvious "keep the N most recent versions, delete the
+rest" deletes the arch members of the release you meant to keep and leaves a `:latest`
+that won't pull. The job instead deletes by **digest**: it computes the digests to keep
+(the kept releases, plus any version tagged with a channel — `latest` and your `[deploy]
+channels` — or a `ci-<arch>` scratch tag), extends that set with the child manifests
+those kept lists reference (read from the registry), and deletes only versions outside
+it. With signing on, each cosign signature (`sha256-<digest>.sig`, again its own
+version) follows its image: it's kept exactly when the list or arch member it signs is
+kept, and never takes up a `KEEP_PREVIOUS` slot. It refuses to run if that would delete
+everything.
 
 - **Token** — it deletes with the built-in `GITHUB_TOKEN` (`packages: write`), which
   works for a package **linked to this repo**. If the package is org-owned and the token
@@ -331,7 +332,11 @@ deploy. The build context is the **entire project root**, so the gate is an
 - `sysroot/**` — the overlay baked into the image
 - `bootcher.toml` and `bootcher.ci.toml` — a registry/`[targets]`/`[hooks]` change re-images too
 - the CI file itself, so editing the pipeline re-runs it (not the `ci/` scripts: they
-  don't change the image, and the checks only run on a schedule anyway)
+  don't change the image). An edited cleanup script runs at the next deploy, manual
+  runs included. The base and release checks run only on a schedule, which GitHub can't
+  trigger by hand: test an edit by running the script locally (both only read
+  registries; `base_check.py` needs `IMAGE`, plus `CHANNEL` for a channel), or on
+  GitLab with the schedule's Run button (a real refresh).
 
 **A `v*` tag always builds**, path filter or not — a tag is a deliberate release. So
 does a manual run, and a scheduled one does when the base image moved (see

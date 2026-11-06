@@ -3,8 +3,10 @@
 # Recipe docs: https://github.com/cdellacqua/bootcher/tree/main/recipes/ci
 #
 # Copy this to your bootcher project as `.github/workflows/bootcher-deploy.yml`, and the
-# recipe's `scripts/` directory (https://github.com/cdellacqua/bootcher/tree/main/recipes/ci/scripts)
-# to `ci/` at your repo root: the jobs run `python3 ci/<script>.py`. Its sibling, `provision.yml`, is the disk-building half — see that file. They're split
+# recipe's `scripts/` directory
+# (https://github.com/cdellacqua/bootcher/tree/main/recipes/ci/scripts) to `ci/` at your
+# repo root: the jobs run `python3 ci/<script>.py`. Its sibling, `provision.yml`, is the
+# disk-building half — see that file. They're split
 # because the disk build needs a MANUAL gate, and GitHub Free can't gate a job inside a
 # push pipeline (Environment "Required reviewers" is public-repo-only on Free). So the
 # build→deploy pipeline below runs automatically on push, and provision is a separate
@@ -139,8 +141,11 @@ jobs:
   # or a hook script lives outside sysroot/, add them — anything in the build context
   # that ends up in the image belongs here. This workflow file is included so a pipeline
   # edit re-runs it; provision.yml is manual (workflow_dispatch), so it isn't listed. Nor
-  # is ci/: its scripts don't change the image, and the checks only run on a schedule
-  # anyway (dispatch a run by hand to exercise an edited one).
+  # is ci/: its scripts don't change the image. An edited cleanup script runs at the
+  # next deploy (a manual run always deploys). The base and release checks run only on
+  # the schedule, which can't be triggered by hand: test an edit by running the script
+  # locally (both only read registries; base_check.py needs IMAGE, plus CHANNEL for a
+  # channel).
   changes:
     runs-on: ubuntu-24.04
     permissions:
