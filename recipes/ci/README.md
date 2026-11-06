@@ -75,6 +75,14 @@ Drop one arch from the matrix (GitHub) / delete the second `build:`/`provision:`
 | GitHub Actions (provision) | [`github-actions/provision.yml`](github-actions/provision.yml) | `.github/workflows/bootcher-provision.yml` |
 | GitLab CI | [`gitlab-ci.yml`](gitlab-ci.yml) | `.gitlab-ci.yml` (repo root) |
 | Both | [`bootcher.ci.toml`](bootcher.ci.toml) | `bootcher.ci.toml` (repo root, beside `bootcher.toml`) |
+| Both | [`scripts/`](scripts/) | `ci/` (repo root) |
+
+The deploy pipelines run a few stdlib-only Python scripts from `ci/`
+([`base_check.py`](scripts/base_check.py), [`release_check.py`](scripts/release_check.py),
+and on GitHub [`ghcr_cleanup.py`](scripts/ghcr_cleanup.py)), so copy the whole
+[`scripts/`](scripts/) directory into your repo as `ci/` alongside the workflow file(s).
+Each script's docstring says what it does and which environment variables it reads;
+they're yours to adapt like the workflows.
 
 **Release channels?** For a workflow where the default branch publishes the rolling
 `latest` channel and a `v*` git tag promotes to a `stable` channel for a production
@@ -234,8 +242,8 @@ which for fedora-bootc is usually within the week.
 (`ARG FEDORA_VERSION` in the `Containerfile`), and that release's tag stops moving at end
 of life. From then on the base never moves, every scheduled run skips the rebuild, and the
 fleet stops getting security updates while the pipeline stays green. The `release-check`
-job compares it with the release `fedora-bootc:latest` currently points at (skopeo plus a
-short Python script) on each schedule: it warns while the pin is one release behind and
+job compares it with the release `fedora-bootc:latest` currently points at (skopeo plus
+[`ci/release_check.py`](scripts/release_check.py)) on each schedule: it warns while the pin is one release behind and
 fails once it is two behind (at or within weeks of end of life). It gates nothing, so the
 failure is the alert: bump `FEDORA_VERSION`, push, and the normal pipeline rebuilds onto
 the new release. The script reads the pin from `ARG FEDORA_VERSION` and the current
@@ -256,7 +264,8 @@ refresh rebuilds the commit that channel currently ships (from its image's revis
 Every push publishes a new `:latest` list and a fresh immutable `:<CalVer>` tag, so the
 package accrues one release per deploy. Left alone it grows without bound.
 
-**GitHub** — the `deploy.yml` `cleanup` job (runs after a successful deploy) keeps
+**GitHub** — the `deploy.yml` `cleanup` job (runs after a successful deploy, with
+[`ci/ghcr_cleanup.py`](scripts/ghcr_cleanup.py)) keeps
 `:latest` + the newest `KEEP_PREVIOUS` CalVer releases and deletes the rest. Tune
 `KEEP_PREVIOUS` (an `env` at the top of the workflow; `0` keeps only `:latest`). The
 prune is **multi-arch-safe** — the footgun it sidesteps: GHCR stores each arch's child
@@ -321,7 +330,8 @@ deploy. The build context is the **entire project root**, so the gate is an
 - `Containerfile`
 - `sysroot/**` — the overlay baked into the image
 - `bootcher.toml` and `bootcher.ci.toml` — a registry/`[targets]`/`[hooks]` change re-images too
-- the CI file itself, so editing the pipeline re-runs it
+- the CI file itself, so editing the pipeline re-runs it (not the `ci/` scripts: they
+  don't change the image, and the checks only run on a schedule anyway)
 
 **A `v*` tag always builds**, path filter or not — a tag is a deliberate release. So
 does a manual run, and a scheduled one does when the base image moved (see

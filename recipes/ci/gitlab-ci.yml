@@ -2,7 +2,9 @@
 #
 # Recipe docs: https://github.com/cdellacqua/bootcher/tree/main/recipes/ci
 #
-# Copy this to your bootcher project as `.gitlab-ci.yml` at the repo root. It builds
+# Copy this to your bootcher project as `.gitlab-ci.yml` at the repo root, and the
+# recipe's `scripts/` directory (https://github.com/cdellacqua/bootcher/tree/main/recipes/ci/scripts)
+# to `ci/` beside it: the schedule-only checks run `python3 ci/<script>.py`. It builds
 # both architectures on native runners (no cross-arch emulation), assembles them into
 # one multi-arch image, and can produce a flashable disk per arch — in three stages:
 #
@@ -177,7 +179,8 @@ stages: [build, deploy, provision]
 # Adjust the list to YOUR project: if the Containerfile `COPY`s other paths, or a
 # [hooks] script lives outside sysroot/, add them — anything in the build context that
 # ends up in the image belongs here. `.gitlab-ci.yml` is included so a pipeline edit
-# re-runs itself.
+# re-runs itself. ci/ isn't: its scripts don't change the image, and the checks only run
+# on a schedule anyway (run a pipeline by hand to exercise an edited one).
 .image-rules:
   rules:
     - if: $CI_COMMIT_TAG
@@ -191,10 +194,10 @@ stages: [build, deploy, provision]
           - .gitlab-ci.yml
 
 # --- base-check: did the base image move since the last publish? (schedules only) --
-# Compares the base digest buildah recorded in each published member with the base
-# tag's current one; anything uncheckable rebuilds. Hands BASE_CHANGED (and SOURCE_REV,
-# the commit :latest ships) to `.build`/`deploy` as a dotenv report. A private base image
-# needs its own `skopeo login`.
+# ci/base_check.py compares the base digest buildah recorded in each published member
+# with the base tag's current one; anything uncheckable rebuilds. Hands BASE_CHANGED (and
+# SOURCE_REV, the commit :latest ships) to `.build`/`deploy` as a dotenv report. A private
+# base image needs its own `skopeo login`.
 base-check:
   stage: build
   rules:
@@ -206,71 +209,7 @@ base-check:
     - test -n "$IMAGE" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see https://github.com/cdellacqua/bootcher/tree/main/recipes/ci)"; exit 1; }
     - export IMAGE
     - echo "$CI_REGISTRY_PASSWORD" | skopeo login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
-    - |
-      python3 - <<'EOF'
-      import json, os, subprocess, sys
-
-      image, channel = os.environ["IMAGE"], os.environ.get("CHANNEL") or "latest"
-      out = open(os.environ.get("GITHUB_OUTPUT") or "base.env", "a")
-
-      def inspect(*args):
-          run = subprocess.run(["skopeo", "inspect", *args], capture_output=True, text=True)
-          if run.returncode:
-              raise LookupError(run.stderr.strip())
-          return json.loads(run.stdout)
-
-      def done(changed, why):
-          print(why)
-          out.write(f"BASE_CHANGED={str(changed).lower()}\n")
-          sys.exit(0)
-
-      def fail(why):
-          sys.exit(f"{image}:{channel}: {why}")
-
-      try:
-          top = inspect("--raw", f"docker://{image}:{channel}")
-      except LookupError as e:
-          if "manifest unknown" not in str(e):
-              fail(f"can't read it: {e}")
-          done(channel == "latest", f"nothing published to {image}:{channel} yet")
-
-      # A list's per-arch members (attestations have no real platform), or a lone image.
-      if "manifests" in top:
-          refs = [f"{image}@{m['digest']}" for m in top["manifests"]
-                  if m.get("platform", {}).get("architecture", "unknown") != "unknown"]
-      else:
-          refs = [f"{image}:{channel}"]
-
-      # The commit the channel ships: a refresh rebuilds it on the new base.
-      try:
-          labels = inspect("--config", f"docker://{refs[0]}")["config"].get("Labels") or {}
-      except (LookupError, IndexError, KeyError, ValueError):
-          labels = {}
-      rev = labels.get("org.opencontainers.image.revision", "")
-      if rev and not rev.endswith("-dirty"):
-          print(f"{image}:{channel} ships {rev}")
-          out.write(f"SOURCE_REV={rev}\n")
-      elif channel != "latest":
-          fail(f"no clean source revision recorded ({rev!r}); publish it once with a normal deploy")
-      if not refs:
-          done(True, f"{image}:{channel} lists no image to check, rebuilding")
-
-      for ref in refs:
-          try:
-              arch = inspect("--config", f"docker://{ref}")["architecture"]
-              annotations = inspect("--raw", f"docker://{ref}").get("annotations", {})
-              base = annotations["org.opencontainers.image.base.name"]
-              built = annotations["org.opencontainers.image.base.digest"]
-              current = next((m["digest"] for m in inspect("--raw", f"docker://{base}").get("manifests", [])
-                              if m.get("platform", {}).get("architecture") == arch), None) \
-                  or inspect(f"docker://{base}")["Digest"]
-          except (LookupError, KeyError, ValueError) as e:
-              done(True, f"{ref}: can't check the base ({e!r}), rebuilding")
-          if current != built:
-              done(True, f"{arch}: {base} moved ({built} -> {current}), rebuilding")
-          print(f"{arch}: {base} unchanged")
-      done(False, "base image unchanged since the last publish, skipping the rebuild")
-      EOF
+    - python3 ci/base_check.py
   artifacts:
     reports:
       dotenv: base.env
@@ -282,49 +221,20 @@ base-check:
 # once the pin is two releases behind (at or within weeks of end of life) and warns while
 # it's one behind. Nothing needs it: a failure here is the alert, not a reason to skip a
 # rebuild. It reads the pin from `ARG FEDORA_VERSION`; adapt the two settings at the top
-# of the script if your Containerfile or base differ.
+# of ci/release_check.py if your Containerfile or base differ.
 release-check:
   stage: build
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule"
   needs: []
   before_script: [] # no container store needed: this job only reads a registry
+  variables:
+    WARNING_PREFIX: "warning: "
+    BEHIND_EXIT_CODE: "3" # one release behind: exit 3, an allowed failure (below)...
   allow_failure:
-    exit_codes: [3] # one release behind: a warning, not a failure
+    exit_codes: [3] # ...so the job shows as a warning, not a failure
   script:
-    - |
-      python3 - <<'EOF'
-      import json, re, subprocess, sys
-
-      WARNING, BEHIND = "warning: ", 3  # exit 3 = allowed failure: the job shows as a warning
-
-      # Adapt to your setup: where the Containerfile pins the release, and the tag that
-      # follows the current stable one (point it at your mirror if you use one).
-      PIN = re.compile(r"^\s*ARG FEDORA_VERSION=(\d+)\s*$", re.M)
-      STABLE = "docker://quay.io/fedora/fedora-bootc:latest"
-
-      match = PIN.search(open("Containerfile").read())
-      if not match:
-          print("no `ARG FEDORA_VERSION=<N>` in the Containerfile, nothing to check")
-          sys.exit(0)
-      pinned = int(match[1])
-      run = subprocess.run(["skopeo", "inspect", STABLE], capture_output=True, text=True)
-      if run.returncode:
-          sys.exit(f"can't read {STABLE}: {run.stderr.strip()}")
-      current = int(json.loads(run.stdout)["Labels"]["org.opencontainers.image.version"].split(".")[0])
-
-      if current <= pinned:
-          print(f"Fedora {pinned} is the current release")
-      elif current == pinned + 1:
-          print(f"{WARNING}Fedora {current} is out. Fedora {pinned} gets updates until about four "
-                f"weeks after Fedora {pinned + 2} ships: plan the upgrade (bump FEDORA_VERSION, "
-                "rebuild, test).")
-          sys.exit(BEHIND)
-      else:
-          sys.exit(f"Fedora {pinned} is at or past end of life (the current release is Fedora "
-                   f"{current}): devices stop getting security updates. Bump FEDORA_VERSION to "
-                   f"{current}, rebuild, test.")
-      EOF
+    - python3 ci/release_check.py
 
 # --- source checkout: a refresh rebuilds the commit :latest ships (SOURCE_REV) --
 .source-checkout:

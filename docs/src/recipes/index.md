@@ -14,7 +14,9 @@ with a README and the files to copy; this page maps each to the flow it covers.
 ## How recipes are wired in
 
 - **CI recipes** are workflow files you copy into your repo (`.github/workflows/`
-  or `.gitlab-ci.yml`) plus a small committed [`bootcher.ci.toml`](../reference/bootcher-toml.md#extend-top-level-optional)
+  or `.gitlab-ci.yml`), the helper scripts they run (the recipe's `scripts/`
+  directory, copied to `ci/` at your repo root), and a small committed
+  [`bootcher.ci.toml`](../reference/bootcher-toml.md#extend-top-level-optional)
   override. They drive the same [`deploy`](../workflows/deploy.md) /
   [`provision`](../workflows/setup.md) commands you run locally, just unattended — see
   [Continuous deployment](../workflows/deploy.md#continuous-deployment). The channels

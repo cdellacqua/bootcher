@@ -10,7 +10,9 @@
 # DIFFERENT: which channel each trigger publishes to. For the store relocation, the
 # per-arch split rationale, the cleanup mechanics, and the secrets, read
 # the base recipe and the recipe docs; nothing there changes. The disk
-# build is the sibling provision.yml.
+# build is the sibling provision.yml. Like the base recipe, it runs the shared scripts
+# (https://github.com/cdellacqua/bootcher/tree/main/recipes/ci/scripts), which you copy to
+# `ci/` at your repo root.
 #
 #   push to main             → deploy to the default `latest` channel (rolling / canary)
 #   push a v* tag            → deploy to the `stable` channel         (production fleet)
@@ -133,10 +135,10 @@ jobs:
           SCHEDULES: |
             latest 17 3 * * 6
             stable 17 3 * * 2
-      # Scheduled runs: compare the base digest buildah recorded in each published member
-      # with the base tag's current one; anything uncheckable rebuilds. Also emits the commit
-      # the channel ships (SOURCE_REV), for a refresh to rebuild. A private base image needs
-      # its own `skopeo login`.
+      # Scheduled runs: ci/base_check.py compares the base digest buildah recorded in each
+      # published member of this run's channel with the base tag's current one; anything
+      # uncheckable rebuilds. Also emits the commit the channel ships (SOURCE_REV), for a
+      # refresh to rebuild. A private base image needs its own `skopeo login`.
       - name: Resolve image ref
         if: github.event_name == 'schedule'
         run: |
@@ -151,72 +153,9 @@ jobs:
       - name: Check whether the base image moved
         if: github.event_name == 'schedule'
         id: base
-        shell: python3 {0}
         env:
           CHANNEL: ${{ steps.channel.outputs.channel }}
-        run: |
-          import json, os, subprocess, sys
-
-          image, channel = os.environ["IMAGE"], os.environ.get("CHANNEL") or "latest"
-          out = open(os.environ.get("GITHUB_OUTPUT") or "base.env", "a")
-
-          def inspect(*args):
-              run = subprocess.run(["skopeo", "inspect", *args], capture_output=True, text=True)
-              if run.returncode:
-                  raise LookupError(run.stderr.strip())
-              return json.loads(run.stdout)
-
-          def done(changed, why):
-              print(why)
-              out.write(f"BASE_CHANGED={str(changed).lower()}\n")
-              sys.exit(0)
-
-          def fail(why):
-              sys.exit(f"{image}:{channel}: {why}")
-
-          try:
-              top = inspect("--raw", f"docker://{image}:{channel}")
-          except LookupError as e:
-              if "manifest unknown" not in str(e):
-                  fail(f"can't read it: {e}")
-              done(channel == "latest", f"nothing published to {image}:{channel} yet")
-
-          # A list's per-arch members (attestations have no real platform), or a lone image.
-          if "manifests" in top:
-              refs = [f"{image}@{m['digest']}" for m in top["manifests"]
-                      if m.get("platform", {}).get("architecture", "unknown") != "unknown"]
-          else:
-              refs = [f"{image}:{channel}"]
-
-          # The commit the channel ships: a refresh rebuilds it on the new base.
-          try:
-              labels = inspect("--config", f"docker://{refs[0]}")["config"].get("Labels") or {}
-          except (LookupError, IndexError, KeyError, ValueError):
-              labels = {}
-          rev = labels.get("org.opencontainers.image.revision", "")
-          if rev and not rev.endswith("-dirty"):
-              print(f"{image}:{channel} ships {rev}")
-              out.write(f"SOURCE_REV={rev}\n")
-          elif channel != "latest":
-              fail(f"no clean source revision recorded ({rev!r}); publish it once with a normal deploy")
-          if not refs:
-              done(True, f"{image}:{channel} lists no image to check, rebuilding")
-
-          for ref in refs:
-              try:
-                  arch = inspect("--config", f"docker://{ref}")["architecture"]
-                  annotations = inspect("--raw", f"docker://{ref}").get("annotations", {})
-                  base = annotations["org.opencontainers.image.base.name"]
-                  built = annotations["org.opencontainers.image.base.digest"]
-                  current = next((m["digest"] for m in inspect("--raw", f"docker://{base}").get("manifests", [])
-                                  if m.get("platform", {}).get("architecture") == arch), None) \
-                      or inspect(f"docker://{base}")["Digest"]
-              except (LookupError, KeyError, ValueError) as e:
-                  done(True, f"{ref}: can't check the base ({e!r}), rebuilding")
-              if current != built:
-                  done(True, f"{arch}: {base} moved ({built} -> {current}), rebuilding")
-              print(f"{arch}: {base} unchanged")
-          done(False, "base image unchanged since the last publish, skipping the rebuild")
+        run: python3 ci/base_check.py
 
   # --- release-check: is the pinned Fedora release still supported? (schedules only)
   # The Containerfile pins fedora-bootc to one Fedora release (`ARG FEDORA_VERSION`). Its
@@ -225,7 +164,7 @@ jobs:
   # job fails once the pin is two releases behind (at or within weeks of end of life) and
   # warns while it's one behind. It gates nothing: a failure here is the alert, not a
   # reason to skip a rebuild. It reads the pin from `ARG FEDORA_VERSION`; adapt the two
-  # settings at the top of the script if your Containerfile or base differ.
+  # settings at the top of ci/release_check.py if your Containerfile or base differ.
   release-check:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-24.04
@@ -234,38 +173,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Check the pinned Fedora release
-        shell: python3 {0}
-        run: |
-          import json, re, subprocess, sys
-
-          WARNING, BEHIND = "::warning::", 0  # an annotation on the run; still green
-
-          # Adapt to your setup: where the Containerfile pins the release, and the tag that
-          # follows the current stable one (point it at your mirror if you use one).
-          PIN = re.compile(r"^\s*ARG FEDORA_VERSION=(\d+)\s*$", re.M)
-          STABLE = "docker://quay.io/fedora/fedora-bootc:latest"
-
-          match = PIN.search(open("Containerfile").read())
-          if not match:
-              print("no `ARG FEDORA_VERSION=<N>` in the Containerfile, nothing to check")
-              sys.exit(0)
-          pinned = int(match[1])
-          run = subprocess.run(["skopeo", "inspect", STABLE], capture_output=True, text=True)
-          if run.returncode:
-              sys.exit(f"can't read {STABLE}: {run.stderr.strip()}")
-          current = int(json.loads(run.stdout)["Labels"]["org.opencontainers.image.version"].split(".")[0])
-
-          if current <= pinned:
-              print(f"Fedora {pinned} is the current release")
-          elif current == pinned + 1:
-              print(f"{WARNING}Fedora {current} is out. Fedora {pinned} gets updates until about four "
-                    f"weeks after Fedora {pinned + 2} ships: plan the upgrade (bump FEDORA_VERSION, "
-                    "rebuild, test).")
-              sys.exit(BEHIND)
-          else:
-              sys.exit(f"Fedora {pinned} is at or past end of life (the current release is Fedora "
-                       f"{current}): devices stop getting security updates. Bump FEDORA_VERSION to "
-                       f"{current}, rebuild, test.")
+        run: python3 ci/release_check.py
+        env:
+          WARNING_PREFIX: "::warning::" # one release behind: an annotation on the run...
+          BEHIND_EXIT_CODE: "0" # ...and the run stays green
 
   # --- build: one container per arch, on a native-arch runner -----------------------
   # Same as the base recipe — channel-agnostic (it pushes the member to a scratch tag
@@ -429,9 +340,9 @@ jobs:
           BOOTCHER_SIGN_PASSPHRASE: ${{ secrets.SIGN_PASSPHRASE }}
 
   # --- cleanup: prune old published image versions ----------------------------------
-  # Identical to the base recipe's `cleanup` (see the base recipe for the
-  # full multi-arch-safety and token rationale). Channels need no special handling: the
-  # protected-tag set comes from `bootcher info --format '{{ .Channels }}'`, which reports
+  # Identical to the base recipe's `cleanup`, running the same ci/ghcr_cleanup.py (see the
+  # base recipe for the full multi-arch-safety and token rationale). Channels need no
+  # special handling: the protected-tag set comes from `bootcher info`, which reports
   # every declared channel (`latest` + `stable`), so a live channel pointer is never pruned
   # by age. The CalVer tags it keeps N of are shared across channels, so one KEEP_PREVIOUS
   # covers both the latest and stable fleets.
@@ -446,109 +357,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Prune old image versions
-        shell: python3 {0} # stdlib only (urllib/json) — the bootcher image bundles python3
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # org-owned package refused? use a CLEANUP_TOKEN PAT
           DRY_RUN: "false" # "true" = log the plan without deleting (validate a first run)
-        run: |
-          # Identical to the base recipe's cleanup (see the base recipe).
-          # Channels need no special handling: `channels` comes from `bootcher info`, which
-          # reports every declared channel, so a live channel pointer is a protected tag.
-          import base64, json, os, re, subprocess, sys, urllib.error, urllib.request
-
-          keep = int(os.environ.get("KEEP_PREVIOUS", "5"))
-          dry_run = os.environ.get("DRY_RUN", "false") == "true"
-          token = os.environ["GH_TOKEN"]
-          owner = os.environ["GITHUB_REPOSITORY"].split("/")[0].lower()
-
-          def project_info():
-              argv = ["bootcher", "--manifest", "bootcher.ci.toml", "info", "--format", "json"]
-              return json.loads(subprocess.run(argv, capture_output=True, text=True, check=True).stdout)
-
-          info = project_info()
-          name, channels = info["name"], set(info["channels"])
-          print(f"cleanup: {owner}/{name} — keeping :latest + {keep} previous release(s) (dry-run={dry_run})")
-
-          def fetch(url, headers, method="GET"):
-              with urllib.request.urlopen(urllib.request.Request(url, headers=headers, method=method)) as r:
-                  body = r.read()
-              return json.loads(body) if body else None
-
-          api = "https://api.github.com"
-          gh_headers = {
-              "Authorization": f"Bearer {token}",
-              "Accept": "application/vnd.github+json",
-              "X-GitHub-Api-Version": "2022-11-28",
-          }
-          gh = lambda url, method="GET": fetch(url, gh_headers, method)
-
-          # The package-versions endpoint differs for a user vs an org owner — detect once.
-          kind = "orgs" if gh(f"{api}/users/{owner}")["type"] == "Organization" else "users"
-          base = f"{api}/{kind}/{owner}/packages/container/{name}"
-
-          versions, page = [], 1
-          while (batch := gh(f"{base}/versions?per_page=100&page={page}")):
-              versions += batch
-              page += 1
-          print(f"cleanup: {len(versions)} version(s) currently published")
-          if not versions:
-              print("cleanup: nothing to do")
-              sys.exit(0)
-
-          tags = lambda v: v["metadata"]["container"]["tags"]
-          # Protected = a channel pointer (latest + [deploy] channels) or a ci-<arch> scratch
-          # tag; those are mutable and never pruned by age.
-          protected = lambda v: any(t in channels or t.startswith("ci-") for t in tags(v))
-          # cosign signatures/attestations are their own versions, tagged
-          # `sha256-<subject hex>.sig|.att|.sbom`. They aren't releases (counting them would
-          # spend KEEP_PREVIOUS slots on signatures): each one follows its subject's fate.
-          attachment = re.compile(r"^sha256-([0-9a-f]{64})\.(sig|att|sbom)$")
-          def subject(v):
-              return next((f"sha256:{m[1]}" for t in tags(v) if (m := attachment.match(t))), None)
-
-          images = [v for v in versions if not subject(v)]
-          releases = sorted((v for v in images if tags(v) and not protected(v)),
-                            key=lambda v: v["created_at"], reverse=True)
-          keep_lists = {v["name"] for v in images if protected(v)} | {v["name"] for v in releases[:keep]}
-
-          # Extend the keep-set with the arch children the kept lists reference (registry
-          # pull token), so a multi-arch image we keep never loses a member.
-          basic = base64.b64encode(f"{owner}:{token}".encode()).decode()
-          reg = fetch(f"https://ghcr.io/token?service=ghcr.io&scope=repository:{owner}/{name}:pull",
-                      {"Authorization": f"Basic {basic}"})["token"]
-          accept = ",".join([
-              "application/vnd.oci.image.index.v1+json",
-              "application/vnd.docker.distribution.manifest.list.v2+json",
-              "application/vnd.oci.image.manifest.v1+json",
-              "application/vnd.docker.distribution.manifest.v2+json",
-          ])
-          children = set()
-          for digest in keep_lists:
-              manifest = fetch(f"https://ghcr.io/v2/{owner}/{name}/manifests/{digest}",
-                               {"Authorization": f"Bearer {reg}", "Accept": accept})
-              children |= {m["digest"] for m in manifest.get("manifests", [])}
-
-          keep_all = keep_lists | children
-          # Keep the signatures of every kept image, arch members included.
-          keep_all |= {v["name"] for v in versions if subject(v) in keep_all}
-          doomed = [v for v in versions if v["name"] not in keep_all]
-          # Guard: never proceed if that would leave nothing — a bug upstream shouldn't wipe
-          # the package.
-          if not keep_all or len(doomed) >= len(versions):
-              sys.exit(f"cleanup: refusing to delete all {len(versions)} version(s) (keep-set empty) — aborting")
-          print(f"cleanup: keeping {len(versions) - len(doomed)} version(s), deleting {len(doomed)}")
-
-          for v in doomed:
-              label = f"{v['name']} tags=[{','.join(tags(v))}]"
-              if dry_run:
-                  print(f"  would delete: {v['id']} {label}")
-                  continue
-              try:
-                  gh(f"{base}/versions/{v['id']}", method="DELETE")
-              except urllib.error.HTTPError as e:
-                  if e.code == 403:
-                      sys.exit("cleanup: GITHUB_TOKEN refused (403) — for an org-owned package set a "
-                               "CLEANUP_TOKEN PAT with delete:packages and use it as GH_TOKEN.")
-                  raise
-              print(f"  deleted: {v['id']} {label}")
-          print("cleanup: done")
+        run: python3 ci/ghcr_cleanup.py
