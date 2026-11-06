@@ -11,7 +11,7 @@ Each registry-mode push publishes the same manifest digest under two tags:
 
   When the project isn't in git, there's no commit to pin to, so the tag is the timestamp alone, `YYYYMMDD.HHMMSS`. Either way, two deploys would only share a tag if they minted it in the same second (of the same commit, with git), in which case the later push would repoint it; possible in theory, negligible in practice. UTC throughout keeps tags from different builder machines sorting and comparing unambiguously.
 
-  The version tag is pushed **first**, and the channel tag only moves once it has landed, so a build devices follow always has a durable tag. (Tags minted before bootcher added seconds read `YYYYMMDD.HHMM.g<short-sha>`, or `YYYYMMDD.HH.MM` without git. They stay valid, but a plain string sort can misorder a no-git one against newer tags from the same hour; order by push time when it matters.)
+  The version tag is pushed **first**, and the channel tag only moves once it has landed, so a build devices follow always has a durable tag.
 
 This is bootcher's whole versioning story: there's no `version` field to bump and no release ritual — the timestamp tag is generated on every push, and devices continuously track `:latest`. CalVer fits that continuous-rollout model, where nobody chooses a version to upgrade *to*.
 
