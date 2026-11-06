@@ -31,7 +31,8 @@ aarch64 on native runners** (no cross-arch emulation), in three stages:
   digests to keep (the kept releases, plus the `latest`/channel/`ci-<arch>` tags) and
   extending it with the arch children those kept lists reference, then deleting only
   what's outside it. A naive "keep N, delete the rest" would delete the members of the
-  release you're keeping and corrupt it. On **GitLab** this is a job you don't write:
+  release you're keeping and corrupt it. cosign signatures (also their own versions)
+  aren't counted as releases: each is kept exactly when the image it signs is. On **GitLab** this is a job you don't write:
   turn on the project's built-in **Container Registry cleanup policy** instead (see
   below).
 - **provision** — one job per arch (e.g. a qcow2 for x86_64, a raw for aarch64).
@@ -252,7 +253,10 @@ keep and leaves a `:latest` that won't pull. The job instead deletes by **digest
 computes the digests to keep (the kept releases, plus any version tagged with a channel —
 `latest` and your `[deploy] channels` — or a `ci-<arch>` scratch tag), extends that set
 with the child manifests those kept lists reference (read from the registry), and deletes
-only versions outside it. It refuses to run if that would delete everything.
+only versions outside it. With signing on, each cosign signature (`sha256-<digest>.sig`,
+again its own version) follows its image: it's kept exactly when the list or arch member
+it signs is kept, and never takes up a `KEEP_PREVIOUS` slot. It refuses to run if that
+would delete everything.
 
 - **Token** — it deletes with the built-in `GITHUB_TOKEN` (`packages: write`), which
   works for a package **linked to this repo**. If the package is org-owned and the token
