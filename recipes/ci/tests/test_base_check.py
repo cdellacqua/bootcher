@@ -1,5 +1,6 @@
 """Tests for `recipes/ci/scripts/base_check.py`."""
 
+import json
 import unittest
 
 from support import load_script, run_script
@@ -48,10 +49,12 @@ class Registry:
         ]}})
 
     def inspect(self, *args):
+        """Like `skopeo_inspect`: LookupError on failure, and `{"raw": ...}` replies go
+        through `json.loads`, so a malformed one raises ValueError as skopeo's would."""
         reply = self.table.get(" ".join(args), {"error": "manifest unknown"})
         if "error" in reply:
             raise LookupError(reply["error"])
-        return reply["json"]
+        return json.loads(reply["raw"]) if "raw" in reply else reply["json"]
 
     def check(self, channel="latest"):
         """Run `check()`: returns (BASE_CHANGED, written outputs, log lines)."""
@@ -73,11 +76,17 @@ class CheckTest(unittest.TestCase):
         self.assertIn("arm64", logged[-1])
         self.assertIn("moved", logged[-1])
 
-    def test_attestation_entries_are_not_checked(self):
-        # The "unknown" platform entry has no config/annotations in the fake: checking
-        # it would count as "can't check" and rebuild.
-        changed, _, _ = Registry().publish(attestation=True).base_now().check()
-        self.assertIs(changed, False)
+    def test_entries_without_a_real_platform_are_not_checked(self):
+        # Attestations ("unknown"), and entries whose platform lacks an architecture or
+        # that have none, have no config/annotations in the fake: checking one would
+        # count as "can't check" and rebuild.
+        registry = Registry().publish(attestation=False).base_now()
+        top = registry.table[f"--raw docker://{IMAGE}:latest"]["json"]["manifests"]
+        top += [{"digest": "sha256:att", "platform": {"architecture": "unknown"}},
+                {"digest": "sha256:noarch", "platform": {"os": "linux"}},
+                {"digest": "sha256:noplatform"}]
+        changed, _, logged = registry.check()
+        self.assertIs(changed, False, logged)
 
     def test_nothing_published_yet(self):
         self.assertIs(Registry().check("latest")[0], True)
@@ -94,6 +103,26 @@ class CheckTest(unittest.TestCase):
         changed, _, logged = registry.check()
         self.assertIs(changed, True)
         self.assertIn("can't check the base", logged[-1])
+
+    def test_unreadable_labels_mean_no_revision(self):
+        # The first member's config without its `config` key: no revision recorded,
+        # which is fine for `latest`, and the base check still runs.
+        registry = Registry().publish().base_now()
+        registry.set(f"--config docker://{IMAGE}@sha256:amd64",
+                     {"json": {"architecture": "amd64"}})
+        self.assertEqual(registry.check()[:2], (False, {}))
+        # A malformed config: no revision either, and that member can't be checked.
+        registry.set(f"--config docker://{IMAGE}@sha256:amd64", {"raw": "not json"})
+        changed, written, logged = registry.check()
+        self.assertEqual((changed, written), (True, {}))
+        self.assertIn("can't check the base", logged[-1])
+
+    def test_malformed_replies_rebuild(self):
+        for args in (f"--raw docker://{IMAGE}@sha256:arm64", f"--raw docker://{BASE}"):
+            registry = Registry().publish().base_now().set(args, {"raw": "{not json"})
+            changed, _, logged = registry.check()
+            self.assertIs(changed, True, args)
+            self.assertIn("can't check the base", logged[-1])
 
     def test_unreadable_base_rebuilds(self):
         changed, _, logged = Registry().publish().check()  # base tag not in the registry

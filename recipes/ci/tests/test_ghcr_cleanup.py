@@ -1,10 +1,16 @@
-"""Tests for the keep/delete decision of `recipes/ci/scripts/ghcr_cleanup.py`.
+"""Tests for `recipes/ci/scripts/ghcr_cleanup.py`: the keep/delete decision, and
+`main()` against a fake GitHub API and registry (no network).
 
-Stdlib `unittest` only; run with `python3 -m unittest discover recipes/ci/tests`
-(`cargo xtask test` does). Not part of what users copy into their repo.
+Stdlib `unittest` only; run with `python3 -B -m unittest discover -s recipes/ci/tests`
+(`cargo xtask test` does).
 """
 
+import io
+import json
+import os
 import unittest
+import urllib.error
+from unittest import mock
 
 from support import load_script
 
@@ -29,7 +35,7 @@ class Package:
         self.versions.append({
             "id": len(self.versions) + 1,
             "name": name,
-            "created_at": f"2026-01-01T00:00:{self._clock:02d}Z",
+            "created_at": f"2026-01-01T00:{self._clock // 60:02d}:{self._clock % 60:02d}Z",
             "metadata": {"container": {"tags": list(tags)}},
         })
         return name
@@ -137,6 +143,168 @@ class PlanTest(unittest.TestCase):
         pkg.release("old", ["2026.1.1"])
         with self.assertRaises(cleanup.Refused):
             pkg.plan(keep=0)
+
+
+API = "https://api.github.com"
+OCI_INDEX = "application/vnd.oci.image.index.v1+json"
+DOCKER_LIST = "application/vnd.docker.distribution.manifest.list.v2+json"
+
+
+class FakeGitHub:
+    """Answers `urlopen` like the GitHub packages API and GHCR would, and logs calls.
+
+    The versions endpoint pages like the real one (`per_page`/`page`), the package is
+    only served under the endpoint matching the owner's type, and each list is served
+    only if the Accept header admits its media type (lists alternate OCI index /
+    Docker manifest list), as GHCR answers an unacceptable type with an error.
+    """
+
+    def __init__(self, pkg, owner_type="User", delete_status=None):
+        self.pkg, self.owner_type, self.delete_status = pkg, owner_type, delete_status
+        kind = "orgs" if owner_type == "Organization" else "users"
+        self.base = f"{API}/{kind}/me/packages/container/img"
+        self.media = {lst: (OCI_INDEX, DOCKER_LIST)[i % 2]
+                      for i, lst in enumerate(pkg.children)}
+        self.deleted = []  # version ids, in order
+        self.errors = []  # raised HTTPErrors, closed by `MainTest.run_main`
+
+    def error(self, url, code):
+        self.errors.append(urllib.error.HTTPError(url, code, "fake", {}, None))
+        return self.errors[-1]
+
+    def urlopen(self, request):
+        url, method = request.full_url, request.get_method()
+        if method == "DELETE":
+            prefix = f"{self.base}/versions/"
+            if not url.startswith(prefix):
+                raise self.error(url, 404)
+            if self.delete_status:
+                raise self.error(url, self.delete_status)
+            self.deleted.append(int(url[len(prefix):]))
+            return self.reply(None)
+        if url == f"{API}/users/me":
+            return self.reply({"type": self.owner_type})
+        if url.startswith(f"{self.base}/versions?"):
+            query = dict(kv.split("=") for kv in url.split("?", 1)[1].split("&"))
+            per_page, page = int(query["per_page"]), int(query["page"])
+            return self.reply(self.pkg.versions[(page - 1) * per_page:page * per_page])
+        if url == "https://ghcr.io/token?service=ghcr.io&scope=repository:me/img:pull":
+            return self.reply({"token": "registry-token"})
+        prefix = "https://ghcr.io/v2/me/img/manifests/"
+        if url.startswith(prefix) and url[len(prefix):] in self.pkg.children:
+            digest = url[len(prefix):]
+            accepted = request.get_header("Accept", "").split(",")
+            if (request.get_header("Authorization") != "Bearer registry-token"
+                    or self.media[digest] not in accepted):
+                raise self.error(url, 404)
+            return self.reply({"mediaType": self.media[digest], "manifests": [
+                {"digest": m} for m in self.pkg.children[digest]]})
+        raise self.error(url, 404)
+
+    @staticmethod
+    def reply(body):
+        return io.BytesIO(b"" if body is None else json.dumps(body).encode())
+
+
+class MainTest(unittest.TestCase):
+    """`main()` end to end against `FakeGitHub`, with the caller's env shut out."""
+
+    def run_main(self, github, **env):
+        """Run `main()`; returns `(exit code, stdout)` (code None when it returns)."""
+        env = {"GH_TOKEN": "gh-token", "GITHUB_REPOSITORY": "Me/repo", **env}
+        info = {"name": "img", "channels": ["latest"]}
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(cleanup, "project_info", lambda: info), \
+                mock.patch("urllib.request.urlopen", github.urlopen), \
+                mock.patch("sys.stdout", out):
+            try:
+                cleanup.main()
+                code = None
+            except SystemExit as e:
+                code = e.code
+            finally:
+                for error in github.errors:
+                    error.close()
+        return code, out.getvalue()
+
+    def big_package(self):
+        """20 signed releases (120 versions, two API pages), `latest` the newest."""
+        pkg = Package()
+        old = [pkg.release(f"r{i:02d}", [f"2026.1.{i}"], signed=True) for i in range(19)]
+        pkg.release("r19", ["latest", "2026.1.19"], signed=True)
+        self.assertGreater(len(pkg.versions), 100)
+        return pkg, old
+
+    def ids(self, pkg, lists):
+        """The version ids of `lists` with their members and signatures."""
+        names = set().union(*(pkg.family(lst) for lst in lists))
+        return {v["id"] for v in pkg.versions if v["name"] in names}
+
+    def test_deletes_exactly_the_versions_outside_the_keep_set(self):
+        pkg, old = self.big_package()
+        github = FakeGitHub(pkg)
+        code, out = self.run_main(github)
+        self.assertIsNone(code, out)
+        # latest + the 5 newest previous releases stay whole, members and signatures.
+        self.assertEqual(set(github.deleted), self.ids(pkg, old[:-5]))
+        self.assertEqual(len(github.deleted), len(set(github.deleted)))
+        self.assertIn(f"cleanup: {len(pkg.versions)} version(s) currently published",
+                      out)
+        self.assertTrue(out.endswith("cleanup: done\n"), out)
+
+    def test_keep_previous(self):
+        pkg, old = self.big_package()
+        github = FakeGitHub(pkg)
+        self.assertIsNone(self.run_main(github, KEEP_PREVIOUS="2")[0])
+        self.assertEqual(set(github.deleted), self.ids(pkg, old[:-2]))
+
+    def test_org_owner_uses_the_orgs_endpoint(self):
+        pkg, old = self.big_package()
+        github = FakeGitHub(pkg, owner_type="Organization")
+        self.assertIsNone(self.run_main(github)[0])
+        self.assertEqual(set(github.deleted), self.ids(pkg, old[:-5]))
+
+    def test_dry_run_deletes_nothing(self):
+        pkg, old = self.big_package()
+        github = FakeGitHub(pkg)
+        code, out = self.run_main(github, DRY_RUN="true")
+        self.assertIsNone(code, out)
+        self.assertEqual(github.deleted, [])
+        would = {int(line.split()[2]) for line in out.splitlines()
+                 if line.startswith("  would delete: ")}
+        self.assertEqual(would, self.ids(pkg, old[:-5]))
+
+    def test_forbidden_delete_exits_with_the_token_hint(self):
+        pkg, _ = self.big_package()
+        github = FakeGitHub(pkg, delete_status=403)
+        code, _ = self.run_main(github)
+        self.assertIsInstance(code, str)
+        self.assertIn("refused (403)", code)
+        self.assertIn("CLEANUP_TOKEN", code)
+
+    def test_other_http_errors_propagate(self):
+        pkg, _ = self.big_package()
+        github = FakeGitHub(pkg, delete_status=500)
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self.run_main(github)
+        self.assertEqual(caught.exception.code, 500)
+
+    def test_empty_package_is_nothing_to_do(self):
+        github = FakeGitHub(Package())
+        code, out = self.run_main(github)
+        self.assertEqual(code, 0)
+        self.assertIn("cleanup: nothing to do", out)
+        self.assertEqual(github.deleted, [])
+
+    def test_refuses_without_deleting(self):
+        pkg = Package()
+        pkg.release("old", ["2026.1.1"], signed=True)  # no `latest`, nothing protected
+        github = FakeGitHub(pkg)
+        code, _ = self.run_main(github, KEEP_PREVIOUS="0")
+        self.assertIsInstance(code, str)
+        self.assertIn("refusing to delete all", code)
+        self.assertEqual(github.deleted, [])
 
 
 if __name__ == "__main__":
