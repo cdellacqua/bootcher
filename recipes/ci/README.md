@@ -295,9 +295,8 @@ everything.
 
 **GitLab** — don't write a job for this; use the project's built-in **Container Registry
 cleanup policy** (*Settings → Packages and registries → Clean up image tags*). Keep the N
-most recent tags, match the immutable `CalVer` tags for removal (`[0-9]{8}\..*` covers both
-the current `YYYYMMDD.HHMMSS…` shape and the older minute-resolution one), and add `latest`,
-your channel names, and `ci-.*` to *Keep tags matching* so the mutable pointers and scratch
+most recent tags, match the immutable `CalVer` tags for removal, and add `latest`, your
+channel names, and `ci-.*` to *Keep tags matching* so the mutable pointers and scratch
 members are never swept. GitLab's own registry garbage collection then reclaims the
 unreferenced layers safely — it won't drop a manifest a kept tag still points at.
 
