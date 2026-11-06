@@ -7,14 +7,15 @@
 # build (per-arch, native runners) → deploy (assemble + push) → provision (per-arch
 # disks), the loopback container store in `before_script`, and the `.image-rules` path
 # gate — so this header only covers what's DIFFERENT: which channel each trigger
-# publishes to. For the store relocation, the per-arch split rationale, and the CI/CD
+# publishes to, and the `promote` job a `v*` tag runs instead of a build. For the store
+# relocation, the per-arch split rationale, and the CI/CD
 # variables, read the base recipe and the recipe docs; nothing there changes. Like the
 # base recipe, it runs the shared scripts
 # (https://github.com/cdellacqua/bootcher/tree/main/recipes/ci/scripts), which you copy to
 # `ci/` at your repo root.
 #
 #   push to default branch      → deploy to the default `latest` channel (rolling / canary)
-#   push a v* tag               → deploy to the `stable` channel         (production fleet)
+#   push a v* tag               → promote that commit's build to `stable` (production fleet)
 #   schedule                    → refresh `latest`                       (base updates)
 #   schedule, SCHEDULE_CHANNEL=<c> → refresh channel <c>                  (base updates)
 #   manual run on branch/a tag  → rebuild it into `latest` / `stable`, unconditionally
@@ -34,14 +35,13 @@
 # THE PROMOTION MODEL this encodes:
 #   - Every push to the default branch publishes :latest. Devices provisioned on the
 #     default channel (dev boxes / QA rigs) auto-update to it on their timer — the canary.
-#   - When a commit has proven good, tag it `vX.Y.Z`. The tag pipeline rebuilds THAT
-#     commit and publishes it to :stable; production devices (provisioned with `--channel
-#     stable`) only now auto-update. The tag is on the same source commit, so stable is
-#     that validated revision and `git describe` stamps `vX.Y.Z` as its version label.
-#     (bootcher rebuilds on the tag rather than re-tagging the default branch's exact
-#     digest — same source, fresh CalVer; the immutable CalVer tag is the per-build
-#     identity either way. Need bit-identical promotion? Pull the branch's CalVer image
-#     and `podman manifest push` it to :stable by hand instead of tagging.)
+#   - When a commit has proven good, tag it `vX.Y.Z`. The tag pipeline does NOT rebuild:
+#     `ci/find_version.py` finds the newest build of THAT commit (the one that canaried
+#     on :latest) by its CalVer tag, and `bootcher promote` points :stable at that exact
+#     digest. Production devices (provisioned with `--channel stable`) only now
+#     auto-update, to the very image the canary fleet ran; its signature, if you sign,
+#     covers :stable unchanged. A tag on a commit that was never deployed to :latest
+#     fails the pipeline ("deploy it to `latest` first") instead of rebuilding.
 #
 # bootcher.toml must DECLARE the channel so `--channel stable` validates — a typo'd
 # channel is rejected, not silently minted as a stray tag:
@@ -95,11 +95,13 @@ default:
 stages: [build, deploy, provision]
 
 # --- when to run: only when something that affects the image changed --------------
-# Identical to the base recipe: an allowlist of image inputs on the default-branch
-# rule, and a tag rule with no `changes:` (a `v*` tag always builds). Tune the list to
-# your project.
+# Like the base recipe: an allowlist of image inputs on the default-branch rule (tune
+# it to your project), except that a pushed tag never builds — it promotes (see
+# `promote`). A tag pipeline you run by hand still rebuilds, unconditionally.
 .image-rules:
   rules:
+    - if: $CI_COMMIT_TAG && $CI_PIPELINE_SOURCE == "push"
+      when: never
     - if: $CI_COMMIT_TAG
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       changes:
@@ -263,6 +265,23 @@ deploy:
         echo "deploying to default channel: latest"
         bootcher --manifest bootcher.ci.toml deploy --skip-build --skip-bootc-upgrade
       fi
+
+# --- promote: a pushed `v*` tag moves :stable onto the commit's existing build -----
+# No build: ci/find_version.py finds the newest build of the tagged commit by its CalVer
+# tag (ranked by push time, from the registry API with the job token), and `bootcher
+# promote` points :stable at that exact digest. No build of the commit published → the
+# job fails, saying to deploy it to :latest first. With signing configured, promote
+# verifies the build's signature first (a verifying pull, hence the container store in
+# `before_script`) and needs only the committed public key, no passphrase.
+promote:
+  stage: deploy
+  needs: []
+  rules:
+    - if: $CI_COMMIT_TAG && $CI_PIPELINE_SOURCE == "push"
+  script:
+    - echo "$CI_REGISTRY_PASSWORD" | podman login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
+    - VERSION="$(COMMIT="$CI_COMMIT_SHA" python3 ci/find_version.py)"
+    - bootcher --manifest bootcher.ci.toml promote "$VERSION" --channel stable
 
 # --- provision: build a flashable disk that TRACKS this pipeline's channel --------
 # Same as the base recipe, but it's playable on tag pipelines too, and it bakes the

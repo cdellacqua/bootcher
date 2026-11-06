@@ -9,10 +9,10 @@ publishes to:
 | Trigger | Channel | Audience |
 |---|---|---|
 | push to the default branch (`main`) | `latest` (bootcher's default — no flag) | rolling / **canary** fleet |
-| push a `v*` git tag | `stable` (`bootcher deploy --channel stable`) | **production** fleet |
+| push a `v*` git tag | `stable` (`bootcher promote <version> --channel stable`, no rebuild) | **production** fleet |
 | Saturday schedule (if the base moved) | `latest` | base-image updates for canary |
 | Tuesday schedule (if the base moved) | `stable` | base-image updates for production, no new release |
-| manual run on the default branch / a `v*` tag | `latest` / `stable` | an unconditional rebuild |
+| manual run on the default branch / a `v*` tag | `latest` / `stable` | an unconditional rebuild (a tag's too) |
 
 Each channel gets its own weekly base-image refresh, staggered so the canary fleet runs a
 new Fedora base for a few days before production does. A refresh rebuilds **the exact
@@ -50,16 +50,35 @@ override, why deploy uses `--skip-bootc-upgrade`).
 
 1. **Merge to `main`** → CI publishes `:latest`. Devices you provisioned on the default
    channel (dev boxes, QA rigs) auto-update on their timer. This is your canary.
-2. **Tag a proven commit `vX.Y.Z`** → the tag pipeline rebuilds that commit and publishes
-   it to `:stable`. Production devices (provisioned with `--channel stable`) auto-update
-   only now.
+2. **Tag a proven commit `vX.Y.Z`** → the tag pipeline **promotes** the build of that
+   commit that canaried on `:latest` to `:stable`, without rebuilding. Production devices
+   (provisioned with `--channel stable`) auto-update only now, to the exact image the
+   canary fleet ran.
 
-Because the tag is on the same source commit that rode `latest`, the stable image is that
-validated revision, and `git describe` stamps `vX.Y.Z` as its version label. bootcher
-**rebuilds on the tag** rather than re-tagging `main`'s exact digest — same source, fresh
-`CalVer`; the immutable `CalVer` tag is the per-build identity either way. If you need
-bit-identical promotion (no rebuild), pull `main`'s `CalVer` image and `podman manifest
-push` it to `:stable` by hand instead of tagging.
+The tag pipeline runs two steps:
+
+1. [`ci/find_version.py`](../scripts/find_version.py) finds that build: the most recently
+   pushed version tag whose `g<short-sha>` is the tagged commit. It ranks by push time,
+   read from the platform's package API (GitHub's package versions, GitLab's container
+   registry API with the job token), not by the tag text. A later base-image refresh of
+   `latest` for the same commit is a newer build of it and wins.
+2. [`bootcher promote <version> --channel stable`](../../../docs/src/reference/commands.md#bootcher-promote-version---channel-channel---tls-verify-bool)
+   points `:stable` at that build's exact digest. With signing, it first verifies the
+   build's signature, and the signature made when it was deployed to `latest` covers
+   `:stable` too, since both tags name the same digest.
+
+If no build of the tagged commit was published (it never reached `latest`, or cleanup
+has pruned it), the run **fails** with "deploy it to `latest` first" rather than
+rebuilding: push the commit to the default branch, let it canary, then tag it. Run the
+tag's pipeline by hand if you do want a fresh build on `:stable`; that path still
+rebuilds.
+
+To roll `:stable` back, or promote a build by hand, run `bootcher promote` from your
+machine with any earlier version tag:
+
+```bash
+bootcher promote 20261106.142233.g0a1b2c3d4e5 --channel stable
+```
 
 ## Setup
 
@@ -92,7 +111,9 @@ builder networking; `channels` is inherited from `bootcher.toml` via `extend`).
 Like the base recipe, the deploy pipelines run the shared Python scripts from `ci/`, so
 copy the base recipe's [`scripts/`](../scripts/) directory into your repo as `ci/`
 alongside the workflow file(s). They're the same scripts: the channel a refresh checks
-comes in through the `CHANNEL` environment variable the workflow sets.
+comes in through the `CHANNEL` environment variable the workflow sets, and the
+`promote` job runs [`find_version.py`](../scripts/find_version.py), which only this
+variant uses.
 
 ## Enrolling a device onto a channel
 
