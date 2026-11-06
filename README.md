@@ -272,7 +272,8 @@ See [DEVELOPMENT.md](DEVELOPMENT.md) for build prerequisites and common workflow
 - [`crates/bootcher-cli/`](crates/bootcher-cli/) — the `bootcher` binary.
 
 `cargo xtask ci` runs the full check set (`cargo fmt --check`, `cargo clippy -D
-warnings`, `cargo test`). The CLI integration tests
+warnings`, `cargo test`, and the CI recipe scripts' stdlib `unittest` suite, so it needs
+`python3`). The CLI integration tests
 ([`crates/bootcher-cli/tests/integration.rs`](crates/bootcher-cli/tests/integration.rs))
 scaffold throwaway projects with `bootcher init` and assert the project plumbing
 (no podman needed). `cargo xtask run <args>` runs a dev build of the binary;

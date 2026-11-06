@@ -87,6 +87,12 @@ builder networking; `channels` is inherited from `bootcher.toml` via `extend`).
 | GitHub Actions (provision) | [`github-actions/provision.yml`](github-actions/provision.yml) | `.github/workflows/bootcher-provision.yml` |
 | GitLab CI | [`gitlab-ci.yml`](gitlab-ci.yml) | `.gitlab-ci.yml` (repo root) |
 | Both | [`../bootcher.ci.toml`](../bootcher.ci.toml) | `bootcher.ci.toml` (repo root, beside `bootcher.toml`) |
+| Both | [`../scripts/`](../scripts/) | `ci/` (repo root) |
+
+Like the base recipe, the deploy pipelines run the shared Python scripts from `ci/`, so
+copy the base recipe's [`scripts/`](../scripts/) directory into your repo as `ci/`
+alongside the workflow file(s). They're the same scripts: the channel a refresh checks
+comes in through the `CHANNEL` environment variable the workflow sets.
 
 ## Enrolling a device onto a channel
 

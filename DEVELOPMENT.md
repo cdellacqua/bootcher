@@ -26,7 +26,9 @@ There isn't one to install. The development workflows live in
 [`crates/xtask/`](crates/xtask/), a dev-only workspace member reached through the
 `cargo xtask` alias in [.cargo/config.toml](.cargo/config.toml) — so `cargo xtask
 ci`, `cargo xtask run`, `cargo xtask test`, … work with nothing beyond the
-toolchain. `cargo xtask --help` lists every task.
+toolchain, plus `python3` (stdlib only, no packages) for `test` and `ci`: they also run
+the unit tests of the CI recipe scripts ([`recipes/ci/tests/`](recipes/ci/tests/)).
+`cargo xtask --help` lists every task.
 
 ### mdbook
 
@@ -68,7 +70,7 @@ and fails up front naming any that are missing (see
 
 ```sh
 cargo xtask run <args>   # run a dev build of the binary (in the current directory)
-cargo xtask test         # cargo test
+cargo xtask test         # cargo test + the CI recipe script tests (python3 unittest)
 cargo xtask ci           # fmt check + clippy + doc + test (what CI runs) + warn-only cargo audit
 cargo xtask fix          # auto-fix fmt and clippy warnings
 cargo xtask install      # cargo install --path crates/bootcher-cli

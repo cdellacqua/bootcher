@@ -9,3 +9,5 @@
 
 /target/
 TODO.md
+# Python bytecode from running the CI recipe scripts/tests
+__pycache__/
