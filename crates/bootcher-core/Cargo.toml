@@ -13,7 +13,7 @@ publish.workspace = true
 [dependencies]
 anyhow = "1.0.102"
 base64 = "0.22.1"
-# CalVer registry tags (`YYYYMMDD.HH.MM`, UTC): `Timestamp::now().strftime` formats
+# CalVer registry tags (`YYYYMMDD.HHMMSS`, UTC): `Timestamp::now().strftime` formats
 # the current instant in UTC — no timezone DB needed for a UTC-only wall clock.
 jiff = "0.2"
 # Image-signing enroll: produce the cosign/sigstore "ENCRYPTED SIGSTORE PRIVATE

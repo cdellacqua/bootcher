@@ -134,11 +134,10 @@ pub(crate) fn run(
 }
 
 /// Registry backend: assemble the per-arch members into one multi-arch manifest
-/// list, push it to the configured registry (under the run's mutable channel tag
-/// — `:latest` by default — and an immutable `CalVer` tag —
-/// `:YYYYMMDD.HHMM.g<short-sha>`, or `:YYYYMMDD.HH.MM` with no git — for the same
-/// digest), then point each listed device's
-/// bootc origin at the (suffix-free) registry ref and upgrade it now. With no
+/// list, push it to the configured registry (under an immutable `CalVer` tag —
+/// `:YYYYMMDD.HHMMSS.g<short-sha>`, or `:YYYYMMDD.HHMMSS` with no git — then the
+/// run's mutable channel tag — `:latest` by default — for the same digest), then
+/// point each listed device's bootc origin at the (suffix-free) registry ref and upgrade it now. With no
 /// remotes the push is the whole job — every target's auto-update timer fetches
 /// the new revision (and resolves its own arch out of the list) on its own. The
 /// first switch is idempotent against a registry-mode provision (origin already
@@ -174,11 +173,16 @@ fn run_registry(
 }
 
 /// Assemble the per-arch members into one multi-arch manifest list and push it to
-/// the registry under both the mutable `channel_ref` (`:<channel>`, `:latest` by
-/// default) tag and the immutable `version_ref` (`CalVer`, see `calver_now`) tag —
-/// the same digest under both. Returns whether signature enforcement is in effect
+/// the registry under both the immutable `version_ref` (`CalVer`, see `calver_now`)
+/// tag and the mutable `channel_ref` (`:<channel>`, `:latest` by default) tag — the
+/// same digest under both. Returns whether signature enforcement is in effect
 /// (`true` iff `signing` is configured), so the caller records a verifying origin on
 /// each device.
+///
+/// The version tag goes first and the channel only moves once it has landed, so a
+/// build devices follow always carries a durable tag: were the channel moved first
+/// and the version push then failed, the next deploy would leave that build
+/// untagged — out of rollback history and fair game for registry cleanup.
 ///
 /// Shared by `upgrade`/`deploy` (which then switch + reboot each device) and
 /// [`crate::jobs::takeover`] (where each host pulls the pushed ref directly): both
@@ -186,8 +190,8 @@ fn run_registry(
 ///
 /// # Errors
 ///
-/// Returns an error if assembling the list or either push fails (e.g. this host
-/// isn't logged in to the registry).
+/// Returns an error if either push fails (e.g. this host isn't logged in to the
+/// registry), or if the two pushes produce different digests.
 pub(crate) fn push_multiarch_list(
 	local_list_ref: &str,
 	channel_ref: &str,
@@ -203,53 +207,78 @@ pub(crate) fn push_multiarch_list(
 	job.step("push image");
 	// The list object was assembled by the build phase; `local_list_ref` just names it.
 
-	// `--all` ships every member manifest + blobs the list references, not just the
-	// host-arch one, so the registry ends up with the full multi-arch image. With
-	// signing configured we splice in `--sign-by-sigstore-private-key` (so the push also
-	// writes a cosign signature attachment — having ensured this host is configured
-	// to store one), and the caller records a signature-enforcing origin so every
-	// later upgrade verifies the signature against the injected policy.
-	let mut push_argv: Vec<OsString> =
-		["podman", "manifest", "push", "--all"].iter().map(|&s| OsString::from(s)).collect();
-	let passguard = match signing {
+	// With signing configured, the version push carries
+	// `--sign-by-sigstore-private-key` (having ensured this host is configured to
+	// store the cosign signature attachment), and the caller records a
+	// signature-enforcing origin so every later upgrade verifies the signature
+	// against the injected policy. One signature is enough: sigstore attachments are
+	// keyed by manifest *digest*, and both tags name the same digest, so bootc
+	// verifies it whichever tag the device resolved it through.
+	let sign = match signing {
 		Some(cfg) => {
 			let ns = crate::jobs::signing::registry_namespace(channel_ref);
 			crate::jobs::signing::ensure_push_attachments(ns, job)?;
-			let passguard = crate::jobs::signing::sign_args(cfg)?;
-			push_argv.extend(passguard.flags().iter().cloned());
-			Some(passguard)
+			Some(crate::jobs::signing::sign_args(cfg)?)
 		}
 		None => None,
 	};
-	push_argv.push(OsString::from(local_list_ref));
-	push_argv.push(OsString::from(channel_ref));
-	run_argv_labeled(job, &push_argv, "podman manifest push").with_context(|| {
-		let host = channel_ref.split('/').next().unwrap_or(channel_ref);
-		format!(
-			"`podman manifest push` to {channel_ref} failed — is this machine logged in? (`podman login {host}`)"
-		)
-	})?;
-	// The push is done; the temp passphrase file (held by `passguard`) can go now.
-	let enforce_sig = passguard.is_some();
-	drop(passguard);
+	let enforce_sig = sign.is_some();
 
-	// Also publish an immutable CalVer tag pointing at the same manifest. `:latest`
-	// is the mutable channel devices track; this version tag is a durable,
-	// human-readable anchor for rollback/audit (an untagged digest can be GC'd).
-	// Same digest ⇒ only a manifest PUT, no layer re-upload. No sign flags: cosign
-	// sigstore attachments are keyed by manifest *digest*, so the `:latest` push's
-	// attachment already covers the identical digest this tag points at — bootc
-	// verifies by digest regardless of the tag the device resolved it through.
-	let version_argv: Vec<OsString> =
-		["podman", "manifest", "push", "--all", local_list_ref, version_ref]
-			.iter()
-			.map(OsString::from)
-			.collect();
-	run_argv_labeled(job, &version_argv, "podman manifest push").with_context(|| {
-		format!("`podman manifest push` of the version tag to {version_ref} failed")
-	})?;
+	let version_digest = push_list(job, local_list_ref, version_ref, sign)?;
+	// Same content ⇒ only a manifest PUT, no layer re-upload.
+	let channel_digest = push_list(job, local_list_ref, channel_ref, None)?;
+
+	// Both pushes serialize the same local list, so they must produce the same
+	// digest — that is what lets the one signature cover the channel too. Check it
+	// rather than assume it.
+	if version_digest != channel_digest {
+		bail!(
+			"pushing the same build produced different digests: {version_ref} is \
+			 {version_digest} but {channel_ref} is {channel_digest}{}",
+			if enforce_sig {
+				" — only the version tag's digest is signed, so devices enforcing signatures \
+				 will reject the channel"
+			} else {
+				""
+			}
+		);
+	}
 
 	Ok(enforce_sig)
+}
+
+/// `podman manifest push --all` the local list `local_list_ref` to `dest`, returning
+/// the pushed list's digest. `--all` ships every member manifest + blobs the list
+/// references, not just the host-arch one, so the registry ends up with the full
+/// multi-arch image. `sign` splices in the signing flags; the temp passphrase file it
+/// holds is removed when it drops, right after this push.
+fn push_list(
+	job: &Scope,
+	local_list_ref: &str,
+	dest: &str,
+	sign: Option<crate::jobs::signing::SignArgs>,
+) -> Result<String> {
+	let digest_dir = tempfile::tempdir().context("creating a temp dir for the pushed digest")?;
+	let digest_file = digest_dir.path().join("digest");
+	let mut argv: Vec<OsString> =
+		["podman", "manifest", "push", "--all"].iter().map(OsString::from).collect();
+	argv.push(OsString::from("--digestfile"));
+	argv.push(digest_file.clone().into_os_string());
+	if let Some(sign) = &sign {
+		argv.extend(sign.flags().iter().cloned());
+	}
+	argv.push(OsString::from(local_list_ref));
+	argv.push(OsString::from(dest));
+	run_argv_labeled(job, &argv, "podman manifest push").with_context(|| {
+		let host = dest.split('/').next().unwrap_or(dest);
+		format!(
+			"`podman manifest push` to {dest} failed — is this machine logged in? (`podman login {host}`)"
+		)
+	})?;
+	drop(sign);
+	let digest = std::fs::read_to_string(&digest_file)
+		.with_context(|| format!("reading the digest `podman manifest push` wrote for {dest}"))?;
+	Ok(digest.trim().to_owned())
 }
 
 /// Switch one device's bootc origin to `channel_ref` and reboot it into the upgrade.

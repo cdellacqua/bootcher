@@ -14,7 +14,7 @@ bootcher deploy
 2. Collect the freshly-built per-arch images into a local multi-arch manifest list (`localhost/<name>:latest`).
 3. **Push + upgrade** — push the update and trigger `bootc upgrade` on each device. The push backend depends on the manifest:
    - **LAN mode** — serve the image from a loopback registry and forward it over SSH; see [LAN backend](../concepts/deploy-backends.md).
-   - **Registry mode** — `podman push` to `<registry>/<name>:latest`, *and* to an immutable `<registry>/<name>:<version>` tag for the same digest (see [Image identity & provenance](../concepts/image-identity.md)); SSH into each `[deploy] remotes` device and run `bootc upgrade`.
+   - **Registry mode** — `podman push` to an immutable `<registry>/<name>:<version>` tag, *then* to `<registry>/<name>:latest` for the same digest (see [Image identity & provenance](../concepts/image-identity.md)); SSH into each `[deploy] remotes` device and run `bootc upgrade`.
 
 Each device then reboots into the staged deployment, and `deploy` checks with `bootc status` that it booted it: a device that came back on its old deployment fails the deploy. A device already booted into the image has nothing staged and isn't rebooted. In LAN mode a device that already stores the image skips the transfer.
 

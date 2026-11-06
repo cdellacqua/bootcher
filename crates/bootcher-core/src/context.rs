@@ -1462,22 +1462,21 @@ impl DiskTarget {
 }
 
 /// The current UTC instant as a `CalVer` tag. With a git `short_sha` it reads
-/// `YYYYMMDD.HHMM.g<short-sha>` (e.g. `20260113.1233.g0a1b2c3d4e5f`); without one
-/// (no git) it falls back to `YYYYMMDD.HH.MM` (e.g. `20260113.12.33`).
+/// `YYYYMMDD.HHMMSS.g<short-sha>` (e.g. `20260113.123304.g0a1b2c3d4e5f`); without one
+/// (no git) it falls back to `YYYYMMDD.HHMMSS` (e.g. `20260113.123304`).
 ///
 /// The commit suffix is what makes the tag a *stable identity* rather than a mere
-/// clock reading: it pins the exact source the image was built from, so the tag
-/// can't silently mean two different trees built in the same minute. Without git
-/// the timestamp is all we have, so minute resolution is the collision floor: two
-/// separate deploys within the same minute reuse the tag, and the later one
-/// silently re-points it at its own (freshly built, distinct) digest.
+/// clock reading: it pins the exact source the image was built from. Second
+/// resolution is the collision floor: two deploys minting a tag within the same
+/// second (of the same commit, or of anything without git) would share it, and the
+/// later push would repoint it. Possible in theory, negligible in practice.
 /// UTC throughout so tags from different machines sort and compare unambiguously.
 #[must_use]
 pub fn calver_now(short_sha: Option<&str>) -> String {
 	let now = jiff::Timestamp::now();
 	match short_sha {
-		Some(sha) => format!("{}.g{sha}", now.strftime("%Y%m%d.%H%M")),
-		None => now.strftime("%Y%m%d.%H.%M").to_string(),
+		Some(sha) => format!("{}.g{sha}", now.strftime("%Y%m%d.%H%M%S")),
+		None => now.strftime("%Y%m%d.%H%M%S").to_string(),
 	}
 }
 
@@ -1935,8 +1934,8 @@ mod tests {
 			Some("reg.example.com/org/kiosk:stable")
 		);
 		assert_eq!(
-			m.registry_version_ref("20260113.12.33").as_deref(),
-			Some("reg.example.com/org/kiosk:20260113.12.33")
+			m.registry_version_ref("20260113.123304").as_deref(),
+			Some("reg.example.com/org/kiosk:20260113.123304")
 		);
 	}
 
@@ -1944,7 +1943,7 @@ mod tests {
 	fn registry_version_ref_is_none_without_registry() {
 		let m = parse("[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n");
 		assert!(m.registry_list_ref(DEFAULT_CHANNEL).is_none());
-		assert!(m.registry_version_ref("20260113.12.33").is_none());
+		assert!(m.registry_version_ref("20260113.123304").is_none());
 	}
 
 	#[test]
@@ -1971,25 +1970,23 @@ mod tests {
 
 	#[test]
 	fn calver_now_without_git_is_timestamp_only() {
-		// `YYYYMMDD.HH.MM`: 8 digits, dot, 2 digits, dot, 2 digits — all numeric.
+		// `YYYYMMDD.HHMMSS`: 8 digits, dot, 6 digits — all numeric.
 		let v = calver_now(None);
 		let (date, time) = v.split_once('.').expect("a dot after the date");
-		let (hh, mm) = time.split_once('.').expect("a dot between hour and minute");
 		assert_eq!(date.len(), 8, "date is YYYYMMDD: {v}");
-		assert_eq!(hh.len(), 2, "hour is HH: {v}");
-		assert_eq!(mm.len(), 2, "minute is MM: {v}");
-		assert!(v.chars().all(|c| c.is_ascii_digit() || c == '.'), "digits and dots only: {v}");
+		assert_eq!(time.len(), 6, "time is HHMMSS: {v}");
+		assert!(date.chars().chain(time.chars()).all(|c| c.is_ascii_digit()), "numeric: {v}");
 	}
 
 	#[test]
 	fn calver_now_with_git_appends_commit_suffix() {
-		// `YYYYMMDD.HHMM.g<short-sha>`: minute folded into one field, commit suffixed.
+		// `YYYYMMDD.HHMMSS.g<short-sha>`: time to the second in one field, commit suffixed.
 		let v = calver_now(Some("0a1b2c3d4e5f"));
 		let (date, rest) = v.split_once('.').expect("a dot after the date");
-		let (hhmm, sha) = rest.split_once('.').expect("a dot before the commit suffix");
+		let (hhmmss, sha) = rest.split_once('.').expect("a dot before the commit suffix");
 		assert_eq!(date.len(), 8, "date is YYYYMMDD: {v}");
-		assert_eq!(hhmm.len(), 4, "time is HHMM: {v}");
-		assert!(hhmm.chars().all(|c| c.is_ascii_digit()), "time is numeric: {v}");
+		assert_eq!(hhmmss.len(), 6, "time is HHMMSS: {v}");
+		assert!(hhmmss.chars().all(|c| c.is_ascii_digit()), "time is numeric: {v}");
 		assert_eq!(sha, "g0a1b2c3d4e5f", "commit suffix is g-prefixed: {v}");
 	}
 
