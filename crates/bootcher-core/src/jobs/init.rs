@@ -14,6 +14,12 @@
 //! "must be empty" guards, landing the scaffold in place and overwriting any
 //! files it collides with.
 //!
+//! Base release: the scaffold's `Containerfile` pins `fedora-bootc` to one Fedora
+//! release (`ARG FEDORA_VERSION=<N>`) rather than `:latest`. `init` sets it to the
+//! current stable release, read from `fedora-bootc:latest` on the registry; offline,
+//! it keeps the release this bootcher version was published with. `--fedora-release`
+//! picks it explicitly (and skips the lookup).
+//!
 //! Interaction: `-y`/`--yes` is non-interactive (host platform, LAN deploys,
 //! all-`local` builders); a TTY without `-y` runs a short questionnaire
 //! (platform, registry, signing, deploy targets, build/image builders per arch);
@@ -161,10 +167,61 @@ const CHANNELS_EXAMPLE: &str = "\
 ///
 /// Returns an error if the target directory can't be created, a prompt fails, or
 /// any file can't be written.
-pub fn run(name: Option<String>, yes: bool, force: bool) -> Result<()> {
+pub fn run(
+	name: Option<String>,
+	yes: bool,
+	force: bool,
+	fedora_release: Option<u32>,
+) -> Result<()> {
 	let target = Target::resolve(name, force)?;
 	let settings = collect(yes)?;
-	target.write(&settings)
+	let release = fedora_release.map_or_else(resolve_release, Ok)?;
+	target.write(&settings, release)
+}
+
+/// The scaffold's `Containerfile`, whose `ARG FEDORA_VERSION=<N>` line `init` rewrites.
+const SCAFFOLD_CONTAINERFILE: &str = "Containerfile";
+
+/// The Fedora release a new project pins: the current stable one, or — when the
+/// registry can't be reached — the release the embedded scaffold carries (the
+/// stable release when this bootcher version was published), with a warning.
+fn resolve_release() -> Result<u32> {
+	let fallback = crate::fedora::scaffold_release()?;
+	Ok(match crate::fedora::current_release() {
+		Ok(release) => release,
+		Err(e) => {
+			eprintln!(
+				"warning: couldn't look up the current Fedora release ({e:#}); pinning Fedora \
+				 {fallback}, the release this bootcher version shipped with. Check it against \
+				 the current Fedora release, or pass `--fedora-release <N>`."
+			);
+			fallback
+		}
+	})
+}
+
+/// Rewrite the scaffolded `Containerfile`'s `ARG FEDORA_VERSION=<N>` line to pin
+/// `release`.
+fn pin_release(dest: &Path, release: u32) -> Result<()> {
+	let path = dest.join(SCAFFOLD_CONTAINERFILE);
+	let text = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+	let prefix = format!("ARG {}=", crate::fedora::RELEASE_ARG);
+	let mut found = false;
+	let rewritten: String = text
+		.lines()
+		.map(|line| {
+			if !found && line.starts_with(&prefix) {
+				found = true;
+				format!("{prefix}{release}\n")
+			} else {
+				format!("{line}\n")
+			}
+		})
+		.collect();
+	if !found {
+		bail!("the scaffold Containerfile has no `{prefix}` line to pin");
+	}
+	fs::write(&path, rewritten).with_context(|| format!("writing {}", path.display()))
 }
 
 /// The manifest settings gathered per interaction mode, beyond the project name
@@ -239,12 +296,13 @@ impl Target {
 
 	/// Create the dir + any missing parents (unless in place), extract the
 	/// scaffold, and write the manifest.
-	fn write(&self, settings: &Settings) -> Result<()> {
+	fn write(&self, settings: &Settings, release: u32) -> Result<()> {
 		if !self.in_place {
 			fs::create_dir_all(&self.dest)
 				.with_context(|| format!("creating {}", self.dest.display()))?;
 		}
 		extract(&SCAFFOLD, &self.dest)?;
+		pin_release(&self.dest, release)?;
 
 		// Render the manifest by serialising the real `Manifest` struct (rather than
 		// hand-building TOML) so the file stays in lockstep with the schema and lists
@@ -341,7 +399,7 @@ impl Target {
 			""
 		};
 		eprintln!(
-			"init: scaffolded {where_} as '{}'\n\nNext:\n{cd}{sign}  \
+			"init: scaffolded {where_} as '{}' (Fedora {release})\n\nNext:\n{cd}{sign}  \
 			 # edit Containerfile / bootcher.toml ([targets] sets target arches + formats), then:\n  \
 			 bootcher provision   # build the disk image (prompts for your admin SSH key)\n  \
 			 # the artifacts land under output/<arch>/ (the image grows its root FS on first boot)",

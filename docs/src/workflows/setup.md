@@ -14,7 +14,7 @@ cd my-os
 | Path | Purpose |
 |---|---|
 | `bootcher.toml` | The project manifest |
-| `Containerfile` | `FROM quay.io/fedora/fedora-bootc:latest` plus a security baseline |
+| `Containerfile` | `FROM quay.io/fedora/fedora-bootc:<N>` (the current Fedora release) plus a security baseline |
 | `sysroot/` | Overlay `COPY`ed into the image; contains sshd drop-ins, sudoers, firewalld, fail2ban, and the admin userdb records |
 | `.gitignore` | Keeps build artifacts and secrets out of git |
 | `.containerignore` | Excludes some files and directories from the `podman build` context |
@@ -24,6 +24,21 @@ The interactive setup asks for target architecture(s), image format, registry, i
 If signing was opted into, `bootcher init` prints a `bootcher sign enroll` reminder — run it before provisioning to create `cosign.key`/`cosign.pub`. The passphrase is read from `BOOTCHER_SIGN_PASSPHRASE` if set, else prompted on a TTY.
 
 Edit the `Containerfile` freely — add `dnf install` steps, copy in assets, or replace baseline components. Edit `bootcher.toml` afterward if you need to adjust anything the questionnaire collected.
+
+### Fedora releases
+
+The `Containerfile` builds from one Fedora release, set at the top:
+
+```dockerfile
+ARG FEDORA_VERSION=45
+FROM quay.io/fedora/fedora-bootc:${FEDORA_VERSION}
+```
+
+`init` writes the stable release current at the time (pass `--fedora-release <N>` to choose). The numbered tag keeps getting updates for the life of that release, so rebuilds still pick up security fixes. What it avoids is `:latest` moving to a new major release on Fedora's release day: with a scheduled rebuild, every device would upgrade and reboot into it unattended, before you've tested your own layers on it.
+
+The cost is that a release reaches end of life about four weeks after the release two versions newer ships. Its tag then stops moving, and devices stop getting security updates. The [CI recipes](../recipes/index.md) check the pin on their weekly schedule: a warning once a newer release is out, a failure once the pin is two releases behind.
+
+To upgrade, change `FEDORA_VERSION`, rebuild, test, and deploy. bootc upgrades across Fedora releases in place, and the previous deployment stays available for rollback. To follow `:latest` instead, replace the `FROM` line with `FROM quay.io/fedora/fedora-bootc:latest`.
 
 The security baseline the scaffold brings — key-only SSH for `admin`, `firewalld`, `fail2ban`, `chrony`, automatic updates — is a **starting point, not a finished posture**. It is what a generic appliance can reasonably assume; it knows nothing about the ports your workload opens, the data it holds, or the network it lands on. Review it against your own threat model before a fleet leaves the bench, and treat everything in `sysroot/` as yours to tighten.
 

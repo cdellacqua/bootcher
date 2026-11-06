@@ -42,6 +42,10 @@ enum Cmd {
 		/// overwriting any files the scaffold collides with.
 		#[arg(short = 'f', long = "force")]
 		force: bool,
+		/// Fedora release to pin the Containerfile's `fedora-bootc` base to (e.g.
+		/// `45`). Defaults to the current stable release, looked up on the registry.
+		#[arg(long = "fedora-release", value_name = "N")]
+		fedora_release: Option<u32>,
 	},
 	/// First-time provisioning: build the container, then build its disk image under
 	/// `output/` for you to write or upload to the target device. Any project-specific
@@ -322,7 +326,9 @@ fn run() -> Result<()> {
 	// subcommand loads the manifest from here.
 	let manifest_path = cli.manifest.as_str();
 	match cli.cmd {
-		Cmd::Init { name, yes, force } => jobs::init::run(name, yes, force),
+		Cmd::Init { name, yes, force, fedora_release } => {
+			jobs::init::run(name, yes, force, fedora_release)
+		}
 		Cmd::Provision {
 			ssh_key,
 			skip_pull_check,

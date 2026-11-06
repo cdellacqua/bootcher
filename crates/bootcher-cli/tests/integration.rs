@@ -16,6 +16,10 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
+/// The Fedora release the tests pin `init` to, so scaffolding never looks up the
+/// current release on the registry.
+const PINNED: &str = "44";
+
 /// A `bootcher` command rooted at `dir` with a throwaway `HOME` so that key
 /// discovery, registry config writes, and cosign state stay out of the real home.
 fn bootcher_in(home: &Path, dir: &Path) -> Command {
@@ -29,7 +33,10 @@ fn bootcher_in(home: &Path, dir: &Path) -> Command {
 fn project(name: &str) -> (TempDir, PathBuf) {
 	let tmp = tempfile::tempdir().unwrap();
 	// `-y`: the tests run non-interactively (assert_cmd has no TTY).
-	bootcher_in(tmp.path(), tmp.path()).args(["init", "-y", name]).assert().success();
+	bootcher_in(tmp.path(), tmp.path())
+		.args(["init", "-y", "--fedora-release", PINNED, name])
+		.assert()
+		.success();
 	let proj = tmp.path().join(name);
 	assert!(proj.join("bootcher.toml").is_file(), "init did not scaffold a manifest");
 	(tmp, proj)
@@ -94,13 +101,19 @@ fn init_scaffolds_a_named_project() {
 fn init_scaffold_is_secret_free_and_from_fedora_bootc() {
 	let (_tmp, proj) = project("demo");
 
-	// Starts from the public base, with the hardening layered inline — no local
-	// base image, no arch pin on the FROM line.
+	// Starts from the public base pinned to one Fedora release (through the ARG
+	// `init` rewrites), with the hardening layered inline — no local base image, no
+	// arch pin on the FROM line.
 	let containerfile = read(&proj, "Containerfile");
+	let directives: Vec<&str> =
+		containerfile.lines().filter(|l| !l.is_empty() && !l.starts_with('#')).take(2).collect();
 	assert_eq!(
-		containerfile.lines().next(),
-		Some("FROM quay.io/fedora/fedora-bootc:latest"),
-		"Containerfile should start FROM stock fedora-bootc",
+		directives,
+		[
+			format!("ARG FEDORA_VERSION={PINNED}").as_str(),
+			"FROM quay.io/fedora/fedora-bootc:${FEDORA_VERSION}",
+		],
+		"Containerfile should start FROM stock fedora-bootc, pinned to the requested release",
 	);
 
 	// Secrets are injected at provision, never baked: no rendered files, and the
@@ -142,7 +155,10 @@ fn init_creates_nested_path_and_names_after_leaf() {
 	// A path with separators creates the missing parents; the image name is the
 	// final component.
 	let tmp = tempfile::tempdir().unwrap();
-	bootcher_in(tmp.path(), tmp.path()).args(["init", "-y", "a/b/c"]).assert().success();
+	bootcher_in(tmp.path(), tmp.path())
+		.args(["init", "-y", "--fedora-release", PINNED, "a/b/c"])
+		.assert()
+		.success();
 	let proj = tmp.path().join("a/b/c");
 	assert!(proj.join("bootcher.toml").is_file(), "nested project not scaffolded");
 	assert!(read(&proj, "bootcher.toml").contains(r#"name = "c""#), "name should be the leaf");
@@ -154,7 +170,10 @@ fn init_resolves_relative_parent_path() {
 	let tmp = tempfile::tempdir().unwrap();
 	let work = tmp.path().join("work");
 	fs::create_dir(&work).unwrap();
-	bootcher_in(tmp.path(), &work).args(["init", "-y", "../sibling"]).assert().success();
+	bootcher_in(tmp.path(), &work)
+		.args(["init", "-y", "--fedora-release", PINNED, "../sibling"])
+		.assert()
+		.success();
 	let proj = tmp.path().join("sibling");
 	assert!(proj.join("bootcher.toml").is_file(), "sibling not created at the resolved path");
 	assert!(
@@ -179,7 +198,10 @@ fn init_without_yes_on_non_tty_fails() {
 fn init_no_name_scaffolds_empty_cwd_in_place() {
 	// No name → scaffold the current directory (which is empty here).
 	let tmp = tempfile::tempdir().unwrap();
-	bootcher_in(tmp.path(), tmp.path()).args(["init", "-y"]).assert().success();
+	bootcher_in(tmp.path(), tmp.path())
+		.args(["init", "-y", "--fedora-release", PINNED])
+		.assert()
+		.success();
 	assert!(tmp.path().join("bootcher.toml").is_file(), "no manifest in cwd");
 	assert!(tmp.path().join("Containerfile").is_file(), "no Containerfile in cwd");
 	// No subdir was created.

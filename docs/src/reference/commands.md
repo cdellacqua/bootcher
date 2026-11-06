@@ -6,9 +6,11 @@ A global `-m`/`--manifest <path>` flag (accepted before or after the subcommand,
 
 ---
 
-## `bootcher init [name] [-y] [-f]`
+## `bootcher init [name] [-y] [-f] [--fedora-release <N>]`
 
 Scaffold a new project. `name` is the directory to create (and the image name); omit to scaffold the current directory in place. `-y` accepts defaults without prompting; `-f` allows scaffolding into a non-empty directory.
+
+The scaffolded `Containerfile` pins `fedora-bootc` to one Fedora release (`ARG FEDORA_VERSION=<N>`). By default `init` looks up the current stable release on the registry (the one `fedora-bootc:latest` points at); offline, it falls back to the release this bootcher version shipped with and says so. `--fedora-release <N>` picks the release explicitly and skips the lookup. See [Fedora releases](../workflows/setup.md#fedora-releases).
 
 ---
 

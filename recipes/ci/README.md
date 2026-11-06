@@ -190,8 +190,9 @@ assume registry mode.)
 
 ## Weekly rebuilds for base-image updates
 
-The `Containerfile` builds `FROM` a floating fedora-bootc tag, but that tag only moves
-your image when you rebuild. Without a rebuild, a fleet that sees no commits never gets
+The `Containerfile` builds `FROM` a fedora-bootc tag that keeps moving with Fedora's
+updates (the scaffold's pinned release tag, e.g. `:45`), but that tag only moves your
+image when you rebuild. Without a rebuild, a fleet that sees no commits never gets
 Fedora's security updates. So the pipeline also rebuilds on a schedule:
 
 - **GitHub** — `deploy.yml` has a weekly `schedule:` trigger plus `workflow_dispatch`
@@ -228,6 +229,18 @@ A **manual run always rebuilds** (on GitHub, only from the default branch or a `
 tag). Use it after a Fedora advisory, or for packages your
 `Containerfile` layers on top: those only refresh on a schedule when the base moves too,
 which for fedora-bootc is usually within the week.
+
+**A scheduled run also checks the Fedora release.** The scaffold pins one Fedora release
+(`ARG FEDORA_VERSION` in the `Containerfile`), and that release's tag stops moving at end
+of life. From then on the base never moves, every scheduled run skips the rebuild, and the
+fleet stops getting security updates while the pipeline stays green. The `release-check`
+job compares it with the release `fedora-bootc:latest` currently points at (skopeo plus a
+short Python script) on each schedule: it warns while the pin is one release behind and
+fails once it is two behind (at or within weeks of end of life). It gates nothing, so the
+failure is the alert: bump `FEDORA_VERSION`, push, and the normal pipeline rebuilds onto
+the new release. The script reads the pin from `ARG FEDORA_VERSION` and the current
+release from `quay.io/fedora/fedora-bootc:latest`; adapt the two settings at its top if
+your Containerfile pins differently or you pull from a mirror.
 
 Time the schedule ahead of the window you want the reboot in. A private base image needs
 its own `skopeo login` in the check. Refreshes and pushes share `KEEP_PREVIOUS`, so with

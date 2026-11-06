@@ -17,9 +17,11 @@ The target arch and build location live in `bootcher.toml` (the `[targets]` and
 
 ## What's here
 
-- `Containerfile` — `FROM quay.io/fedora/fedora-bootc:latest` plus a security
-  baseline (admin user, SSH, sudo, firewalld + fail2ban + chrony, bootc
+- `Containerfile` — `FROM quay.io/fedora/fedora-bootc:${FEDORA_VERSION}` plus a
+  security baseline (admin user, SSH, sudo, firewalld + fail2ban + chrony, bootc
   auto-updates). Yours to extend with `dnf install`s, units, and assets.
+  `FEDORA_VERSION` pins the Fedora release: change it to upgrade before the pinned
+  one reaches end of life.
 - `sysroot/` — files COPYed into the image (`COPY sysroot/ /`): sshd/sudoers drop-ins,
   the firewalld zone, the fail2ban jail, the `admin` userdb record, and
   `derive-userdb.sh`.

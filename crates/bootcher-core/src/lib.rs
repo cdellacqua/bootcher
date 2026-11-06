@@ -17,6 +17,7 @@ pub(crate) mod builder;
 pub mod cache;
 pub mod context;
 pub mod exec;
+pub mod fedora;
 pub mod fetch;
 pub(crate) mod fleet;
 pub(crate) mod hooks;

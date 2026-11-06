@@ -17,13 +17,16 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0.102"
 # clap, anyhow, semver and toml_edit are already in the workspace lockfile
-# (directly or transitively), so this crate adds only xshell to the build graph.
+# (directly or transitively), so this crate adds only xshell (and the in-tree
+# bootcher-core) to the build graph.
 clap = { version = "4.6.1", features = ["derive"] }
 semver = "1"
 toml_edit = "0.25"
 # Shell-ish ergonomics for the many one-line cargo/git/podman invocations these
 # tasks are made of; `cmd!` keeps them readable as the shell lines they replaced.
 xshell = "0.2.7"
+# For the release guard's Fedora lookup (`fedora::scaffold_release`/`current_release`).
+bootcher-core = { path = "../bootcher-core" }
 
 [lints]
 workspace = true
