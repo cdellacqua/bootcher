@@ -86,9 +86,8 @@ they're yours to adapt like the workflows. [`tests/`](tests/) holds bootcher's o
 tests for them (stdlib `unittest`, with a fake `skopeo` and a fake GitHub API); you
 don't need to copy it, but it's a starting point if you change a script's decision
 logic (`check()` in the two checks, `plan()` in `ghcr_cleanup.py`). To use it, copy it
-to your repo root beside `ci/` (it finds the scripts in `../ci`, or in its parent
-directory if you put it inside `ci/`) and run
-`python3 -B -m unittest discover -s tests` (or `-s ci/tests`) from the repo root.
+into your repo as `ci/tests/`, so the scripts and their tests travel together, and run
+`python3 -B -m unittest discover -s ci/tests` from the repo root.
 
 **Release channels?** For a workflow where the default branch publishes the rolling
 `latest` channel and a `v*` git tag promotes to a `stable` channel for a production
