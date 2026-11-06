@@ -21,7 +21,8 @@ Reads:
                     as a warning
 
 The decision lives in `check()`, which takes the stable-release lookup as a function;
-bootcher's repo tests it in `recipes/ci/tests/`.
+bootcher's repo tests it in
+https://github.com/cdellacqua/bootcher/tree/main/recipes/ci/tests
 """
 
 import json, os, re, subprocess, sys
@@ -32,11 +33,19 @@ PIN = re.compile(r"^\s*ARG FEDORA_VERSION=(\d+)\s*$", re.M)
 STABLE = "docker://quay.io/fedora/fedora-bootc:latest"
 
 
+class Unreadable(Exception):
+    """`skopeo` couldn't read STABLE (its stderr is the message)."""
+
+
 def stable_release():
-    """The current Fedora release, read from STABLE's version label."""
+    """The current Fedora release, read from STABLE's version label.
+
+    Raises `Unreadable` when `skopeo` fails; a reply without the label is a bug to see
+    in full, so its KeyError (or bad JSON's ValueError) propagates as a traceback.
+    """
     run = subprocess.run(["skopeo", "inspect", STABLE], capture_output=True, text=True)
     if run.returncode:
-        raise LookupError(run.stderr.strip())
+        raise Unreadable(run.stderr.strip())
     return int(json.loads(run.stdout)["Labels"]["org.opencontainers.image.version"].split(".")[0])
 
 
@@ -67,7 +76,7 @@ def main():
     behind = int(os.environ.get("BEHIND_EXIT_CODE") or "0")
     try:
         verdict, message = check(open("Containerfile").read(), stable_release)
-    except LookupError as e:
+    except Unreadable as e:
         sys.exit(f"can't read {STABLE}: {e}")
     if verdict == "eol":
         sys.exit(message)

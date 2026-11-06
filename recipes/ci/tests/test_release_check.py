@@ -85,6 +85,19 @@ class MainTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("can't read docker://quay.io/fedora/fedora-bootc:latest", err)
 
+    def test_a_bad_reply_is_a_traceback_not_an_unreadable_tag(self):
+        # Only a failed `skopeo` is "can't read": a reply without the version label, or
+        # malformed, is a bug to see in full.
+        stable = "docker://quay.io/fedora/fedora-bootc:latest"
+        for reply, error in (({"json": {"Labels": {}}}, "KeyError"),
+                             ({"json": {}}, "KeyError"),
+                             ({"raw": "not json"}, "JSONDecodeError")):
+            code, out, err, _ = self.run_with(pin(45), self.GITHUB, skopeo={stable: reply})
+            self.assertEqual((code, out), (1, ""), reply)
+            self.assertIn("Traceback", err)
+            self.assertIn(error, err.strip().splitlines()[-1])
+            self.assertNotIn("can't read", err)
+
     def test_unpinned_passes_without_a_lookup(self):
         code, out, _, _ = self.run_with("FROM scratch\n", self.GITLAB, skopeo={})
         self.assertEqual(code, 0)
