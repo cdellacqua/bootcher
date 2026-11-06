@@ -2512,6 +2512,7 @@ name = "xtask"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "bootcher-core",
  "clap",
  "semver",
  "toml_edit",

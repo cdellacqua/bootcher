@@ -1,4 +1,7 @@
-FROM quay.io/fedora/fedora-bootc:latest
+# Pinned to a Fedora major-version tag: it floats with that release's updates, and
+# moving to a new major release is up to you (bump this, rebuild, test).
+ARG FEDORA_VERSION=45
+FROM quay.io/fedora/fedora-bootc:${FEDORA_VERSION}
 
 # Install jq + fish (deps of the admin user record: jq for the derivation
 # below, fish as admin's login shell) and stamp the userdb derivation script

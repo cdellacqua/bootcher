@@ -9,7 +9,8 @@
 An opinionated tool for crafting [bootc](https://bootc-dev.github.io/bootc/) images.
 
 `bootcher` scaffolds a self-contained **project** — one bootc image that starts
-`FROM quay.io/fedora/fedora-bootc:latest` with a security baseline (admin user,
+`FROM quay.io/fedora/fedora-bootc:<N>` (pinned to the Fedora release current at
+`init`) with a security baseline (admin user,
 SSH, sudo, firewalld + fail2ban + chrony, auto-updates) layered on top — then
 drives the lifecycle: build the container (`podman build`), turn it into a
 bootable disk image with
@@ -134,8 +135,9 @@ Per-stage shortcuts exist too: `bootcher build`, `bootcher disk`,
   an optional `registry` for registry-mode deploys (see
   [Deploy backends](#deploy-backends-lan-vs-registry)). Its presence marks the
   directory as a bootcher project.
-- `Containerfile` — `FROM quay.io/fedora/fedora-bootc:latest` plus the security
-  baseline. **This is yours to edit** — add `dnf install`s, units, and assets as
+- `Containerfile` — `FROM quay.io/fedora/fedora-bootc:${FEDORA_VERSION}` plus the
+  security baseline. `FEDORA_VERSION` is the Fedora release current at `init`; bump it
+  to upgrade (the CI recipes check it weekly and flag it before end of life). **This is yours to edit** — add `dnf install`s, units, and assets as
   plain `RUN`/`COPY` steps; replace or `systemctl disable` anything the baseline
   ships.
 - `sysroot/` — an overlay `COPY`ed into the image (`COPY sysroot/ /`): sshd / sudoers

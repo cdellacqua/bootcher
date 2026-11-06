@@ -52,6 +52,8 @@ pub(crate) fn release(sh: &Shell, bump: &str) -> Result<()> {
 		bail!("tag {tag} already exists");
 	}
 
+	scaffold_release_is_current()?;
+
 	write(&next)?;
 	// Restore Cargo.lock too: bumping the version dirties the workspace members'
 	// lock entries. Offline and best-effort — a failure here only means the lock
@@ -65,6 +67,24 @@ pub(crate) fn release(sh: &Shell, bump: &str) -> Result<()> {
 	cmd!(sh, "git tag -a {tag} -m {tag_message}").run()?;
 	cmd!(sh, "git push origin main {tag}").run()?;
 	println!("pushed {tag} — watch the release/image jobs in CI");
+	Ok(())
+}
+
+/// Refuse to release while the scaffold pins an older Fedora release than the current
+/// stable one. `bootcher init` falls back to the scaffold's release when it can't
+/// reach the registry, so a stale pin there would scaffold offline projects onto an
+/// old release.
+fn scaffold_release_is_current() -> Result<()> {
+	use bootcher_core::fedora;
+	let scaffold = fedora::scaffold_release()?;
+	let current = fedora::current_release().context("looking up the current Fedora release")?;
+	if scaffold < current {
+		bail!(
+			"the scaffold Containerfile pins Fedora {scaffold}, but Fedora {current} is the \
+			 current release: bump `ARG {}` in crates/bootcher-core/scaffold/Containerfile first",
+			fedora::RELEASE_ARG,
+		);
+	}
 	Ok(())
 }
 
