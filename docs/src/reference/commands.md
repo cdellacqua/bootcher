@@ -38,6 +38,25 @@ Subsequent deploy: build the container → push it and trigger `bootc upgrade` o
 
 ---
 
+## `bootcher promote <version> --channel <channel> [--tls-verify <bool>]`
+
+Move a release channel onto a build that's already in the registry, without rebuilding it. `<registry>/<name>:<channel>` is pointed at the exact manifest the immutable version tag names: bootcher reads the version's manifest and writes the same bytes under the channel tag, so the channel ends up on the **same digest**, no layers are pulled or pushed, and the signature made when the build was deployed (keyed by digest) covers the channel unchanged. Registry mode only.
+
+| Argument / Flag | Purpose |
+|---|---|
+| `<version>` | The version tag of the build to promote, as `deploy` pushed it (e.g. `20261106.142233.g0a1b2c3d4e5`). Must exist in the registry; a channel name is rejected. |
+| `--channel <channel>` | The channel to move: `latest` or one of [`[deploy] channels`](bootcher-toml.md#channels) |
+| `--tls-verify` | Default `true`; pass `false` for a plain-HTTP or self-signed registry |
+
+- **Signing:** with signing configured in `[deploy] registry`, the build's signature is verified against the project's public key first (the same check as [`sign verify`](#bootcher-sign-verify-image---pubkey-path---tls-verify-bool), on the version's digest), and an unsigned or invalidly signed build is refused, leaving the channel where it was. The check is a verifying `podman pull`, so it downloads the image once; no passphrase is needed.
+- **Devices:** promote is a registry operation only. Devices following the channel pick the build up on their next auto-update; unlike `deploy`, it doesn't SSH into `[deploy] remotes` (those aren't tied to a channel, and `deploy` would switch every one of them onto it).
+- **Credentials:** the ones `podman login` stored for the registry (`$REGISTRY_AUTH_FILE`, `${XDG_RUNTIME_DIR}/containers/auth.json`, `~/.config/containers/auth.json`, or `~/.docker/config.json`), with push access. Credentials kept in a credential helper aren't supported.
+- Promoting a channel that's already on that build is a no-op.
+
+To roll a channel back, promote the earlier version tag to it.
+
+---
+
 ## `bootcher build`
 
 Build the container image (the `podman build` step) and assemble the per-arch results into a local multi-arch manifest list (`localhost/<name>:latest`). Useful when iterating on the Containerfile before a `--skip-build` `provision`/`deploy`/`takeover`.

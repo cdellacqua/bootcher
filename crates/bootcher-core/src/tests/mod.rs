@@ -8,3 +8,4 @@
 
 mod manifest_list;
 mod registry;
+pub(crate) mod support;

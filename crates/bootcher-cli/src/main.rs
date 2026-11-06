@@ -126,6 +126,28 @@ enum Cmd {
 		#[arg(long = "channel")]
 		channel: Option<String>,
 	},
+	/// Move a release channel onto a build already in the registry, without
+	/// rebuilding it: `<registry>/<name>:<channel>` is pointed at the exact manifest
+	/// the immutable version tag `<version>` names (same digest, so the signature made
+	/// when it was deployed covers the channel too; no layers are pulled or pushed).
+	/// With signing configured, the build's signature is verified first and an
+	/// unsigned or invalid build is refused. Registry mode only. Devices following the
+	/// channel pick it up on their next auto-update; unlike `deploy`, promote doesn't
+	/// SSH into `[deploy] remotes`. Authenticates with this machine's `podman login`
+	/// credentials.
+	Promote {
+		/// The version tag of the build to promote, as `deploy` pushed it (e.g.
+		/// `20261106.142233.g0a1b2c3d4e5`).
+		version: String,
+		/// The channel to move: one of `[deploy] channels` in bootcher.toml, or
+		/// `latest`.
+		#[arg(long = "channel")]
+		channel: String,
+		/// Verify the registry's TLS certificate. Pass `--tls-verify=false` for a
+		/// plain-HTTP or self-signed registry (e.g. a local test registry).
+		#[arg(long = "tls-verify", default_value_t = true, action = clap::ArgAction::Set)]
+		tls_verify: bool,
+	},
 	/// Build the bootc container image.
 	Build {
 		/// Restrict the build to a single target architecture from `[targets]`
@@ -239,7 +261,7 @@ enum SignCmd {
 		pubkey: Option<String>,
 		/// Verify the registry's TLS certificate. Pass `--tls-verify=false` for
 		/// a plain-HTTP registry (e.g. a local test registry).
-		#[arg(long = "tls-verify", default_value = "true")]
+		#[arg(long = "tls-verify", default_value_t = true, action = clap::ArgAction::Set)]
 		tls_verify: bool,
 	},
 }
@@ -359,6 +381,11 @@ fn run() -> Result<()> {
 			let channel = manifest.resolve_channel(channel.as_deref())?;
 			pipelines::deploy::preflight(&manifest, skip_bootc_upgrade, skip_build)?;
 			pipelines::deploy::run(&manifest, skip_bootc_upgrade, skip_build, &channel)
+		}
+		Cmd::Promote { version, channel, tls_verify } => {
+			let manifest = Manifest::load(manifest_path)?;
+			jobs::promote::preflight(&manifest)?;
+			jobs::promote::run(&manifest, &version, &channel, tls_verify)
 		}
 		Cmd::Build { target } => {
 			let manifest = Manifest::load(manifest_path)?;
