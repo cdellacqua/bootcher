@@ -239,7 +239,7 @@ enum SignCmd {
 		pubkey: Option<String>,
 		/// Verify the registry's TLS certificate. Pass `--tls-verify=false` for
 		/// a plain-HTTP registry (e.g. a local test registry).
-		#[arg(long = "tls-verify", default_value = "true")]
+		#[arg(long = "tls-verify", default_value_t = true, action = clap::ArgAction::Set)]
 		tls_verify: bool,
 	},
 }
@@ -471,5 +471,27 @@ fn run_rotate(cmd: RotateCmd, manifest_path: &str) -> Result<()> {
 		RotateCmd::SignKey { pubkey } => {
 			jobs::rotate::signing_key(&manifest, pubkey.as_deref(), &mut Scope::standalone())
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn sign_verify_tls(flags: &[&str]) -> bool {
+		let base = ["bootcher", "sign", "verify", "reg.example.com/org/name:tag"];
+		let cli = Cli::try_parse_from(base.iter().chain(flags)).unwrap();
+		match cli.cmd {
+			Cmd::Sign(SignCmd::Verify { tls_verify, .. }) => tls_verify,
+			_ => unreachable!(),
+		}
+	}
+
+	#[test]
+	fn sign_verify_tls_verify_takes_a_value() {
+		assert!(sign_verify_tls(&[]));
+		assert!(!sign_verify_tls(&["--tls-verify=false"]));
+		assert!(!sign_verify_tls(&["--tls-verify", "false"]));
+		assert!(sign_verify_tls(&["--tls-verify=true"]));
 	}
 }
