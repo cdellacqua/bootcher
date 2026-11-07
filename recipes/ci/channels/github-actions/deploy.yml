@@ -7,7 +7,8 @@
 # identical — build (per-arch, native runners) → deploy (assemble + push) → cleanup (prune
 # old versions) — plus the loopback container store, the `changes` path gate, and the
 # runtime `bootcher info` image-ref derivation, so this header only covers what's
-# DIFFERENT: which channel each trigger publishes to. For the store relocation, the
+# DIFFERENT: which channel each trigger publishes to, and the `promote` job a `v*` tag
+# runs instead of a build. For the store relocation, the
 # per-arch split rationale, the cleanup mechanics, and the secrets, read
 # the base recipe and the recipe docs; nothing there changes. The disk
 # build is the sibling provision.yml. Like the base recipe, it runs the shared scripts
@@ -15,7 +16,7 @@
 # `ci/` at your repo root.
 #
 #   push to main             → deploy to the default `latest` channel (rolling / canary)
-#   push a v* tag            → deploy to the `stable` channel         (production fleet)
+#   push a v* tag            → promote that commit's build to `stable` (production fleet)
 #   Saturday schedule        → refresh `latest`                       (base-image updates)
 #   Tuesday schedule         → refresh `stable`                       (base-image updates)
 #   manual run on main/a tag → rebuild it into `latest` / `stable`, unconditionally
@@ -34,14 +35,13 @@
 # THE PROMOTION MODEL this encodes:
 #   - Every merge to main publishes :latest. Devices provisioned on the default channel
 #     (your dev boxes / QA rigs) auto-update to it on their timer — that's the canary.
-#   - When a commit on main has proven good, tag it `vX.Y.Z`. The tag pipeline rebuilds
-#     THAT commit and publishes it to :stable; production devices (provisioned with
-#     `--channel stable`) only now auto-update. The tag is on the same source commit, so
-#     stable is that validated revision, and `git describe` stamps `vX.Y.Z` as its
-#     version label. (bootcher rebuilds on the tag rather than re-tagging main's exact
-#     digest — same source, fresh CalVer; the immutable CalVer tag is the per-build
-#     identity either way. If you need bit-identical promotion, pull main's CalVer image
-#     and `podman manifest push` it to :stable by hand instead of tagging.)
+#   - When a commit on main has proven good, tag it `vX.Y.Z`. The tag pipeline does NOT
+#     rebuild: `ci/find_version.py` finds the newest build of THAT commit (the one that
+#     canaried on :latest) by its CalVer tag, and `bootcher promote` points :stable at
+#     that exact digest. Production devices (provisioned with `--channel stable`) only
+#     now auto-update, to the very image the canary fleet ran; its signature, if you
+#     sign, covers :stable unchanged. A tag on a commit that was never deployed to
+#     :latest fails the run ("deploy it to `latest` first") instead of rebuilding.
 #
 # bootcher.toml must DECLARE the channel so `--channel stable` validates — a typo'd
 # channel is rejected, not silently minted as a stray tag:
@@ -93,16 +93,18 @@ jobs:
     outputs:
       channel: ${{ steps.channel.outputs.channel }}
       ref: ${{ steps.base.outputs.SOURCE_REV }}
-      # push → the path filter; schedule → the base-image check; manual → always, but only
-      # on main or a `v*` tag (anything else would publish an arbitrary branch).
+      # push → the path filter (a `v*` tag push promotes instead, below); schedule → the
+      # base-image check; manual → always, but only on main or a `v*` tag (anything else
+      # would publish an arbitrary branch).
       image: >-
         ${{ (github.event_name == 'workflow_dispatch'
         && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))
-        || (github.event_name == 'push' && steps.filter.outputs.image == 'true')
+        || (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
+        && steps.filter.outputs.image == 'true')
         || (github.event_name == 'schedule' && steps.base.outputs.BASE_CHANGED == 'true') }}
     steps:
       - uses: actions/checkout@v4
-      - if: github.event_name == 'push'
+      - if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
         uses: dorny/paths-filter@v3
         id: filter
         with:
@@ -185,7 +187,7 @@ jobs:
   # :stable; the channel is chosen only at push time, in `deploy`.
   build:
     needs: [changes]
-    if: needs.changes.outputs.image == 'true' || startsWith(github.ref, 'refs/tags/v')
+    if: needs.changes.outputs.image == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -339,6 +341,51 @@ jobs:
           CHANNEL: ${{ needs.changes.outputs.channel }} # stable, or empty → `latest`
           BOOTCHER_SIGN_PASSPHRASE: ${{ secrets.SIGN_PASSPHRASE }}
 
+  # --- promote: a pushed `v*` tag moves :stable onto the commit's existing build -----
+  # No build: ci/find_version.py finds the newest build of the tagged commit by its CalVer
+  # tag (ranked by push time, from the package API), and `bootcher promote` points :stable
+  # at that exact digest. No build of the commit published → the job fails, saying to
+  # deploy it to :latest first. With signing configured, promote verifies the build's
+  # signature first (a verifying pull, hence the container store) and needs only the
+  # committed public key, no passphrase. Manual runs on a tag still rebuild (see `build`).
+  promote:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write # read the package versions, move the :stable tag
+    container:
+      image: ghcr.io/cdellacqua/bootcher:latest
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare container store
+        run: |
+          set -eu
+          if [ "$(stat -f -c %T / 2>/dev/null)" = "overlayfs" ]; then
+            : "${BOOTCHER_STORE_SIZE:=20G}"
+            img=/bootcher-store.img
+            truncate -s "$BOOTCHER_STORE_SIZE" "$img"
+            mkfs.ext4 -q -F "$img"
+            mkdir -p /var/lib/containers/storage
+            mount -o loop "$img" /var/lib/containers/storage
+            echo "relocated podman store onto loopback ext4 (${BOOTCHER_STORE_SIZE} ceiling)"
+          else
+            echo "container store already on a real fs; skipping loopback store"
+          fi
+      - name: Log in to GHCR
+        run: echo "$GITHUB_TOKEN" | podman login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Promote the tagged commit's build to stable
+        run: |
+          set -eu
+          version="$(python3 ci/find_version.py)"
+          bootcher --manifest bootcher.ci.toml promote "$version" --channel stable
+        env:
+          COMMIT: ${{ github.sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   # --- cleanup: prune old published image versions ----------------------------------
   # Identical to the base recipe's `cleanup`, running the same ci/ghcr_cleanup.py (see the
   # base recipe for the full multi-arch-safety and token rationale). Channels need no
@@ -347,7 +394,11 @@ jobs:
   # by age. The CalVer tags it keeps N of are shared across channels, so one KEEP_PREVIOUS
   # covers both the latest and stable fleets.
   cleanup:
-    needs: [deploy]
+    needs: [deploy, promote]
+    # After whichever of the two ran and succeeded (the other is skipped).
+    if: >-
+      !failure() && !cancelled()
+      && (needs.deploy.result == 'success' || needs.promote.result == 'success')
     runs-on: ubuntu-24.04
     permissions:
       contents: read

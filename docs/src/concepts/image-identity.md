@@ -13,6 +13,10 @@ Each registry-mode push publishes the same manifest digest under two tags:
 
   The version tag is pushed **first**, and the channel tag only moves once it has landed, so a build devices follow always has a durable tag.
 
+## Promoting a build to a channel
+
+[`bootcher promote <version> --channel <channel>`](../reference/commands.md#bootcher-promote-version---channel-channel---tls-verify-bool) moves a channel tag onto a build that's already published, by its version tag, without rebuilding: the channel is written with the version's exact manifest bytes, so both tags name the same digest. That keeps the version tag the build's identity across channels. The image a canary fleet ran on `:latest` is the image `:stable` gets, rather than a fresh build of the same commit on a base or package set that may have moved since, and a signature made at deploy time covers the promoted channel unchanged. It's also how to roll a channel back: promote the earlier version.
+
 This is bootcher's whole versioning story: there's no `version` field to bump and no release ritual — the timestamp tag is generated on every push, and devices continuously track `:latest`. CalVer fits that continuous-rollout model, where nobody chooses a version to upgrade *to*.
 
 ## Provenance labels

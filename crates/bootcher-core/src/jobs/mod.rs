@@ -2,6 +2,7 @@ pub mod build;
 pub(crate) mod disk;
 pub mod info;
 pub mod init;
+pub mod promote;
 pub mod rotate;
 pub mod secrets;
 pub mod signing;
