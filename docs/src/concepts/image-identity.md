@@ -2,18 +2,18 @@
 
 A bootcher project is a single image, published as a multi-arch manifest list and tracked by every device. This page covers how that image is *named* (the registry tags), how it's *stamped* (the OCI provenance labels), and how to read either back — from a workstation or on a running device.
 
-## The two registry tags
+## Registry tags
 
-Each registry-mode push publishes the same manifest digest under two tags:
+A registry-mode push publishes the multi-arch manifest list under one or two tags:
 
-- **`:latest`** — the mutable channel every device tracks. `bootc upgrade` and the auto-update timer (`bootc-fetch-apply-updates.timer`) resolve this, so a push to `:latest` is what rolls out.
-- **`:<version>`** — an immutable [CalVer](https://calver.org/) tag combining a UTC timestamp with the git commit, `YYYYMMDD.HHMMSS.g<short-sha>` (e.g. `20260113.123304.g0a1b2c3d4e5f`). The date keeps it human-readable and sortable; the commit suffix is what makes it a *stable identity* rather than a mere clock reading — it pins the exact source the image was built from, so the tag can never mean two different trees. (A build from an uncommitted tree keeps git's `-dirty` marker on the suffix, so it can't masquerade as the clean commit.) It points at the same digest as the `:latest` it accompanied, but never moves — a durable handle for rollback and audit that a registry garbage-collection pass won't reap (an untagged digest can be). To pin a device to a specific past build, point its bootc origin at the version tag instead of `:latest`.
+- **A channel** — `:latest` by default, or `:<channel>` with `deploy --channel <channel>` (see [`channels`](../reference/bootcher-toml.md#channels)). A channel is mutable: it moves to each new build deployed to it. `bootc upgrade` and the auto-update timer (`bootc-fetch-apply-updates.timer`) resolve the channel a device tracks, so a push to it is what rolls out.
+- **A build tag** — `:<tag>` with `deploy --tag <tag>`. You pick the name (a git tag, a CI counter, anything that is a valid OCI tag); bootcher doesn't generate one. It names that one build, for testing it on a single device (`bootc switch <registry>/<name>:<tag>`), for rollback, or to move a channel onto it later without rebuilding. bootcher doesn't stop a later `--tag` push from reusing a name, so keeping build tags immutable is up to the pipeline that picks them.
 
-  When the project isn't in git, there's no commit to pin to, so the tag is the timestamp alone, `YYYYMMDD.HHMMSS`. Either way, two deploys would only share a tag if they minted it in the same second (of the same commit, with git), in which case the later push would repoint it; possible in theory, negligible in practice. UTC throughout keeps tags from different builder machines sorting and comparing unambiguously.
+  `--tag` alone pushes only the build tag: no channel moves and no `[deploy] remotes` device is upgraded. `--tag <name> --channel <channel>` pushes the build tag **first** and moves the channel only once it has landed, for the same digest, so a build devices follow always has its durable name. A build tag can't be `latest` or a declared channel, and can't start with `ci-` (scratch tags in CI pipelines) or `sha256-` (where signature attachments are stored).
 
-  The version tag is pushed **first**, and the channel tag only moves once it has landed, so a build devices follow always has a durable tag.
+With signing configured, the first push is the signed one (the build tag with `--tag`, otherwise the channel). Signatures are keyed by manifest digest, so the one signature covers every tag for that digest, including a channel later moved onto it with a digest-preserving copy.
 
-This is bootcher's whole versioning story: there's no `version` field to bump and no release ritual — the timestamp tag is generated on every push, and devices continuously track `:latest`. CalVer fits that continuous-rollout model, where nobody chooses a version to upgrade *to*.
+A plain `deploy` without `--tag` pushes the channel alone, so nothing keeps a build that a channel has since moved past: use `--tag` for builds you may need to return to. `takeover` likewise pushes only its channel.
 
 ## Provenance labels
 
@@ -35,7 +35,7 @@ The same values are handed to lifecycle hooks as `revision` / `version` in [`BOO
 From any machine with registry read access — to see what a tag was built from without touching a device:
 
 ```sh
-podman search --list-tags <registry>/<name>     # every immutable :<version> build
+podman search --list-tags <registry>/<name>     # every channel and build tag
 
 # Read a tag's provenance labels. podman inspects local storage, so pull first:
 podman pull <registry>/<name>:latest

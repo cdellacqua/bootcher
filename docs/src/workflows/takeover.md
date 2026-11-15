@@ -51,7 +51,7 @@ remotes = [
 ## What a run does, per host
 
 1. **Build** the container image (the pipeline's first phase, with `[hooks.build]`).
-2. **Transfer** the arch-matched image into the host's `containers-storage` — the same two backends as `deploy`: a loopback registry over `ssh -R` in [LAN mode](../concepts/deploy-backends.md), or a direct registry pull (the multi-arch list is pushed first) in registry mode.
+2. **Transfer** the arch-matched image into the host's `containers-storage` — the same two backends as `deploy`: a loopback registry over `ssh -R` in [LAN mode](../concepts/deploy-backends.md), or a direct registry pull in registry mode (the multi-arch list is pushed first, under the channel tag only: `takeover` has no `--tag`, so use `deploy --tag` when a build needs a fixed name).
 3. **Convert** the disk in place from the transferred image.
 4. **Inject secrets** into the staged deployment's `/etc` — the admin key, the registry pull token, and (in signing mode) the signature-enforcement policy — exactly the file set [disk provisioning](setup.md) bakes. The same step masks `boot.automount` there (see [Hosts with an ESP](#hosts-with-an-esp)).
 5. **Reboot**, wait for the host to answer SSH on the new boot as `admin@`, assert `bootc status`, and check that nothing automounts on `/boot`.

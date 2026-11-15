@@ -14,7 +14,7 @@ bootcher deploy
 2. Collect the freshly-built per-arch images into a local multi-arch manifest list (`localhost/<name>:latest`).
 3. **Push + upgrade** — push the update and trigger `bootc upgrade` on each device. The push backend depends on the manifest:
    - **LAN mode** — serve the image from a loopback registry and forward it over SSH; see [LAN backend](../concepts/deploy-backends.md).
-   - **Registry mode** — `podman push` to an immutable `<registry>/<name>:<version>` tag, *then* to `<registry>/<name>:latest` for the same digest (see [Image identity & provenance](../concepts/image-identity.md)); SSH into each `[deploy] remotes` device and run `bootc upgrade`.
+   - **Registry mode** — `podman push` to `<registry>/<name>:latest` (or the `--channel`'s tag). With `--tag <tag>`, the build is pushed to `<registry>/<name>:<tag>` *first*, then to the channel for the same digest; `--tag` without `--channel` pushes the build tag alone. See [Image identity & provenance](../concepts/image-identity.md). Then SSH into each `[deploy] remotes` device and run `bootc upgrade`, unless no channel moved (`--tag` alone) or `--skip-bootc-upgrade` is given.
 
 Each device then reboots into the staged deployment, and `deploy` checks with `bootc status` that it booted it: a device that came back on its old deployment fails the deploy. A device already booted into the image has nothing staged and isn't rebooted. In LAN mode a device that already stores the image skips the transfer.
 
@@ -22,7 +22,7 @@ In registry mode with no `[deploy] remotes` configured, the push to the registry
 
 Every device connection uses trust-on-first-use host-key checking; on an untrusted network, pin the host key instead — see [Host-key verification](../reference/bootcher-toml.md#host-key-verification).
 
-Both tags carry the git commit they were built from as OCI labels, and you can read either tag or label back from a workstation or a running device — see [Image identity & provenance](../concepts/image-identity.md).
+Every pushed image carries the git commit it was built from as OCI labels, and you can read tags and labels back from a workstation or a running device — see [Image identity & provenance](../concepts/image-identity.md).
 
 ## Skipping the build
 

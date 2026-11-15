@@ -306,7 +306,7 @@ channels = ["stable", "next", "testing"]
 
 Declaring channels is opt-in and does two things: it **validates** `--channel` against a known set (a typo'd `--channel nightyl` is rejected rather than silently minting a stray tag), and it gives `bootcher init` something to seed. Leaving it empty (the default) keeps the project on just `latest` — the single-channel case, where `--channel` is never needed.
 
-A channel is a *pointer*, not a separate identity: the same digest a `deploy` produces is **also** tagged with its immutable `:CalVer` (see [Image identity](../concepts/image-identity.md)) regardless of channel, so the version tag is the durable rollback/audit handle and the channel tag is just which subscribers see it. Channels are a **registry-mode** concept — they have no LAN (SSH-tunnel) equivalent, so a non-`latest` `--channel` with no `registry` configured is an error.
+A channel is a *pointer*, not a separate identity: it says which subscribers see a build. A fixed name for one build is a separate tag, pushed with `deploy --tag <name>` (with `--channel` too to move the channel onto it in the same run; see [Image identity](../concepts/image-identity.md)), and a build tag can't reuse a channel's name. Channel names must be valid OCI tags. Channels are a **registry-mode** concept — they have no LAN (SSH-tunnel) equivalent, so a non-`latest` `--channel` with no `registry` configured is an error.
 
 > **Note** — `latest` is always a valid channel without being listed here, and is the default when `--channel` is omitted. Existing devices provisioned before channels existed track `:latest` and stay on it untouched. Don't rename `latest`; add named channels alongside it.
 

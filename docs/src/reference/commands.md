@@ -27,7 +27,7 @@ First-time provisioning: collect secrets → build the container → build its d
 
 ---
 
-## `bootcher deploy [--skip-bootc-upgrade] [--skip-build]`
+## `bootcher deploy [--skip-bootc-upgrade] [--skip-build] [--channel <name>] [--tag <name>]`
 
 Subsequent deploy: build the container → push it and trigger `bootc upgrade` on the configured targets. All configuration comes from `bootcher.toml`.
 
@@ -35,6 +35,8 @@ Subsequent deploy: build the container → push it and trigger `bootc upgrade` o
 |---|---|
 | `--skip-bootc-upgrade` | Registry mode only: push the image and return without SSHing into remotes to run `bootc upgrade`. Devices pick up the update on their next auto-update cycle. Has no effect in LAN mode. |
 | `--skip-build` | Push the already-built container, skipping the container build — for shipping an image an earlier `bootcher build` produced, or iterating on the push/upgrade step |
+| `--channel <name>` | Registry mode only: publish to this release channel (`<registry>/<name>:<channel>`) instead of `latest`. Must be `latest` or one of [`[deploy] channels`](bootcher-toml.md#channels); only devices tracking it pick the build up |
+| `--tag <name>` | Registry mode only: push the build under this fixed tag, signed when signing is configured. Alone, no channel moves and no remote is upgraded (try it with `bootc switch <registry>/<name>:<tag>` on a device). With `--channel`, the tag is pushed first, then the channel, for the same digest. Must be a valid OCI tag (`[A-Za-z0-9_][A-Za-z0-9._-]{0,127}`), not `latest` or a declared channel, and not starting with `ci-` or `sha256-`. See [Image identity](../concepts/image-identity.md) |
 
 ---
 
