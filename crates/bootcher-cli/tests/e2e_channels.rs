@@ -5,9 +5,9 @@
 //!
 //! 1. provisioned `--channel stable` → the bootc origin is the *channel* ref
 //!    (`<registry>/<name>:stable`), not `:latest`, and nothing is pushed yet;
-//! 2. `deploy --channel stable` pushes the multi-arch list under `:stable` (and the
-//!    shared immutable `:CalVer` tag) and the device upgrades from it — proving a
-//!    channel deploy reaches a device that tracks that channel;
+//! 2. `deploy --channel stable` pushes the multi-arch list under `:stable` alone and
+//!    the device upgrades from it — proving a channel deploy reaches a device that
+//!    tracks that channel;
 //! 3. **isolation**: a default (`latest`) `deploy --skip-bootc-upgrade` pushes a
 //!    *different* image under `:latest` without touching the device; the device's own
 //!    `bootc upgrade` (which pulls from its `:stable` origin) does **not** pick that

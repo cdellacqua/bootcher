@@ -1,5 +1,5 @@
 use crate::{
-	context::{Arch, ImageRef, Manifest, SigningConfig, ToSsh},
+	context::{Arch, ImageRef, Manifest, Publish, SigningConfig, ToSsh},
 	exec::{run_argv_labeled, sh_quote},
 	fleet,
 	hooks::{HookMetadata, Phase, Stage},
@@ -20,25 +20,39 @@ use std::time::{Duration, Instant};
 /// Check the external tools the push/upgrade phase needs: `podman` always (build
 /// the manifest list, push, inspect); `ssh` whenever the push reaches devices —
 /// always in LAN mode (the transfer *is* an ssh tunnel), and in registry mode only
-/// when listed remotes are upgraded immediately (`!skip_bootc_upgrade`). Co-located
-/// with [`run`]; invoked before the push starts.
+/// when listed remotes are upgraded immediately (see [`upgrades_remotes`]).
+/// Co-located with [`run`]; invoked before the push starts.
 ///
 /// # Errors
 ///
 /// Returns an error listing every missing prerequisite.
-pub(crate) fn preflight(manifest: &Manifest, skip_bootc_upgrade: bool) -> Result<()> {
+pub(crate) fn preflight(
+	manifest: &Manifest,
+	skip_bootc_upgrade: bool,
+	publish: &Publish,
+) -> Result<()> {
 	let mut checks = Checks::default();
 	checks.bin("podman", preflight::PODMAN_HINT);
 	let ssh_needed = match manifest.registry() {
 		// LAN mode: the image is shipped to each device over an SSH-tunnelled push.
 		None => true,
 		// Registry mode: ssh only to run `bootc upgrade` on listed remotes.
-		Some(_) => !manifest.deploy_remotes().is_empty() && !skip_bootc_upgrade,
+		Some(_) => {
+			!manifest.deploy_remotes().is_empty() && upgrades_remotes(skip_bootc_upgrade, publish)
+		}
 	};
 	if ssh_needed {
 		checks.bin("ssh", "reach the deploy targets over SSH");
 	}
 	checks.finish()
+}
+
+/// Whether a registry-mode push goes on to switch + upgrade the listed remotes. Not
+/// with `--skip-bootc-upgrade`, and not when the run moves no channel (`--tag`
+/// alone): a device's origin is a channel, and switching it onto a one-off build
+/// tag would pin it there, off every later channel deploy.
+fn upgrades_remotes(skip_bootc_upgrade: bool, publish: &Publish) -> bool {
+	!skip_bootc_upgrade && publish.channel.is_some()
 }
 
 /// Push the freshly built image to the configured targets and stage a `bootc
@@ -51,6 +65,11 @@ pub(crate) fn preflight(manifest: &Manifest, skip_bootc_upgrade: bool) -> Result
 /// each device's arch over ssh, then an SSH-tunnelled `podman pull` of the
 /// matching member from a loopback mini-registry on the builder + `bootc switch
 /// --transport containers-storage`).
+///
+/// `publish` is what the run pushes (see [`Publish`]): in registry mode each of its
+/// tags, in order, all for the same digest; LAN mode only ever has the default
+/// channel. With a tag but no channel the push is the whole job — no device is
+/// switched, since none tracks a build tag.
 ///
 /// `remotes` is the `[deploy] remotes` list. LAN requires at least one — there's
 /// no path to a device without it — but registry mode accepts an empty list:
@@ -74,7 +93,7 @@ pub(crate) fn preflight(manifest: &Manifest, skip_bootc_upgrade: bool) -> Result
 pub(crate) fn run(
 	manifest: &Manifest,
 	skip_bootc_upgrade: bool,
-	channel: &str,
+	publish: &Publish,
 	job: &mut Scope,
 ) -> Result<()> {
 	let images = manifest.images();
@@ -85,18 +104,25 @@ pub(crate) fn run(
 	}
 	let remote_hosts: Vec<String> = remotes.iter().map(|s| s.host().to_owned()).collect();
 	let provenance = crate::context::GitProvenance::detect(std::path::Path::new("."), job);
-	// Compute the immutable CalVer tag now, while `provenance` is still whole (its
-	// fields are moved into `meta` just below). The commit suffix pins the tag to source.
-	let calver = crate::context::calver_now(provenance.short_sha().as_deref());
+	// Every registry ref this run pushes, in push order (the build tag, then the
+	// channel); empty in LAN mode.
+	let push_refs: Vec<String> =
+		publish.tags().iter().filter_map(|t| manifest.registry_list_ref(t)).collect();
+	// The ref devices are pointed at: the channel's, when the run moves one.
+	let channel_ref = publish.channel.as_deref().and_then(|c| manifest.registry_list_ref(c));
 	let mut meta = HookMetadata {
 		phase: Phase::Upgrade,
 		stage: Stage::Pre,
 		image_name: manifest.general.name.clone(),
 		arches: images.iter().map(|i| i.arch).collect(),
 		// The ref pushed/served and recorded as the device bootc origin: the registry
-		// list ref for this run's channel in registry mode, else the LAN-served local
-		// list ref (LAN has no channels).
-		image_ref: manifest.registry_list_ref(channel).unwrap_or_else(|| manifest.local_list_ref()),
+		// list ref for this run's channel in registry mode (or the build tag's, when
+		// `--tag` moves no channel), else the LAN-served local list ref (LAN has no
+		// channels).
+		image_ref: channel_ref
+			.clone()
+			.or_else(|| push_refs.first().cloned())
+			.unwrap_or_else(|| manifest.local_list_ref()),
 		revision: provenance.revision,
 		version: provenance.version,
 		output_dir: None,
@@ -106,19 +132,16 @@ pub(crate) fn run(
 		results: None,
 	};
 	crate::hooks::run(&meta, hooks.upgrade.pre.as_deref(), job)?;
-	let report = if let Some(channel_ref) = manifest.registry_list_ref(channel)
-	// The immutable companion tag for this push (see `run_registry`); both refs
-	// come from the manifest, not any one arch's image.
-	 && let Some(version_ref) = manifest.registry_version_ref(&calver)
-	{
+	let report = if manifest.registry().is_some() {
 		let signing = manifest.signing();
 		run_registry(
 			&manifest.local_list_ref(),
-			(&channel_ref, &version_ref),
-			&remotes,
+			&push_refs,
+			channel_ref.as_deref(),
+			// Only a channel deploy reaches devices (see `upgrades_remotes`).
+			if upgrades_remotes(skip_bootc_upgrade, publish) { &remotes } else { &[] },
 			signing.as_ref(),
 			manifest.concurrency().upgrade,
-			skip_bootc_upgrade,
 			job,
 		)?
 	} else if remotes.is_empty() {
@@ -134,55 +157,61 @@ pub(crate) fn run(
 }
 
 /// Registry backend: assemble the per-arch members into one multi-arch manifest
-/// list, push it to the configured registry (under an immutable `CalVer` tag —
-/// `:YYYYMMDD.HHMMSS.g<short-sha>`, or `:YYYYMMDD.HHMMSS` with no git — then the
-/// run's mutable channel tag — `:latest` by default — for the same digest), then
-/// point each listed device's bootc origin at the (suffix-free) registry ref and upgrade it now. With no
-/// remotes the push is the whole job — every target's auto-update timer fetches
-/// the new revision (and resolves its own arch out of the list) on its own. The
-/// first switch is idempotent against a registry-mode provision (origin already
-/// the ref). Returns the per-device [`fleet::Report`] (empty when no device was
-/// switched), failures included, for the caller to raise after its `post` hook.
+/// list and push it to the configured registry under each of `push_refs` in turn —
+/// the `--tag` build name first when given, then the run's channel (`:latest` by
+/// default, absent for a `--tag` alone) — all for the same digest (see
+/// [`push_multiarch_list`]). Then, when the run moved a channel (`channel_ref`),
+/// point each device in `remotes` (empty when they're not to be upgraded) at that
+/// channel ref and upgrade it now. Otherwise the push
+/// is the whole job — every target's auto-update timer fetches the new revision (and
+/// resolves its own arch out of the list) on its own. The first switch is idempotent
+/// against a registry-mode provision (origin already the ref). Returns the
+/// per-device [`fleet::Report`] (empty when no device was switched), failures
+/// included, for the caller to raise after its `post` hook.
 fn run_registry(
 	local_list_ref: &str,
-	// `(channel_ref, version_ref)`: the run's mutable channel tag (`:latest` by
-	// default) and the immutable CalVer tag (see `calver_now`), both for the same
-	// pushed digest.
-	refs: (&str, &str),
+	push_refs: &[String],
+	channel_ref: Option<&str>,
 	remotes: &[Ssh],
 	signing: Option<&SigningConfig>,
 	max_workers: Option<NonZeroUsize>,
-	skip_bootc_upgrade: bool,
 	job: &mut Scope,
 ) -> Result<fleet::Report> {
-	let (channel_ref, version_ref) = refs;
-	let enforce_sig = push_multiarch_list(local_list_ref, channel_ref, version_ref, signing, job)?;
+	let enforce_sig = push_multiarch_list(local_list_ref, push_refs, signing, job)?;
+	let pushed = push_refs.join(" and ");
 
-	if remotes.is_empty() || skip_bootc_upgrade {
+	let Some(upgrade_ref) = channel_ref else {
+		// `--tag` alone: a one-off build name no device tracks.
 		job.println(format!(
-			"pushed {channel_ref} (also tagged {version_ref}) — targets will pull it on their next \
-			 auto-update; add a target to `[deploy] remotes` to apply it immediately"
+			"pushed {pushed} — no channel moved, so no device was upgraded; `bootc switch` a \
+			 device to it to try it"
+		));
+		return Ok(fleet::Report::empty("upgrade", "device"));
+	};
+	if remotes.is_empty() {
+		job.println(format!(
+			"pushed {pushed} — targets will pull it on their next auto-update; add a target \
+			 to `[deploy] remotes` to apply it immediately"
 		));
 		return Ok(fleet::Report::empty("upgrade", "device"));
 	}
 
 	// Apply to every listed device in parallel, attempting all (see `fleet`).
 	fleet::for_each_remote(remotes, "upgrade", max_workers, job, |remote, scope| {
-		apply_registry(channel_ref, enforce_sig, remote, scope)
+		apply_registry(upgrade_ref, enforce_sig, remote, scope)
 	})
 }
 
 /// Assemble the per-arch members into one multi-arch manifest list and push it to
-/// the registry under both the immutable `version_ref` (`CalVer`, see `calver_now`)
-/// tag and the mutable `channel_ref` (`:<channel>`, `:latest` by default) tag — the
-/// same digest under both. Returns whether signature enforcement is in effect
-/// (`true` iff `signing` is configured), so the caller records a verifying origin on
-/// each device.
+/// the registry under each of `refs`, in order — the same digest under all of them.
+/// Returns whether signature enforcement is in effect (`true` iff `signing` is
+/// configured), so the caller records a verifying origin on each device.
 ///
-/// The version tag goes first and the channel only moves once it has landed, so a
-/// build devices follow always carries a durable tag: were the channel moved first
-/// and the version push then failed, the next deploy would leave that build
-/// untagged — out of rollback history and fair game for registry cleanup.
+/// The first ref is the one signed, and each later one is pushed only once the
+/// earlier have landed. A `deploy --tag` lists its fixed build tag before the
+/// channel, so a build devices follow always carries its durable name too: were the
+/// channel moved first and the tag push then failed, the build would be left
+/// without the name a rollback or promotion looks it up by.
 ///
 /// Shared by `upgrade`/`deploy` (which then switch + reboot each device) and
 /// [`crate::jobs::takeover`] (where each host pulls the pushed ref directly): both
@@ -190,15 +219,17 @@ fn run_registry(
 ///
 /// # Errors
 ///
-/// Returns an error if either push fails (e.g. this host isn't logged in to the
-/// registry), or if the two pushes produce different digests.
+/// Returns an error if `refs` is empty, if any push fails (e.g. this host isn't
+/// logged in to the registry), or if the pushes produce different digests.
 pub(crate) fn push_multiarch_list(
 	local_list_ref: &str,
-	channel_ref: &str,
-	version_ref: &str,
+	refs: &[String],
 	signing: Option<&SigningConfig>,
 	job: &mut Scope,
 ) -> Result<bool> {
+	let Some((first_ref, rest)) = refs.split_first() else {
+		bail!("nothing to push: no registry tag was selected");
+	};
 	// Assemble + push the multi-arch image to the registry. `podman manifest push`
 	// streams line-oriented progress to a pipe (not a TTY), so `run_command`'s
 	// line-forwarding renders it cleanly without clobbering the live bars.
@@ -207,16 +238,16 @@ pub(crate) fn push_multiarch_list(
 	job.step("push image");
 	// The list object was assembled by the build phase; `local_list_ref` just names it.
 
-	// With signing configured, the version push carries
+	// With signing configured, the first push carries
 	// `--sign-by-sigstore-private-key` (having ensured this host is configured to
 	// store the cosign signature attachment), and the caller records a
 	// signature-enforcing origin so every later upgrade verifies the signature
 	// against the injected policy. One signature is enough: sigstore attachments are
-	// keyed by manifest *digest*, and both tags name the same digest, so bootc
+	// keyed by manifest *digest*, and every tag names the same digest, so bootc
 	// verifies it whichever tag the device resolved it through.
 	let sign = match signing {
 		Some(cfg) => {
-			let ns = crate::jobs::signing::registry_namespace(channel_ref);
+			let ns = crate::jobs::signing::registry_namespace(first_ref);
 			crate::jobs::signing::ensure_push_attachments(ns, job)?;
 			Some(crate::jobs::signing::sign_args(cfg)?)
 		}
@@ -224,24 +255,25 @@ pub(crate) fn push_multiarch_list(
 	};
 	let enforce_sig = sign.is_some();
 
-	let version_digest = push_list(job, local_list_ref, version_ref, sign)?;
-	// Same content ⇒ only a manifest PUT, no layer re-upload.
-	let channel_digest = push_list(job, local_list_ref, channel_ref, None)?;
-
-	// Both pushes serialize the same local list, so they must produce the same
-	// digest — that is what lets the one signature cover the channel too. Check it
-	// rather than assume it.
-	if version_digest != channel_digest {
-		bail!(
-			"pushing the same build produced different digests: {version_ref} is \
-			 {version_digest} but {channel_ref} is {channel_digest}{}",
-			if enforce_sig {
-				" — only the version tag's digest is signed, so devices enforcing signatures \
-				 will reject the channel"
-			} else {
-				""
-			}
-		);
+	let first_digest = push_list(job, local_list_ref, first_ref, sign)?;
+	for other_ref in rest {
+		// Same content ⇒ only a manifest PUT, no layer re-upload.
+		let digest = push_list(job, local_list_ref, other_ref, None)?;
+		// Every push serializes the same local list, so they must produce the same
+		// digest — that is what lets the one signature cover the later tags too.
+		// Check it rather than assume it.
+		if digest != first_digest {
+			bail!(
+				"pushing the same build produced different digests: {first_ref} is \
+				 {first_digest} but {other_ref} is {digest}{}",
+				if enforce_sig {
+					" — only the first tag's digest is signed, so devices enforcing signatures \
+					 will reject the other"
+				} else {
+					""
+				}
+			);
+		}
 	}
 
 	Ok(enforce_sig)
@@ -730,6 +762,19 @@ fn remote_podman_image_id(remote: &Ssh, tag: &str) -> Result<Option<String>> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn only_a_channel_deploy_upgrades_remotes() {
+		let publish = |tag: Option<&str>, channel: Option<&str>| Publish {
+			tag: tag.map(Into::into),
+			channel: channel.map(Into::into),
+		};
+		assert!(upgrades_remotes(false, &publish(None, Some("latest"))));
+		assert!(upgrades_remotes(false, &publish(Some("42"), Some("stable"))));
+		// `--tag` alone moves no channel, so no device is switched onto the build tag.
+		assert!(!upgrades_remotes(false, &publish(Some("42"), None)));
+		assert!(!upgrades_remotes(true, &publish(None, Some("latest"))));
+	}
 
 	#[test]
 	fn bootc_status_reads_booted_and_staged() {

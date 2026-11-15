@@ -33,7 +33,7 @@ pub struct Info {
 	/// Registry namespace (`<registry>`), or `null` in LAN mode.
 	pub registry: Option<String>,
 	/// Suffix-free fully-qualified image ref (`<registry>/<name>`), or `null` in LAN
-	/// mode — what a pipeline appends `:latest` / `:ci-<arch>` / a `CalVer` tag to.
+	/// mode — what a pipeline appends `:latest` / `:ci-<arch>` / a `--tag` name to.
 	pub image: Option<String>,
 	/// Local manifest-list ref (`localhost/<name>:latest`) the build assembles.
 	pub local_image: String,

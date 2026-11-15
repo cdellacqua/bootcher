@@ -293,9 +293,6 @@ pub(crate) fn run(
 	let max_workers = manifest.concurrency().takeover;
 
 	let provenance = crate::context::GitProvenance::detect(std::path::Path::new("."), job);
-	// Compute the immutable CalVer tag now, while `provenance` is still whole (its
-	// fields are moved into `meta` just below).
-	let calver = crate::context::calver_now(provenance.short_sha().as_deref());
 	let hooks = manifest.hooks();
 	let mut meta = HookMetadata {
 		phase: Phase::Takeover,
@@ -313,16 +310,15 @@ pub(crate) fn run(
 		results: None,
 	};
 	crate::hooks::run(&meta, hooks.takeover.pre.as_deref(), job)?;
-	let report = if let Some(channel_ref) = manifest.registry_list_ref(channel)
-		&& let Some(version_ref) = manifest.registry_version_ref(&calver)
-	{
+	let report = if let Some(channel_ref) = manifest.registry_list_ref(channel) {
 		// Registry mode: the host pulls the ref directly, so it must be in the registry
-		// first. Push the multi-arch list (signing it if configured), then hand each
-		// host the ref + the pull credential (the device `auth.json`, when present).
+		// first. Push the multi-arch list under the channel tag alone (signing it if
+		// configured), then hand each host the ref + the pull credential (the device
+		// `auth.json`, when present). Takeover names no build: a fixed build tag is
+		// `deploy --tag`'s job.
 		upgrade::push_multiarch_list(
 			&manifest.local_list_ref(),
-			&channel_ref,
-			&version_ref,
+			std::slice::from_ref(&channel_ref),
 			manifest.signing().as_ref(),
 			job,
 		)?;

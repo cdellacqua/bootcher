@@ -572,6 +572,44 @@ fn deploy_channel_without_registry_is_rejected() {
 }
 
 #[test]
+fn deploy_tag_without_registry_is_rejected() {
+	// A build tag names an image in a registry; LAN mode has none, so `--tag` must
+	// fail fast, before any build, with a pointer to set a registry.
+	let (tmp, proj) = project("demo");
+	bootcher_in(tmp.path(), &proj)
+		.args(["deploy", "--tag", "42"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("`--tag 42` needs a registry"));
+}
+
+#[test]
+fn deploy_reserved_or_invalid_tag_is_rejected() {
+	// A build tag can't shadow a channel or a reserved prefix, and must be a valid
+	// OCI tag; each is rejected before any build.
+	let (tmp, proj) = project("demo");
+	fs::write(
+		proj.join("bootcher.toml"),
+		"[general]\nname = \"demo\"\n[targets]\nx86_64 = \"qcow2\"\n\
+		 [deploy]\nregistry = \"registry.example.com/org\"\nchannels = [\"stable\"]\n",
+	)
+	.unwrap();
+	for (tag, expect) in [
+		("latest", "names a channel"),
+		("stable", "names a channel"),
+		("ci-x86_64", "reserved"),
+		("sha256-abc", "reserved"),
+		("v1/2", "isn't a valid tag"),
+	] {
+		bootcher_in(tmp.path(), &proj)
+			.args(["deploy", "--tag", tag])
+			.assert()
+			.failure()
+			.stderr(predicate::str::contains(expect));
+	}
+}
+
+#[test]
 fn deploy_undeclared_channel_is_rejected() {
 	// In registry mode a channel must be one the manifest declares in `[deploy]
 	// channels` (plus the implicit `latest`), so a typo can't silently mint a stray

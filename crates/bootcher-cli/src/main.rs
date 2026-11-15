@@ -119,12 +119,20 @@ enum Cmd {
 		#[arg(long = "skip-build")]
 		skip_build: bool,
 		/// Publish to this release channel instead of the default `latest`: the image
-		/// is pushed under the mutable `<registry>/<name>:<channel>` tag (the immutable
-		/// `CalVer` tag is shared across channels), and only the devices tracking that
-		/// channel pick it up. Must be one of `[deploy] channels` in bootcher.toml.
-		/// Registry mode only — channels have no LAN equivalent.
+		/// is pushed under the mutable `<registry>/<name>:<channel>` tag, and only the
+		/// devices tracking that channel pick it up. Must be one of `[deploy] channels`
+		/// in bootcher.toml. Registry mode only — channels have no LAN equivalent.
+		/// With `--tag`, the channel is moved onto the tagged build after the tag push.
 		#[arg(long = "channel")]
 		channel: Option<String>,
+		/// Push the build under this fixed name, `<registry>/<name>:<tag>`, and sign
+		/// that push. Alone, no channel moves and no remote is upgraded: the build is
+		/// published for testing (`bootc switch` a device to it) or later promotion.
+		/// With `--channel`, the tag is pushed first, then the channel. Must be a valid
+		/// OCI tag, not `latest` or a declared channel, and not start with `ci-` or
+		/// `sha256-`. Registry mode only.
+		#[arg(long = "tag")]
+		tag: Option<String>,
 	},
 	/// Build the bootc container image.
 	Build {
@@ -354,11 +362,11 @@ fn run() -> Result<()> {
 			.blueprint()?;
 			pipelines::provision::run(&manifest, target, &disk, Some(&config), skip_build, &channel)
 		}
-		Cmd::Deploy { skip_bootc_upgrade, skip_build, channel } => {
+		Cmd::Deploy { skip_bootc_upgrade, skip_build, channel, tag } => {
 			let manifest = Manifest::load(manifest_path)?;
-			let channel = manifest.resolve_channel(channel.as_deref())?;
-			pipelines::deploy::preflight(&manifest, skip_bootc_upgrade, skip_build)?;
-			pipelines::deploy::run(&manifest, skip_bootc_upgrade, skip_build, &channel)
+			let publish = manifest.resolve_publish(tag.as_deref(), channel.as_deref())?;
+			pipelines::deploy::preflight(&manifest, skip_bootc_upgrade, skip_build, &publish)?;
+			pipelines::deploy::run(&manifest, skip_bootc_upgrade, skip_build, &publish)
 		}
 		Cmd::Build { target } => {
 			let manifest = Manifest::load(manifest_path)?;

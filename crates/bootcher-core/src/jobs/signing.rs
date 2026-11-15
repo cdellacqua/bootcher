@@ -773,4 +773,86 @@ mod tests {
 		assert!(signed.is_ok(), "verify rejected a validly signed image: {signed:?}");
 		assert!(unsigned.is_err(), "verify accepted an unsigned image");
 	}
+
+	/// A `registries.conf.d` drop-in in the real `~/.config/containers` marking
+	/// `localhost:<port>` insecure (plain HTTP), removed on drop. The production push
+	/// path passes no `--tls-verify` flag, so a test driving it against a
+	/// [`TestRegistry`] needs the registry allowed this way instead.
+	struct InsecureRegistryConf(std::path::PathBuf);
+
+	impl InsecureRegistryConf {
+		fn allow(host_port: u16) -> Self {
+			let home = std::env::var_os("HOME").expect("HOME is set");
+			let dir = Path::new(&home).join(".config/containers/registries.conf.d");
+			std::fs::create_dir_all(&dir).unwrap();
+			let path = dir.join(format!("bootcher-test-localhost-{host_port}.conf"));
+			std::fs::write(
+				&path,
+				format!("[[registry]]\nlocation = \"localhost:{host_port}\"\ninsecure = true\n"),
+			)
+			.unwrap();
+			Self(path)
+		}
+	}
+
+	impl Drop for InsecureRegistryConf {
+		fn drop(&mut self) {
+			let _ = std::fs::remove_file(&self.0);
+		}
+	}
+
+	/// The deploy push itself, against a real registry: a `--tag 42 --channel stable`
+	/// run pushes the local list under both tags, signing only the first push, and
+	/// the one signature verifies through either tag, which proves both name the
+	/// same digest. Needs podman and network (a tiny, cached busybox pull).
+	#[test]
+	fn push_multiarch_list_signs_the_first_tag_for_every_tag() {
+		const PORT: u16 = 5996;
+		const LIST: &str = "localhost/bootcher-pushtest:latest";
+		const TAG: &str = "localhost:5996/test/pushtest:42";
+		const CHANNEL: &str = "localhost:5996/test/pushtest:stable";
+
+		let _env = SIGN_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+		let dir = tempfile::tempdir().unwrap();
+		let key = dir.path().join("cosign.key");
+		let pubk = dir.path().join("cosign.pub");
+		// SAFETY: SIGN_ENV_LOCK serializes the env-mutating signing tests and no
+		// other thread reads this var meanwhile; set before any signing call reads it.
+		unsafe { std::env::set_var(ENV_SIGN_PASSPHRASE, "push-pass") };
+		enroll(&key, &pubk, false).unwrap();
+
+		let _reg = TestRegistry::start("bootcher-pushtest-reg", PORT);
+		let _insecure = InsecureRegistryConf::allow(PORT);
+
+		duct::cmd!("podman", "pull", "-q", "docker.io/library/busybox:latest")
+			.run()
+			.expect("could not pull busybox");
+		// The local manifest list the build phase would have assembled.
+		let _ = duct::cmd!("podman", "manifest", "rm", LIST)
+			.stdout_null()
+			.stderr_null()
+			.unchecked()
+			.run();
+		duct::cmd!("podman", "manifest", "create", LIST).stdout_null().run().unwrap();
+		duct::cmd!("podman", "manifest", "add", LIST, "docker.io/library/busybox:latest")
+			.stdout_null()
+			.run()
+			.unwrap();
+
+		let mut scope = Scope::standalone();
+		let cfg = SigningConfig { key: key.to_str().unwrap().into() };
+		let refs = [TAG.to_owned(), CHANNEL.to_owned()];
+		let pushed = crate::jobs::upgrade::push_multiarch_list(LIST, &refs, Some(&cfg), &mut scope);
+		let _ = duct::cmd!("podman", "manifest", "rm", LIST)
+			.stdout_null()
+			.stderr_null()
+			.unchecked()
+			.run();
+		assert!(pushed.expect("push_multiarch_list failed"), "signing should be enforced");
+
+		for r in [TAG, CHANNEL] {
+			let v = verify(r, &pubk, false, &scope);
+			assert!(v.is_ok(), "{r} should carry the first push's signature: {v:?}");
+		}
+	}
 }

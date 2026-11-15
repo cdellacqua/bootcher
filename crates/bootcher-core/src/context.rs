@@ -20,6 +20,56 @@ pub const MANIFEST: &str = "bootcher.toml";
 /// against `:latest` before channels existed — stay on their channel untouched.
 pub const DEFAULT_CHANNEL: &str = "latest";
 
+/// Tag-name prefixes `deploy --tag` refuses: `ci-` is the scratch-tag namespace CI
+/// pipelines use for per-arch intermediates, and `sha256-` is where sigstore
+/// signature attachments live in the same repository.
+const RESERVED_TAG_PREFIXES: &[&str] = &["ci-", "sha256-"];
+
+/// Check `name` against the OCI distribution spec's tag grammar,
+/// `[A-Za-z0-9_][A-Za-z0-9._-]{0,127}`: at most 128 characters, made of ASCII
+/// letters, digits, `_`, `.` and `-`, and not starting with `.` or `-`.
+///
+/// # Errors
+///
+/// Returns an error describing which rule `name` breaks.
+pub fn validate_tag_name(name: &str) -> Result<()> {
+	let Some(first) = name.chars().next() else { bail!("a tag can't be empty") };
+	if name.len() > 128 {
+		bail!("a tag is at most 128 characters, this one is {}", name.len());
+	}
+	if !(first.is_ascii_alphanumeric() || first == '_') {
+		bail!("a tag must start with an ASCII letter, digit or `_`, not `{first}`");
+	}
+	if let Some(bad) =
+		name.chars().find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')))
+	{
+		bail!("a tag may only contain ASCII letters, digits, `_`, `.` and `-`, not `{bad}`");
+	}
+	Ok(())
+}
+
+/// What one registry-mode `deploy` publishes, resolved from its `--tag` and
+/// `--channel` flags by [`Manifest::resolve_publish`]: a fixed build name, a
+/// channel, or both. At least one is always set. When both are, the tag is pushed
+/// first and the channel moves onto the same digest only after it has landed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Publish {
+	/// The `--tag` name, if any: a fixed name for this one build.
+	pub tag: Option<String>,
+	/// The channel to move onto the build, if any. `None` only with a `tag`, in which
+	/// case no channel moves and devices aren't upgraded.
+	pub channel: Option<String>,
+}
+
+impl Publish {
+	/// The tags to push, in push order: the build tag first, then the channel. The
+	/// first is the one the push signs.
+	#[must_use]
+	pub fn tags(&self) -> Vec<&str> {
+		self.tag.iter().chain(self.channel.iter()).map(String::as_str).collect()
+	}
+}
+
 /// Directory `bootcher init` writes the generated JSON Schemas into (the manifest
 /// schema [`SCHEMA`] and the hook-metadata schema), keeping them out of the
 /// project root. Relative to the project root.
@@ -807,9 +857,9 @@ pub struct DeployConfig {
 	/// Named release channels this project publishes, beyond the implicit
 	/// [`DEFAULT_CHANNEL`] (`latest`) every project always has. Each is a mutable
 	/// registry tag a subset of devices tracks (`<registry>/<name>:<channel>`),
-	/// pushed in place of `:latest` by a `--channel <name>` deploy; the immutable
-	/// `:CalVer` tag for the same digest is shared across channels, so a channel is
-	/// a *pointer*, not a separate identity (see [`Manifest::registry_version_ref`]).
+	/// pushed in place of `:latest` by a `--channel <name>` deploy. A channel is a
+	/// *pointer* that moves between builds; a durable name for one build is the
+	/// separate `deploy --tag <name>` (see [`Manifest::resolve_publish`]).
 	///
 	/// Declaring them is opt-in and serves two purposes: it validates `--channel`
 	/// against a known set (a typo'd `--channel nightyl` is rejected rather than
@@ -1173,7 +1223,52 @@ impl Manifest {
 				declared.join(", ")
 			);
 		}
+		validate_tag_name(channel)
+			.with_context(|| format!("`[deploy] channels` entry `{channel}` isn't a usable tag"))?;
 		Ok(channel.to_owned())
+	}
+
+	/// Resolve what a `deploy` publishes from its `--tag` and `--channel` flags.
+	///
+	/// Without `--tag` this is just [`Self::resolve_channel`]: the run publishes to one
+	/// channel (`latest` by default), as it always has. With `--tag <name>` the build is
+	/// pushed under that fixed name, and additionally moved onto a channel only when
+	/// `--channel` is also given. A tag name must be a valid OCI tag and must not
+	/// collide with the tags bootcher or its CI recipes manage themselves: `latest`, a
+	/// declared channel, the `ci-` scratch prefix, or the `sha256-` prefix signature
+	/// attachments are stored under. Tags are registry-only: LAN mode has nowhere to
+	/// keep a named build, so `--tag` without `[deploy] registry` is an error.
+	///
+	/// # Errors
+	///
+	/// Returns an error if `--tag` is given in LAN mode or names an invalid or
+	/// reserved tag, or if the channel fails [`Self::resolve_channel`].
+	pub fn resolve_publish(&self, tag: Option<&str>, channel: Option<&str>) -> Result<Publish> {
+		let Some(tag) = tag else {
+			return Ok(Publish { tag: None, channel: Some(self.resolve_channel(channel)?) });
+		};
+		if self.registry().is_none() {
+			bail!(
+				"`--tag {tag}` needs a registry: a tag names a build in a registry, and LAN \
+				 deploys have none. Set `[deploy] registry` to publish tagged builds."
+			);
+		}
+		validate_tag_name(tag).with_context(|| format!("`--tag {tag}` isn't a valid tag"))?;
+		let declared = self.declared_channels();
+		if declared.contains(&tag) {
+			bail!(
+				"`--tag {tag}` names a channel; channels move between builds, so a tag can't \
+				 reuse one. Pick another name, or use `--channel {tag}` to publish to it."
+			);
+		}
+		if let Some(prefix) = RESERVED_TAG_PREFIXES.iter().find(|p| tag.starts_with(**p)) {
+			bail!(
+				"`--tag {tag}` starts with `{prefix}`, which is reserved (`ci-` for CI scratch \
+				 tags, `sha256-` for signature attachments). Pick another name."
+			);
+		}
+		let channel = channel.map(|c| self.resolve_channel(Some(c))).transpose()?;
+		Ok(Publish { tag: Some(tag.to_owned()), channel })
 	}
 
 	/// Suffix-free **local** manifest-list ref (`localhost/<name>:latest`) — the
@@ -1185,18 +1280,6 @@ impl Manifest {
 	#[must_use]
 	pub fn local_list_ref(&self) -> String {
 		format!("localhost/{}:latest", self.general.name)
-	}
-
-	/// Fully-qualified registry reference for an immutable `CalVer` tag
-	/// (`<namespace>/<name>:<version>`), or `None` when no registry is configured.
-	/// Pushed alongside [`Self::registry_list_ref`] in registry mode: the mutable
-	/// `:latest` is the channel devices track, while this version tag is a durable,
-	/// human-readable handle for the same manifest digest — a stable anchor for
-	/// rollback/audit that a registry GC pass won't reap (an untagged digest can be).
-	/// `version` comes from [`calver_now`].
-	#[must_use]
-	pub fn registry_version_ref(&self, version: &str) -> Option<String> {
-		self.registry().map(|ns| format!("{ns}/{}:{version}", self.general.name))
 	}
 
 	/// One [`ImageRef`] per target arch in `[targets]`. The container/registry
@@ -1461,25 +1544,6 @@ impl DiskTarget {
 	}
 }
 
-/// The current UTC instant as a `CalVer` tag. With a git `short_sha` it reads
-/// `YYYYMMDD.HHMMSS.g<short-sha>` (e.g. `20260113.123304.g0a1b2c3d4e5f`); without one
-/// (no git) it falls back to `YYYYMMDD.HHMMSS` (e.g. `20260113.123304`).
-///
-/// The commit suffix is what makes the tag a *stable identity* rather than a mere
-/// clock reading: it pins the exact source the image was built from. Second
-/// resolution is the collision floor: two deploys minting a tag within the same
-/// second (of the same commit, or of anything without git) would share it, and the
-/// later push would repoint it. Possible in theory, negligible in practice.
-/// UTC throughout so tags from different machines sort and compare unambiguously.
-#[must_use]
-pub fn calver_now(short_sha: Option<&str>) -> String {
-	let now = jiff::Timestamp::now();
-	match short_sha {
-		Some(sha) => format!("{}.g{sha}", now.strftime("%Y%m%d.%H%M%S")),
-		None => now.strftime("%Y%m%d.%H%M%S").to_string(),
-	}
-}
-
 /// Git provenance for the project tree at `dir` (the build context / project
 /// root): the commit a build came from and a human-readable description of it.
 /// Stamped onto the built container as the standard OCI `org.opencontainers.image.*`
@@ -1564,23 +1628,6 @@ impl GitProvenance {
 			format!("warning: git provenance unavailable ({reason}); {consequence}")
 		});
 		(Self { revision, version }, warning)
-	}
-
-	/// The abbreviated commit for use as the `CalVer` tag suffix (see [`calver_now`]):
-	/// the first 12 hex chars of [`Self::revision`], with its `-dirty` marker preserved
-	/// (so a tag built from an uncommitted tree can't masquerade as the clean commit).
-	/// `None` when there's no revision — i.e. no git — which is exactly when
-	/// [`calver_now`] drops back to its timestamp-only form.
-	#[must_use]
-	pub fn short_sha(&self) -> Option<String> {
-		self.revision.as_deref().map(|rev| {
-			let (sha, dirty) = match rev.strip_suffix("-dirty") {
-				Some(clean) => (clean, "-dirty"),
-				None => (rev, ""),
-			};
-			let short: String = sha.chars().take(12).collect();
-			format!("{short}{dirty}")
-		})
 	}
 
 	/// The provenance as ready-to-splice `podman build` argv tokens: for each field
@@ -1933,17 +1980,12 @@ mod tests {
 			m.registry_list_ref("stable").as_deref(),
 			Some("reg.example.com/org/kiosk:stable")
 		);
-		assert_eq!(
-			m.registry_version_ref("20260113.123304").as_deref(),
-			Some("reg.example.com/org/kiosk:20260113.123304")
-		);
 	}
 
 	#[test]
-	fn registry_version_ref_is_none_without_registry() {
+	fn registry_list_ref_is_none_without_registry() {
 		let m = parse("[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n");
 		assert!(m.registry_list_ref(DEFAULT_CHANNEL).is_none());
-		assert!(m.registry_version_ref("20260113.123304").is_none());
 	}
 
 	#[test]
@@ -1961,49 +2003,66 @@ mod tests {
 	}
 
 	#[test]
+	fn validate_tag_name_follows_the_oci_grammar() {
+		for ok in ["1", "v1.2.3", "_x", "build-42", "A.b_C-d", &"a".repeat(128)] {
+			assert!(validate_tag_name(ok).is_ok(), "{ok} should be valid");
+		}
+		for bad in ["", ".x", "-x", "a/b", "a:b", "a+b", "é", &"a".repeat(129)] {
+			assert!(validate_tag_name(bad).is_err(), "{bad} should be invalid");
+		}
+	}
+
+	fn channels_manifest() -> Manifest {
+		parse(
+			"[general]\nname = \"kiosk\"\n[targets]\nx86_64 = \"qcow2\"\n\
+			 [deploy]\nregistry = \"reg.example.com/org\"\nchannels = [\"stable\"]\n",
+		)
+	}
+
+	#[test]
+	fn resolve_publish_flag_combinations() {
+		let m = channels_manifest();
+		let p = |tag: Option<&str>, channel: Option<&str>| m.resolve_publish(tag, channel).unwrap();
+		// No flags: today's default-channel deploy.
+		assert_eq!(p(None, None), Publish { tag: None, channel: Some("latest".into()) });
+		assert_eq!(p(None, None).tags(), ["latest"]);
+		assert_eq!(p(None, Some("stable")).tags(), ["stable"]);
+		// `--tag` alone moves no channel.
+		assert_eq!(p(Some("42"), None), Publish { tag: Some("42".into()), channel: None });
+		assert_eq!(p(Some("42"), None).tags(), ["42"]);
+		// `--tag` + `--channel`: the tag is pushed first.
+		assert_eq!(p(Some("42"), Some("stable")).tags(), ["42", "stable"]);
+		assert_eq!(p(Some("42"), Some("latest")).tags(), ["42", "latest"]);
+		// The channel is still validated alongside a tag.
+		assert!(m.resolve_publish(Some("42"), Some("nightly")).is_err());
+	}
+
+	#[test]
+	fn resolve_publish_rejects_reserved_and_invalid_tags() {
+		let m = channels_manifest();
+		for bad in ["latest", "stable", "ci-x86_64", "sha256-abc.sig", "-x", "a/b"] {
+			assert!(m.resolve_publish(Some(bad), None).is_err(), "{bad} should be rejected");
+		}
+		// Only the exact prefixes are reserved.
+		assert!(m.resolve_publish(Some("cix"), None).is_ok());
+		assert!(m.resolve_publish(Some("sha256"), None).is_ok());
+	}
+
+	#[test]
+	fn resolve_publish_rejects_a_tag_in_lan_mode() {
+		let m = parse("[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n");
+		let err = m.resolve_publish(Some("42"), None).unwrap_err();
+		assert!(format!("{err:#}").contains("needs a registry"), "{err:#}");
+		// Without `--tag`, LAN mode still deploys the default channel.
+		assert_eq!(m.resolve_publish(None, None).unwrap().tags(), ["latest"]);
+	}
+
+	#[test]
 	fn resolve_channel_rejects_non_default_without_registry() {
 		let m = parse("[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n");
 		// `latest` is always fine; any other channel needs a registry.
 		assert_eq!(m.resolve_channel(None).unwrap(), DEFAULT_CHANNEL);
 		assert!(m.resolve_channel(Some("stable")).is_err());
-	}
-
-	#[test]
-	fn calver_now_without_git_is_timestamp_only() {
-		// `YYYYMMDD.HHMMSS`: 8 digits, dot, 6 digits — all numeric.
-		let v = calver_now(None);
-		let (date, time) = v.split_once('.').expect("a dot after the date");
-		assert_eq!(date.len(), 8, "date is YYYYMMDD: {v}");
-		assert_eq!(time.len(), 6, "time is HHMMSS: {v}");
-		assert!(date.chars().chain(time.chars()).all(|c| c.is_ascii_digit()), "numeric: {v}");
-	}
-
-	#[test]
-	fn calver_now_with_git_appends_commit_suffix() {
-		// `YYYYMMDD.HHMMSS.g<short-sha>`: time to the second in one field, commit suffixed.
-		let v = calver_now(Some("0a1b2c3d4e5f"));
-		let (date, rest) = v.split_once('.').expect("a dot after the date");
-		let (hhmmss, sha) = rest.split_once('.').expect("a dot before the commit suffix");
-		assert_eq!(date.len(), 8, "date is YYYYMMDD: {v}");
-		assert_eq!(hhmmss.len(), 6, "time is HHMMSS: {v}");
-		assert!(hhmmss.chars().all(|c| c.is_ascii_digit()), "time is numeric: {v}");
-		assert_eq!(sha, "g0a1b2c3d4e5f", "commit suffix is g-prefixed: {v}");
-	}
-
-	#[test]
-	fn short_sha_truncates_and_keeps_dirty_marker() {
-		let clean =
-			GitProvenance { revision: Some("0a1b2c3d4e5f6a7b8c9d".to_owned()), version: None };
-		assert_eq!(clean.short_sha().as_deref(), Some("0a1b2c3d4e5f"));
-
-		let dirty = GitProvenance {
-			revision: Some("0a1b2c3d4e5f6a7b8c9d-dirty".to_owned()),
-			version: None,
-		};
-		assert_eq!(dirty.short_sha().as_deref(), Some("0a1b2c3d4e5f-dirty"));
-
-		let none = GitProvenance::default();
-		assert_eq!(none.short_sha(), None);
 	}
 
 	/// Run `git -C dir <args>` in a test, asserting it succeeds — the setup half of

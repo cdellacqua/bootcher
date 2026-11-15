@@ -1,4 +1,4 @@
-use crate::context::Manifest;
+use crate::context::{Manifest, Publish};
 use crate::{jobs, progress};
 use anyhow::Result;
 
@@ -22,6 +22,9 @@ use anyhow::Result;
 /// here from a job artifact — the deploy job being the only one that needs registry
 /// push credentials and the signing key.
 ///
+/// `publish` is what the push publishes (`--tag` and/or `--channel`, see
+/// [`Manifest::resolve_publish`]).
+///
 /// # Errors
 ///
 /// Returns an error if the build or upgrade phase fails.
@@ -29,7 +32,7 @@ pub fn run(
 	manifest: &Manifest,
 	skip_bootc_upgrade: bool,
 	skip_build: bool,
-	channel: &str,
+	publish: &Publish,
 ) -> Result<()> {
 	if skip_build {
 		let mut job = progress::Scope::standalone();
@@ -45,14 +48,14 @@ pub fn run(
 			&manifest.local_list_ref(),
 			&mut job.child("manifest list"),
 		)?;
-		return jobs::upgrade::run(manifest, skip_bootc_upgrade, channel, &mut job);
+		return jobs::upgrade::run(manifest, skip_bootc_upgrade, publish, &mut job);
 	}
 	let mut b = progress::Scope::root("deploy", Some(2));
 	// `deploy` publishes the whole multi-arch image, never a single-arch subset, so the
 	// build is unscoped (`None`) — every arch, list assembled. Splitting the build per
 	// arch is a separate-job concern (`build --target` + `deploy --skip-build`).
 	jobs::build::run(manifest, None, &mut b.child("build"))?;
-	jobs::upgrade::run(manifest, skip_bootc_upgrade, channel, &mut b.child("upgrade"))
+	jobs::upgrade::run(manifest, skip_bootc_upgrade, publish, &mut b.child("upgrade"))
 }
 
 /// Check the external tools `deploy` needs — its two phases in order (`build` then
@@ -63,9 +66,14 @@ pub fn run(
 /// # Errors
 ///
 /// Returns an error listing every missing prerequisite.
-pub fn preflight(manifest: &Manifest, skip_bootc_upgrade: bool, skip_build: bool) -> Result<()> {
+pub fn preflight(
+	manifest: &Manifest,
+	skip_bootc_upgrade: bool,
+	skip_build: bool,
+	publish: &Publish,
+) -> Result<()> {
 	if !skip_build {
 		jobs::build::preflight(manifest, None)?;
 	}
-	jobs::upgrade::preflight(manifest, skip_bootc_upgrade)
+	jobs::upgrade::preflight(manifest, skip_bootc_upgrade, publish)
 }

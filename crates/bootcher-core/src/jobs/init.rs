@@ -152,9 +152,10 @@ const CHANNELS_EXAMPLE: &str = "\
 # subset of devices tracks (<registry>/<name>:<channel>): `deploy --channel stable`
 # pushes the image under :stable instead of :latest, and `provision`/`takeover
 # --channel stable` point a device's bootc origin at it so it follows that channel.
-# The immutable :CalVer tag is shared across channels — a channel is just *which*
-# subscribers see a build, not a separate identity. Declaring them here validates
-# `--channel` against the set (a typo is rejected, not silently published).
+# A channel is just *which* subscribers see a build, not a separate identity: a
+# fixed name for one build comes from `deploy --tag <name>`, which a channel can
+# later be moved onto. Declaring them here validates `--channel` against the set
+# (a typo is rejected, not silently published).
 #
 # [deploy]
 # channels = [\"stable\", \"next\", \"testing\"]
