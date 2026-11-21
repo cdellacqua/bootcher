@@ -1,5 +1,5 @@
 use crate::builder::Builder;
-use crate::context::{Arch, DiskTarget, DiskType, Manifest};
+use crate::context::{Arch, DiskTarget, DiskType, ImageRef, Manifest};
 use crate::hooks::{DiskTargetMeta, HookMetadata, Phase, Stage};
 use crate::preflight::{self, Checks};
 use crate::progress::Scope;
@@ -39,13 +39,17 @@ pub(crate) fn preflight(manifest: &Manifest, target: Option<Arch>) -> Result<()>
 	checks.finish()
 }
 
-/// Build the run's disk image(s) with `image-builder`, in parallel — for
-/// `provision` (build then disk). `target`/`disks` are the run's [`Manifest`]
-/// selection (threaded from the CLI, the manifest itself untouched): `target` `None`
-/// fans out over every arch in `[targets]`, `Some(arch)` over just that one
-/// ([`Manifest::images_for`]); an empty `disks` builds each arch's full type list,
-/// else only the listed types ([`Manifest::disks_for`]). So `provision --target
-/// aarch64 --disk qcow2` builds exactly one disk.
+/// Build the run's disk image(s) with `image-builder`, in parallel — for `device
+/// provision`. `images` are the arch members to render (already in local storage
+/// under their [`ImageRef::tag`]: `latest-<arch>` for a direct provision,
+/// `pull-<channel>-<arch>` for a channel one); an empty `disks` builds each arch's
+/// full type list, else only the listed types ([`Manifest::disks_for`]). So
+/// `device provision --target aarch64 --disk qcow2` builds exactly one disk.
+///
+/// `source_ref` is the ref every disk records as its bootc origin — what the
+/// installed system's `bootc upgrade` follows: the channel ref
+/// (`<registry>/<name>:<channel>`) for a channel device, `localhost/<name>:latest`
+/// for a direct one (which `device deploy` re-pins to containers-storage).
 ///
 /// Each arch runs on its own worker (see [`crate::fleet::for_each`]): it selects
 /// (and, for a `vm` spec, boots) *its* image builder — the `[builder.<arch>]
@@ -72,20 +76,13 @@ pub(crate) fn preflight(manifest: &Manifest, target: Option<Arch>) -> Result<()>
 /// Returns an error if any arch's disk build fails, a hook fails, or a signal interrupts.
 pub(crate) fn run(
 	manifest: &Manifest,
-	target: Option<Arch>,
+	images: &[ImageRef],
 	disks: &[DiskType],
 	config: Option<&str>,
-	channel: &str,
+	source_ref: &str,
 	job: &mut Scope,
 ) -> Result<()> {
-	let images = manifest.images_for(target);
 	let hooks = manifest.hooks();
-	// Project-level (arch-independent) refs the image-builder source ref each arch
-	// records as its bootc origin derives from (see `run_one`): the registry list ref
-	// for this run's channel (`Some` only in registry mode) takes precedence over the
-	// local list ref.
-	let registry_ref = manifest.registry_list_ref(channel);
-	let local_list_ref = manifest.local_list_ref();
 	warn_if_signing_unenforced(manifest, job);
 
 	// The whole (arch × disk_type) build matrix, the unit `BOOTCHER_METADATA.targets`
@@ -101,21 +98,16 @@ pub(crate) fn run(
 				.map(|disk_type| DiskTarget { image: image.clone(), disk_type })
 		})
 		.collect();
-	let provenance = crate::context::GitProvenance::detect(std::path::Path::new("."), job);
-	let mut meta = HookMetadata {
-		phase: Phase::Disk,
-		stage: Stage::Pre,
-		image_name: manifest.general.name.clone(),
-		arches: images.iter().map(|i| i.arch).collect(),
-		image_ref: registry_ref.clone().unwrap_or_else(|| local_list_ref.clone()),
-		revision: provenance.revision,
-		version: provenance.version,
-		output_dir: Some(PathBuf::from("output")),
-		targets: Some(target_meta(&targets, false)),
-		remotes: None,
-		credential: None,
-		results: None,
-	};
+	let mut meta = HookMetadata::new(manifest, Phase::Disk, source_ref);
+	meta.arches = images.iter().map(|i| i.arch).collect();
+	// The local tree's provenance describes the disk only when it was built here.
+	if source_ref == manifest.local_list_ref() {
+		let provenance = crate::context::GitProvenance::detect(manifest.root(), job);
+		meta.revision = provenance.revision;
+		meta.version = provenance.version;
+	}
+	meta.output_dir = Some(PathBuf::from("output"));
+	meta.targets = Some(target_meta(&targets, false));
 	crate::hooks::run(&meta, hooks.disk.pre.as_deref(), job)?;
 
 	// If any arch's disk is built in-process, that arch's image-builder does privileged work
@@ -132,7 +124,7 @@ pub(crate) fn run(
 		.transpose()?;
 
 	crate::fleet::for_each(
-		&images,
+		images,
 		"arch",
 		"disk",
 		|i| i.arch.to_string(),
@@ -149,14 +141,7 @@ pub(crate) fn run(
 			// `work` (never header steps), so the worker's arch header stays put above them.
 			for disk_type in manifest.disks_for(image.arch, disks) {
 				let target = DiskTarget { image: image.clone(), disk_type };
-				run_one(
-					&target,
-					registry_ref.as_deref(),
-					&local_list_ref,
-					builder.as_ref(),
-					config,
-					work,
-				)?;
+				run_one(&target, source_ref, builder.as_ref(), config, work)?;
 			}
 			Ok(())
 		},
@@ -197,26 +182,27 @@ fn resolve_disk_file(dir: &Path) -> Option<PathBuf> {
 	matches.next().is_none().then_some(first)
 }
 
-/// Warn (don't fail) when signing is configured (via `[deploy] registry`) but the
-/// build context ships no bootc install config enabling `enforce-container-sigpolicy`.
-/// Without it a freshly provisioned device won't record a verifying origin and so won't
-/// enforce signatures until its first `deploy` switches the scheme — a real gap worth
-/// flagging loudly, but not fatal (the deploy path still enforces). `bootcher init`
-/// with signing bakes the file; this catches a project that enabled signing afterward.
+/// Warn (don't fail) when signing is configured (`[registry] key`) but the build
+/// context ships no bootc install config enabling `enforce-container-sigpolicy`.
+/// Without it a freshly provisioned channel device won't record a verifying origin
+/// until its first channel device step switches it with
+/// `--enforce-container-sigpolicy`. `bootcher signing enroll` bakes the file; this
+/// catches a project that removed it.
 fn warn_if_signing_unenforced(manifest: &Manifest, job: &Scope) {
 	if manifest.signing().is_none() {
 		return;
 	}
-	let dir = std::path::Path::new("sysroot/usr/lib/bootc/install");
+	let dir = manifest.root().join("sysroot/usr/lib/bootc/install");
 	let enforced = fs::read_dir(dir).into_iter().flatten().flatten().any(|e| {
 		fs::read_to_string(e.path()).is_ok_and(|s| s.contains("enforce-container-sigpolicy"))
 	});
 	if !enforced {
 		job.println(
-			"warning: signing is configured in `[deploy] registry` but no bootc install config \
-			 enables enforce-container-sigpolicy — a freshly provisioned device won't enforce \
-			 signatures until its first `deploy`. Add sysroot/usr/lib/bootc/install/\
-			 30-bootcher-signing.toml with `[install]\\nenforce-container-sigpolicy = true`.",
+			"warning: signing is configured (`[registry] key`) but no bootc install config \
+			 enables enforce-container-sigpolicy — a freshly provisioned channel device won't \
+			 enforce signatures until its first channel device step. Add \
+			 sysroot/usr/lib/bootc/install/30-bootcher-signing.toml with \
+			 `[install]\\nenforce-container-sigpolicy = true`.",
 		);
 	}
 }
@@ -231,8 +217,7 @@ fn warn_if_signing_unenforced(manifest: &Manifest, job: &Scope) {
 /// Returns an error if the `image-builder` command fails.
 pub(crate) fn run_one(
 	target: &DiskTarget,
-	registry_ref: Option<&str>,
-	local_list_ref: &str,
+	source_ref: &str,
 	builder: &dyn Builder,
 	config: Option<&str>,
 	job: &mut Scope,
@@ -241,22 +226,11 @@ pub(crate) fn run_one(
 	fs::create_dir_all(&output)?;
 
 	// The image ref image-builder builds from becomes the installed system's bootc
-	// deployment origin — i.e. what `bootc upgrade` (and the auto-update timer)
-	// pulls from. It's the **suffix-free** ref in both modes, so a single origin
-	// resolves to the device's own arch out of the multi-arch image. In registry
-	// mode that's the registry manifest-list ref, so a freshly provisioned device
-	// fetches updates straight from the registry (authenticated by the baked
-	// /etc/ostree/auth.json), no first deploy required. In LAN mode it's the
-	// localhost list ref, which `deploy` re-pins to containers-storage on each
-	// push. The builder tags the per-arch member as this ref in its (root) storage
-	// just long enough for image-builder to record it — no manifest list is needed there.
-	//
-	// `registry_ref` is `Some(...)` in registry mode, `None` for LAN — the build
-	// source ref is the registry list ref when set, else the project's localhost list
-	// ref. Both are project-level (arch-independent), passed in from the manifest.
-	let source_ref = registry_ref.unwrap_or(local_list_ref).to_owned();
-
-	builder.build_disk(target, &source_ref, config, job)
+	// deployment origin — what `bootc upgrade` (and the auto-update timer) pulls
+	// from. It's **suffix-free**, so one origin resolves to the device's own arch out
+	// of the multi-arch image. The builder tags the per-arch member as this ref in its
+	// (root) storage just long enough for image-builder to record it.
+	builder.build_disk(target, source_ref, config, job)
 }
 
 #[cfg(test)]

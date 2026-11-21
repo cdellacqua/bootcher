@@ -45,6 +45,13 @@ impl Builder for LocalBuilder {
 		// does with `ssh_opts` — a plain `&[String]` → argv map needs no helper. (The
 		// shell-string sites can't do this; they use `podman::opts_shell` to re-quote.)
 		args.extend(self.podman_opts.iter().map(OsString::from));
+		// `--pull=newer`: a user-facing build never silently reuses a cached base, so a
+		// base patch published since the last build is picked up (the refreshes rely on
+		// it). `--no-cache` on a forced refresh drops every cached layer too.
+		args.push("--pull=newer".into());
+		if image.no_cache {
+			args.push("--no-cache".into());
+		}
 		#[rustfmt::skip]
 		args.extend::<[OsString; 8]>([
 			"--os".into(), "linux".into(), "--arch".into(), image.arch.oci_arch().into(),

@@ -4,8 +4,8 @@
 //! script or CI pipeline can read a single fact (`{{ .Image }}`, `{{ .Name }}`)
 //! without re-parsing `bootcher.toml`.
 //!
-//! The document is built from the manifest *after* its `extend` chain is merged and
-//! the inline-table `[deploy] registry` form is resolved, so the fields it exposes —
+//! The document is built from the manifest *after* its `extend` chain is merged, so
+//! the fields it exposes —
 //! notably [`Info::image`], the suffix-free `<registry>/<name>` ref — are the same
 //! values the pipeline itself computes, not a shell re-derivation that can drift.
 
@@ -27,19 +27,18 @@ pub struct Info {
 	/// Image/project name (`[general] name`) — the `<name>` in every image ref and
 	/// the GHCR/GitLab package name.
 	pub name: String,
-	/// `"registry"` when `[deploy] registry` is set (devices self-update from a
-	/// registry), else `"lan"` (the image is tunnelled over ssh; no registry refs).
-	pub mode: &'static str,
-	/// Registry namespace (`<registry>`), or `null` in LAN mode.
+	/// Registry namespace (`[registry] url`), or `null` without a registry.
 	pub registry: Option<String>,
-	/// Suffix-free fully-qualified image ref (`<registry>/<name>`), or `null` in LAN
-	/// mode — what a pipeline appends `:latest` / `:ci-<arch>` / a `CalVer` tag to.
+	/// Suffix-free fully-qualified image ref (`<registry>/<name>`), or `null` without
+	/// a registry — what a pipeline appends a release, a channel or `:ci-<sha>-<arch>` to.
 	pub image: Option<String>,
 	/// Local manifest-list ref (`localhost/<name>:latest`) the build assembles.
 	pub local_image: String,
-	/// Declared release channels, `latest` first.
+	/// Declared release channels (`[registry] channels`; empty without a registry).
 	pub channels: Vec<String>,
-	/// Whether image signing is configured (the `[deploy] registry` inline-table form).
+	/// The configured device destinations (`remotes`).
+	pub remotes: Vec<String>,
+	/// Whether image signing is configured (`[registry] key`).
 	pub signing: bool,
 	/// Target arches, `x86_64` before `aarch64`.
 	pub arches: Vec<String>,
@@ -58,11 +57,11 @@ impl Info {
 			.collect();
 		Info {
 			name: m.general.name.clone(),
-			mode: if m.registry().is_some() { "registry" } else { "lan" },
-			registry: m.registry().map(ToOwned::to_owned),
-			image: m.registry().map(|ns| format!("{ns}/{}", m.general.name)),
+			registry: m.registry().map(|r| r.url.clone()),
+			image: m.repo(),
 			local_image: m.local_list_ref(),
-			channels: m.declared_channels().iter().map(|s| (*s).to_owned()).collect(),
+			channels: m.channels().to_vec(),
+			remotes: m.remotes().iter().map(|r| r.dest().to_owned()).collect(),
 			signing: m.signing().is_some(),
 			arches: arches.iter().map(ToString::to_string).collect(),
 			targets,
@@ -98,7 +97,7 @@ pub fn render(info: &Info, format: Option<&str>) -> Result<String> {
 /// `null` as the empty string); an array/object renders as compact JSON. An unknown
 /// field or unsupported action is an error rather than a silent blank, so a
 /// misspelled `--format` fails loudly in a pipeline instead of yielding "".
-fn render_template(tmpl: &str, root: &Value) -> Result<String> {
+pub(crate) fn render_template(tmpl: &str, root: &Value) -> Result<String> {
 	let mut out = String::new();
 	let mut rest = tmpl;
 	while let Some(open) = rest.find("{{") {
@@ -168,11 +167,11 @@ mod tests {
 	fn sample() -> Value {
 		serde_json::json!({
 			"name": "kiosk",
-			"mode": "registry",
 			"registry": "ghcr.io/acme",
 			"image": "ghcr.io/acme/kiosk",
 			"localImage": "localhost/kiosk:latest",
-			"channels": ["latest", "stable"],
+			"channels": ["stable"],
+			"remotes": ["admin@kiosk-1"],
 			"signing": false,
 			"arches": ["x86_64", "aarch64"],
 			"targets": { "x86_64": ["qcow2"], "aarch64": ["raw"] },

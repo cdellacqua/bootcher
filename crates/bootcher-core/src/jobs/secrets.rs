@@ -10,12 +10,13 @@
 
 use crate::context::{
 	DEVICE_ADMIN_AUTHORIZED_KEYS, DEVICE_AUTH_JSON, DEVICE_COSIGN_PUBKEY_DIR, DEVICE_POLICY_JSON,
-	DEVICE_REGISTRIES_D, Manifest, SigningConfig,
+	DEVICE_REGISTRIES_D, Manifest,
 };
+use crate::interactive::Prompted;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use serde::Serialize;
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -26,71 +27,56 @@ use std::process::{Command, Stdio};
 const ENV_PULL_USER: &str = "BOOTCHER_PULL_USER";
 const ENV_PULL_TOKEN: &str = "BOOTCHER_PULL_TOKEN";
 
+/// How a freshly installed device is set up to receive updates, which decides
+/// what [`Provisioning`] collects.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InstallMode {
+	/// Follow a registry channel: bake a pull credential (unless `anonymous`, for a
+	/// public registry; verified from here unless `skip_pull_check`) and, with
+	/// signing on, the trust files.
+	Channel {
+		/// The declared channel the device follows.
+		channel: String,
+		/// The registry is public: bake no pull credential.
+		anonymous: bool,
+		/// Don't verify the pull credential from this machine.
+		skip_pull_check: bool,
+	},
+	/// Updated over SSH by `device deploy`: no pull credential and no trust files
+	/// (a direct device's trust is the SSH channel; S1 showed the install needs none
+	/// even in a signing project).
+	Direct,
+}
+
 /// The files to inject into a freshly provisioned device's `/etc`.
 pub struct Provisioning {
 	/// Admin `authorized_keys` content (one SSH public key per line).
 	authorized_keys: String,
-	/// Registry pull secret (`auth.json` JSON), present only in registry mode.
+	/// Registry pull secret (`auth.json` JSON), for a channel device with a private
+	/// registry.
 	auth_json: Option<String>,
-	/// Signature-enforcement files, present only when signing is configured in `[deploy] registry`.
-	signing: Option<SigningFiles>,
-}
-
-/// The signing-mode device files: the cosign public key plus the rendered
-/// `policy.json` and `registries.d` config that make `bootc upgrade` require a
-/// valid signature. All three land in the device's persistent `/etc` (see
-/// [`Provisioning::blueprint`]); `rotate sign-key` later edits the policy + adds
-/// keys over ssh.
-struct SigningFiles {
-	/// Image name — the on-device public-key filename ([`device_pubkey_path`]).
-	name: String,
-	/// Cosign public-key PEM, verbatim from the project's `<key>.pub`.
-	pubkey_pem: String,
-	/// `policy.json`: `default: reject` + a `sigstoreSigned`/`keyPath` requirement
-	/// for the registry namespace.
-	policy_json: String,
-	/// `registries.d` YAML enabling `use-sigstore-attachments` for the namespace,
-	/// so the device fetches the signature alongside the image on pull.
-	registries_d: String,
+	/// Signature-enforcement files, for a channel device of a signing project.
+	trust: Option<TrustFiles>,
 }
 
 impl Provisioning {
-	/// Collect the admin SSH key (always) and, when the manifest configures a
-	/// `registry`, the pull credential (rendered to `auth.json`). `key` is a
-	/// private SSH key path (the `.pub` sibling is read for the public key content),
-	/// or `None` to discover/prompt on a TTY. `skip_pull_check` (`--skip-pull-check`)
-	/// bypasses the registry-credential verification (see `verify_pull_login`).
-	/// `anonymous` (`--anonymous`) declares the registry public: no pull credential is
-	/// collected and no `auth.json` is baked, so the device pulls anonymously. It's a
-	/// no-op in LAN mode (no registry ⇒ no credential either way).
-	///
-	/// # Panics
-	///
-	/// Panics if signing is configured but `registry` is absent (structural invariant
-	/// upheld by manifest validation).
+	/// Collect the admin SSH key (always) and, for a [`InstallMode::Channel`]
+	/// device, the pull credential (rendered to `auth.json`) and the trust files.
+	/// `key` is a private SSH key path (the `.pub` sibling is read for the public key
+	/// content), or `None` to discover/prompt on a TTY.
 	///
 	/// # Errors
 	///
 	/// Returns an error if key or credential collection fails, or registry verification fails.
-	pub fn collect(
-		manifest: &Manifest,
-		key: Option<&str>,
-		skip_pull_check: bool,
-		anonymous: bool,
-	) -> Result<Self> {
-		Ok(Self::collect_with_key(manifest, key, skip_pull_check, anonymous)?.0)
+	pub fn collect(manifest: &Manifest, key: Option<&str>, mode: &InstallMode) -> Result<Self> {
+		Ok(Self::collect_with_key(manifest, key, mode)?.0)
 	}
 
 	/// Like [`Self::collect`], but also returns the resolved admin **private** key
-	/// path. `bootcher takeover` needs it as the post-reboot `admin@host` SSH
+	/// path. `bootcher device takeover` needs it as the post-reboot `admin@host` SSH
 	/// identity (the stock cloud user is gone by then), not just the public half
 	/// baked into `authorized_keys`. The picker/discovery on a TTY (when `key` is
 	/// `None`) runs exactly once.
-	///
-	/// # Panics
-	///
-	/// Panics if signing is configured but `registry` is absent (structural invariant
-	/// upheld by manifest validation).
 	///
 	/// # Errors
 	///
@@ -98,49 +84,37 @@ impl Provisioning {
 	pub fn collect_with_key(
 		manifest: &Manifest,
 		key: Option<&str>,
-		skip_pull_check: bool,
-		anonymous: bool,
+		mode: &InstallMode,
 	) -> Result<(Self, PathBuf)> {
 		let (authorized_keys, key_path) = collect_authorized_keys(key, "--ssh-key")?;
-		let auth_json = match manifest.registry() {
-			// `--anonymous`: the registry is public, so collect no pull credential and
-			// bake no `auth.json` — the device pulls anonymously. Without it, a
-			// registry-mode provision requires a credential (env or TTY, else a hard
-			// error); the flag is the explicit opt-in that keeps that default fail-closed.
-			Some(_) if anonymous => None,
-			// `collect_pull_credential` returns `None` when the operator declares the
-			// registry public (a blank username at the TTY prompt) — same outcome as
-			// `--anonymous`: no credential, no auth.json.
-			Some(ns) => match collect_pull_credential(ns)? {
-				Some((user, token)) => {
-					// Sanity-check before this is baked into the disk: prove the credential
-					// authenticates to the registry, catching a typo'd token now rather than
-					// after a device is provisioned. Opt out with `--skip-pull-check` when the
-					// registry is known-unreachable from the build host.
-					if !skip_pull_check {
-						verify_pull_login(ns, &user, &token)?;
-					}
-					Some(render_auth_json(ns, &user, &token))
-				}
-				None => None,
-			},
-			None => None,
-		};
-		// Signing files only when `[deploy] registry` is the WithSigning form. The
-		// public key is read from the project; the policy/registries.d are rendered
-		// for the registry namespace.
-		let signing = match manifest.signing() {
-			Some(cfg) => {
-				let ns = manifest.registry().expect("signing ⇒ registry (structural)");
-				Some(SigningFiles::collect(&cfg, ns, &manifest.general.name)?)
+		let (auth_json, trust) = match mode {
+			InstallMode::Direct => (None, None),
+			InstallMode::Channel { anonymous, skip_pull_check, .. } => {
+				let reg = manifest.require_registry("a channel install")?;
+				let ns = reg.url.as_str();
+				// `--anonymous`: the registry is public, so collect no pull credential
+				// and bake no `auth.json`. Without it a credential is required (env or
+				// TTY, else a hard error); the flag keeps that default fail-closed.
+				let auth: Option<Result<String>> = if *anonymous {
+					None
+				} else {
+					collect_pull_credential(ns)?.map(|(user, token)| {
+						// Prove the credential authenticates before it's baked into a
+						// disk, unless opted out (a registry unreachable from here).
+						if !skip_pull_check {
+							verify_pull_login(ns, &user, &token)?;
+						}
+						Ok(render_auth_json(ns, &user, &token))
+					})
+				};
+				(auth.transpose()?, TrustFiles::for_manifest(manifest)?)
 			}
-			None => None,
 		};
-		Ok((Self { authorized_keys, auth_json, signing }, key_path))
+		Ok((Self { authorized_keys, auth_json, trust }, key_path))
 	}
 
 	/// The provisioning files as `(device path, octal mode, content)` triples, in a
-	/// stable order (admin key, then the registry-mode pull secret, then the three
+	/// stable order (admin key, then a channel device's pull secret, then the three
 	/// signing files when configured). The single source of truth for *what* gets
 	/// injected into a device's `/etc`, independent of *how*: [`Self::blueprint`]
 	/// wraps each into an `image-builder` `customizations.files` entry for disk
@@ -159,11 +133,9 @@ impl Provisioning {
 		if let Some(auth) = &self.auth_json {
 			files.push(DeviceFile::new(DEVICE_AUTH_JSON, "0600", auth));
 		}
-		if let Some(s) = &self.signing {
-			// The public key + policy + registries.d that turn on signature enforcement.
-			files.push(DeviceFile::new(&device_pubkey_path(&s.name), "0644", &s.pubkey_pem));
-			files.push(DeviceFile::new(DEVICE_POLICY_JSON, "0644", &s.policy_json));
-			files.push(DeviceFile::new(&device_registries_d_path(), "0644", &s.registries_d));
+		if let Some(t) = &self.trust {
+			// The public key(s) + policy + registries.d that turn on signature enforcement.
+			files.extend(t.device_files());
 		}
 		files
 	}
@@ -209,37 +181,178 @@ impl DeviceFile {
 	}
 }
 
-/// On-device path of the cosign public key the policy verifies against — the
-/// `keyPath` in [`DEVICE_POLICY_JSON`]. Named after the image so it's
-/// self-describing in `/etc/pki/containers`.
-pub(crate) fn device_pubkey_path(name: &str) -> String {
-	format!("{DEVICE_COSIGN_PUBKEY_DIR}/{name}.pub")
+/// On-device path of a trusted cosign public key: `/etc/pki/containers/<name>-<fp8>.pub`,
+/// named after the image and the key's fingerprint prefix ([`fingerprint`]) so
+/// several keys can be trusted side by side during a rotation.
+pub(crate) fn device_pubkey_path(name: &str, fp: &str) -> String {
+	format!("{DEVICE_COSIGN_PUBKEY_DIR}/{name}-{}.pub", &fp[..8.min(fp.len())])
+}
+
+/// The SHA-256 fingerprint (lowercase hex) of a PEM public key's DER body
+/// (`SubjectPublicKeyInfo`).
+///
+/// # Errors
+///
+/// Returns an error if `pem` isn't a PEM document.
+pub(crate) fn fingerprint(pem: &str) -> Result<String> {
+	use sha2::Digest;
+	let (_, der) = pem_rfc7468::decode_vec(pem.trim().as_bytes())
+		.map_err(|e| anyhow::anyhow!("not a PEM public key: {e}"))?;
+	Ok(sha2::Sha256::digest(&der).iter().fold(String::new(), |mut out, b| {
+		let _ = write!(out, "{b:02x}");
+		out
+	}))
+}
+
+/// One public key a device trusts: its on-device path and PEM.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TrustKey {
+	pub(crate) path: String,
+	pub(crate) pem: String,
+}
+
+impl TrustKey {
+	/// The trust entry for `pem` in project `name`.
+	///
+	/// # Errors
+	///
+	/// Returns an error if `pem` isn't a PEM document.
+	pub(crate) fn new(name: &str, pem: String) -> Result<Self> {
+		Ok(Self { path: device_pubkey_path(name, &fingerprint(&pem)?), pem })
+	}
+
+	/// Read the public key at `pub_path` (a project `.pub`).
+	///
+	/// # Errors
+	///
+	/// Returns an error if the file can't be read or isn't a PEM key.
+	pub(crate) fn read(name: &str, pub_path: &str) -> Result<Self> {
+		let pem = fs::read_to_string(pub_path).with_context(|| {
+			format!(
+				"reading the signing public key {pub_path} — generate a keypair with \
+				 `bootcher signing enroll`"
+			)
+		})?;
+		Self::new(name, pem)
+	}
+}
+
+/// A channel device's signature-verification files: the trusted public key(s), a
+/// `policy.json` requiring a signature from one of them for the OS image, and the
+/// `registries.d` drop-in fetching sigstore attachments. Installed into `/etc` at
+/// provision/takeover and refreshed by every channel device step (see
+/// [`Self::install_script`]).
+#[derive(Clone, Debug)]
+pub(crate) struct TrustFiles {
+	/// Image name (the key-file prefix).
+	pub(crate) name: String,
+	/// The OS image repository the policy binds (`<url>/<name>`).
+	pub(crate) repo: String,
+	/// The registry namespace the attachments drop-in covers (`<url>`).
+	pub(crate) ns: String,
+	/// The keys to install.
+	pub(crate) keys: Vec<TrustKey>,
+}
+
+impl TrustFiles {
+	/// The trust files for the manifest's configured key, or `None` without
+	/// signing.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the configured public key can't be read.
+	pub(crate) fn for_manifest(manifest: &Manifest) -> Result<Option<Self>> {
+		let (Some(signing), Some(reg)) = (manifest.signing(), manifest.registry()) else {
+			return Ok(None);
+		};
+		let name = manifest.general.name.clone();
+		let key = TrustKey::read(
+			&name,
+			&manifest.root().join(signing.public_key_path()).to_string_lossy(),
+		)?;
+		Ok(Some(Self {
+			repo: format!("{}/{name}", reg.url),
+			ns: reg.url.clone(),
+			name,
+			keys: vec![key],
+		}))
+	}
+
+	/// The static files a fresh install gets (provision blueprint, takeover inject):
+	/// each key, a policy trusting exactly them, and the attachments drop-in.
+	pub(crate) fn device_files(&self) -> Vec<DeviceFile> {
+		let mut files: Vec<DeviceFile> =
+			self.keys.iter().map(|k| DeviceFile::new(&k.path, "0644", &k.pem)).collect();
+		let paths: Vec<&str> = self.keys.iter().map(|k| k.path.as_str()).collect();
+		files.push(DeviceFile::new(
+			DEVICE_POLICY_JSON,
+			"0644",
+			&render_policy_json(&self.repo, &paths),
+		));
+		files.push(DeviceFile::new(
+			&device_registries_d_path(),
+			"0644",
+			&render_registries_d(&self.ns),
+		));
+		files
+	}
+
+	/// The device script a running device's trust files are refreshed with (piped to
+	/// `sh` over SSH). Installs [`Self::keys`] and removes the legacy unsuffixed
+	/// `<name>.pub`; with `prune`, also removes every other `<name>-<fp8>.pub`
+	/// (`signing retire`). The policy then trusts every `<name>-<fp8>.pub` left on the
+	/// device, so a routine refresh adds the current key without dropping a key a
+	/// rotation added — only `retire` narrows the set.
+	pub(crate) fn install_script(&self, prune: bool) -> String {
+		let dir = DEVICE_COSIGN_PUBKEY_DIR;
+		let name = &self.name;
+		let glob = format!("{dir}/{name}-{}.pub", "[0-9a-f]".repeat(8));
+		let mut s = String::from("set -eu\ntmp=$(mktemp); trap 'rm -f \"$tmp\"' EXIT\n");
+		for k in &self.keys {
+			let _ = write!(
+				s,
+				"cat > \"$tmp\" <<'BOOTCHER_PUB'\n{pem}BOOTCHER_PUB\nsudo install -m 0644 -D \"$tmp\" {path}\n",
+				pem = ensure_newline(&k.pem),
+				path = k.path,
+			);
+		}
+		let _ = writeln!(s, "sudo rm -f {dir}/{name}.pub");
+		if prune {
+			let keep: Vec<&str> = self.keys.iter().map(|k| k.path.as_str()).collect();
+			let _ = writeln!(
+				s,
+				"for f in {glob}; do [ -e \"$f\" ] || continue; case \"$f\" in {}) ;; *) sudo rm -f \"$f\" ;; esac; done",
+				keep.join("|")
+			);
+		}
+		let _ = write!(
+			s,
+			"paths=\nfor f in {glob}; do [ -e \"$f\" ] || continue; paths=\"$paths${{paths:+,}}\\\"$f\\\"\"; done\n\
+			 cat > \"$tmp\" <<'BOOTCHER_POL'\n{policy}BOOTCHER_POL\n\
+			 sed \"s|\\\"{PLACEHOLDER}\\\"|$paths|\" \"$tmp\" > \"$tmp.pol\"\n\
+			 sudo install -m 0644 \"$tmp.pol\" {DEVICE_POLICY_JSON}; rm -f \"$tmp.pol\"\n\
+			 cat > \"$tmp\" <<'BOOTCHER_REGD'\n{regd}BOOTCHER_REGD\n\
+			 sudo install -m 0644 -D \"$tmp\" {regd_path}\n",
+			policy = render_policy_json(&self.repo, &[PLACEHOLDER]),
+			regd = render_registries_d(&self.ns),
+			regd_path = device_registries_d_path(),
+		);
+		s
+	}
+}
+
+/// The `keyPaths` placeholder [`TrustFiles::install_script`] substitutes on the device.
+const PLACEHOLDER: &str = "__BOOTCHER_KEYPATHS__";
+
+/// `s` with a trailing newline (a heredoc body must end in one).
+fn ensure_newline(s: &str) -> String {
+	if s.ends_with('\n') { s.to_owned() } else { format!("{s}\n") }
 }
 
 /// On-device path of bootcher's `use-sigstore-attachments` drop-in. A fixed name
-/// (one project ⇒ one registry) keeps `rotate sign-key` and provision in lockstep.
+/// (one project ⇒ one registry) keeps the trust-file refresh and provision in lockstep.
 pub(crate) fn device_registries_d_path() -> String {
 	format!("{DEVICE_REGISTRIES_D}/bootcher-signing.yaml")
-}
-
-impl SigningFiles {
-	/// Read the project's cosign public key and render the device policy +
-	/// registries.d for registry namespace `ns` and image `name`.
-	fn collect(cfg: &SigningConfig, ns: &str, name: &str) -> Result<Self> {
-		let pub_path = cfg.public_key_path();
-		let pubkey_pem = fs::read_to_string(&pub_path).with_context(|| {
-			format!(
-				"reading the signing public key {pub_path} — generate a keypair with \
-				 `bootcher sign enroll`"
-			)
-		})?;
-		Ok(Self {
-			name: name.to_owned(),
-			policy_json: render_policy_json(&format!("{ns}/{name}"), &[&device_pubkey_path(name)]),
-			registries_d: render_registries_d(ns),
-			pubkey_pem,
-		})
-	}
 }
 
 /// Render the device `policy.json`: a `default: reject` baseline (so the
@@ -248,9 +361,8 @@ impl SigningFiles {
 /// permissive, regardless of any per-scope rule) plus a `sigstoreSigned`
 /// requirement pinning the OS image repository `repo` to the on-device public
 /// key(s), with `matchRepository` identity (so any tag/arch of that image
-/// verifies against the same key). A single key uses `keyPath`; several (a
-/// `rotate sign-key` transition trusting both the current and incoming key) use
-/// `keyPaths`. A `docker` transport-wide `""` scope of `insecureAcceptAnything`
+/// verifies against the same key). Always `keyPaths`, so a rotation can trust the
+/// current and the incoming key at once. A `docker` transport-wide `""` scope of `insecureAcceptAnything`
 /// (more specific than the global `default`, so it wins for everything but
 /// `repo`) lets every *other* image pull unsigned — only the OS image is bound by
 /// the signing policy, so sibling images under the same registry namespace (and
@@ -262,11 +374,7 @@ pub(crate) fn render_policy_json(repo: &str, keypaths: &[&str]) -> String {
 		"signedIdentity": { "type": "matchRepository" }
 	});
 	let obj = req.as_object_mut().expect("just built an object");
-	if let [single] = keypaths {
-		obj.insert("keyPath".into(), serde_json::json!(single));
-	} else {
-		obj.insert("keyPaths".into(), serde_json::json!(keypaths));
-	}
+	obj.insert("keyPaths".into(), serde_json::json!(keypaths));
 	let doc = serde_json::json!({
 		"default": [{ "type": "reject" }],
 		"transports": {
@@ -320,7 +428,8 @@ pub(crate) fn collect_pull_credential(ns: &str) -> Result<Option<(String, String
 		let user = inquire::Text::new(&format!(
 			"Read-only pull username for {ns} (leave blank if the registry is public):"
 		))
-		.prompt()?;
+		.prompt()
+		.prompted()?;
 		// Blank username ⇒ public registry: collect no token, bake no auth.json.
 		if user.trim().is_empty() {
 			eprintln!(
@@ -332,7 +441,8 @@ pub(crate) fn collect_pull_credential(ns: &str) -> Result<Option<(String, String
 		let token =
 			inquire::Password::new("Read-only pull token (e.g. read_registry deploy token):")
 				.without_confirmation()
-				.prompt()?;
+				.prompt()
+				.prompted()?;
 		Ok(Some((user, token)))
 	} else {
 		let user = std::env::var(ENV_PULL_USER).with_context(|| {
@@ -361,7 +471,7 @@ pub(crate) fn render_auth_json(ns: &str, user: &str, token: &str) -> String {
 
 /// Local check that a freshly collected pull credential authenticates to the
 /// registry, run up front — before provision bakes it into the disk, or before
-/// `bootcher rotate pull-token` starts its rollout — so a fat-fingered token surfaces
+/// `bootcher device rotate pull-token` starts its rollout — so a fat-fingered token surfaces
 /// immediately rather than after a device is provisioned or mid-fleet. Skipped
 /// entirely when the caller passes `--skip-pull-check`.
 ///
@@ -392,7 +502,8 @@ pub(crate) fn verify_pull_login(ns: &str, user: &str, token: &str) -> Result<()>
 		eprintln!("warning: {warning}");
 		if !inquire::Confirm::new("Continue with this credential anyway?")
 			.with_default(true)
-			.prompt()?
+			.prompt()
+			.prompted()?
 		{
 			bail!("aborted: pull credential not verified against {ns}");
 		}
@@ -500,11 +611,12 @@ fn read_input(arg: Option<&str>, flag: &str) -> Result<(String, PathBuf)> {
 fn prompt_key() -> Result<(String, PathBuf)> {
 	let candidates = discover_keys();
 	if candidates.is_empty() {
-		let path_str = inquire::Text::new("SSH key path:").prompt()?;
+		let path_str = inquire::Text::new("SSH key path:").prompt().prompted()?;
 		let pub_path = format!("{path_str}.pub");
 		if !Path::new(&pub_path).is_file() {
 			bail!("public key not found: {pub_path} — expected the .pub sibling of {path_str}");
 		}
+		eprintln!("→ pass --ssh-key {path_str} to skip this prompt");
 		return Ok((fs::read_to_string(&pub_path)?, PathBuf::from(path_str)));
 	}
 
@@ -517,15 +629,19 @@ fn prompt_key() -> Result<(String, PathBuf)> {
 		.collect();
 	options.push(KeyOption { label: "Enter path…".into(), kind: OptionKind::Path });
 
-	let chosen = inquire::Select::new("Select admin SSH key:", options).prompt()?;
+	let chosen = inquire::Select::new("Select admin SSH key:", options).prompt().prompted()?;
 	match chosen.kind {
-		OptionKind::File { key_path, pub_contents } => Ok((pub_contents, PathBuf::from(key_path))),
+		OptionKind::File { key_path, pub_contents } => {
+			eprintln!("→ pass --ssh-key {key_path} to skip this prompt");
+			Ok((pub_contents, PathBuf::from(key_path)))
+		}
 		OptionKind::Path => {
-			let path_str = inquire::Text::new("SSH key path:").prompt()?;
+			let path_str = inquire::Text::new("SSH key path:").prompt().prompted()?;
 			let pub_path = format!("{path_str}.pub");
 			if !Path::new(&pub_path).is_file() {
 				bail!("public key not found: {pub_path} — expected the .pub sibling of {path_str}");
 			}
+			eprintln!("→ pass --ssh-key {path_str} to skip this prompt");
 			Ok((fs::read_to_string(&pub_path)?, PathBuf::from(path_str)))
 		}
 	}
@@ -604,12 +720,32 @@ fn format_label(file_name: &str, line: &str) -> String {
 mod tests {
 	use super::*;
 
+	/// A fresh P-256 public key PEM.
+	fn pem() -> String {
+		use p256::elliptic_curve::Generate;
+		use p256::pkcs8::EncodePublicKey;
+		p256::SecretKey::try_generate()
+			.unwrap()
+			.public_key()
+			.to_public_key_pem(pem_rfc7468::LineEnding::LF)
+			.unwrap()
+	}
+
+	fn trust(keys: Vec<TrustKey>) -> TrustFiles {
+		TrustFiles {
+			name: "kiosk".into(),
+			repo: "reg/org/kiosk".into(),
+			ns: "reg/org".into(),
+			keys,
+		}
+	}
+
 	#[test]
-	fn blueprint_injects_authorized_keys_in_lan_mode() {
+	fn blueprint_injects_only_authorized_keys_for_a_direct_install() {
 		let p = Provisioning {
 			authorized_keys: "ssh-ed25519 AAAA test@host\n".into(),
 			auth_json: None,
-			signing: None,
+			trust: None,
 		};
 		let cfg = p.blueprint().unwrap();
 		assert!(cfg.contains("[[customizations.files]]"), "{cfg}");
@@ -619,49 +755,71 @@ mod tests {
 		// creates `/etc/ssh/authorized_keys.d`, and the osbuild non-idempotent `mkdir` would
 		// fail trying to create a dir that exists.
 		assert!(!cfg.contains("[[customizations.directories]]"), "{cfg}");
-		// LAN mode injects no pull secret.
 		assert!(!cfg.contains("/etc/ostree/auth.json"), "{cfg}");
+		assert!(!cfg.contains("policy.json"), "{cfg}");
 	}
 
 	#[test]
-	fn blueprint_includes_auth_json_in_registry_mode() {
+	fn blueprint_includes_auth_json_for_a_channel_install() {
 		let p = Provisioning {
 			authorized_keys: "k\n".into(),
 			auth_json: Some("{\"auths\":{}}\n".into()),
-			signing: None,
+			trust: None,
 		};
 		let cfg = p.blueprint().unwrap();
 		assert!(cfg.contains("/etc/ostree/auth.json"), "{cfg}");
 		assert!(cfg.contains("0600"), "{cfg}");
 	}
 
-	#[test]
-	fn anonymous_registry_provision_collects_no_credential_and_bakes_no_auth_json() {
-		// `--anonymous` against a registry-mode manifest must skip the pull-credential
-		// collection entirely — no env var, no TTY, no error — and bake no auth.json,
-		// so the device pulls anonymously. (Reads no `BOOTCHER_PULL_*`, so it's robust
-		// regardless of the test runner's environment.)
+	fn manifest(signing: bool) -> Manifest {
+		let key = if signing { "key = \"cosign.key\"\n" } else { "" };
+		toml::from_str(&format!(
+			"[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n\
+			 [registry]\nurl = \"reg.example.com/org\"\nchannels = [\"stable\"]\n{key}",
+		))
+		.unwrap()
+	}
+
+	fn key_file() -> (tempfile::TempDir, String) {
 		let dir = tempfile::tempdir().unwrap();
 		let key = dir.path().join("id");
 		fs::write(dir.path().join("id.pub"), "ssh-ed25519 AAAA test@host\n").unwrap();
-		let manifest: Manifest = toml::from_str(
-			"[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n\
-			 [deploy]\nregistry = \"reg.example.com/org\"\n",
-		)
-		.unwrap();
+		let key = key.to_str().unwrap().to_owned();
+		(dir, key)
+	}
 
-		let p = Provisioning::collect(&manifest, Some(key.to_str().unwrap()), false, true).unwrap();
+	#[test]
+	fn anonymous_channel_install_collects_no_credential_and_bakes_no_auth_json() {
+		// `--anonymous` must skip the pull-credential collection entirely — no env var,
+		// no TTY, no error — and bake no auth.json.
+		let (_dir, key) = key_file();
+		let mode = InstallMode::Channel {
+			channel: "stable".into(),
+			anonymous: true,
+			skip_pull_check: false,
+		};
+		let p = Provisioning::collect(&manifest(false), Some(&key), &mode).unwrap();
 		assert!(p.auth_json.is_none(), "anonymous provision must collect no pull credential");
 		let cfg = p.blueprint().unwrap();
 		assert!(!cfg.contains("/etc/ostree/auth.json"), "no auth.json must be baked: {cfg}");
-		// The admin key is still injected — anonymous only drops the pull secret.
 		assert!(cfg.contains("/etc/ssh/authorized_keys.d/admin"), "{cfg}");
 	}
 
 	#[test]
+	fn direct_install_in_a_signing_project_bakes_no_trust_files() {
+		// D4: S1 showed direct installs need no trust files, so nothing is baked —
+		// not even the public key (which would be read, and fail, if it were).
+		let (_dir, key) = key_file();
+		let p = Provisioning::collect(&manifest(true), Some(&key), &InstallMode::Direct).unwrap();
+		assert!(p.trust.is_none() && p.auth_json.is_none());
+	}
+
+	#[test]
 	fn policy_json_signs_only_the_os_image_and_rejects_by_default() {
-		let policy =
-			render_policy_json("reg.example.com/org/kiosk", &["/etc/pki/containers/kiosk.pub"]);
+		let policy = render_policy_json(
+			"reg.example.com/org/kiosk",
+			&["/etc/pki/containers/kiosk-0011.pub"],
+		);
 		let v: serde_json::Value = serde_json::from_str(&policy).unwrap();
 		// `default: reject` — ostree-image-signed's ContainerPolicy makes a blanket check
 		// on the global `default` and refuses a permissive one.
@@ -669,28 +827,21 @@ mod tests {
 		// Signing is pinned to the OS image repository, not the whole namespace.
 		let req = &v["transports"]["docker"]["reg.example.com/org/kiosk"][0];
 		assert_eq!(req["type"], "sigstoreSigned");
-		assert_eq!(req["keyPath"], "/etc/pki/containers/kiosk.pub");
+		assert_eq!(req["keyPaths"][0], "/etc/pki/containers/kiosk-0011.pub");
+		assert!(req["keyPath"].is_null(), "{policy}");
 		assert_eq!(req["signedIdentity"]["type"], "matchRepository");
-		// Every *other* image (sibling images under the same namespace, or any other
-		// registry) pulls unsigned via the docker transport-wide wildcard.
+		// Every *other* image pulls unsigned via the docker transport-wide wildcard.
 		assert_eq!(v["transports"]["docker"][""][0]["type"], "insecureAcceptAnything");
 		// Local already-pulled images must keep working.
 		assert_eq!(v["transports"]["containers-storage"][""][0]["type"], "insecureAcceptAnything");
 	}
 
 	#[test]
-	fn policy_json_uses_keypaths_for_a_key_union() {
-		// A `rotate sign-key` transition trusts both the current and incoming key, so
-		// the requirement carries `keyPaths` (plural) rather than `keyPath`.
-		let policy = render_policy_json(
-			"reg/org/name",
-			&["/etc/pki/containers/k.pub", "/etc/pki/containers/k-next.pub"],
-		);
+	fn policy_json_trusts_several_keys_at_once() {
+		let policy = render_policy_json("reg/org/name", &["/k1.pub", "/k2.pub"]);
 		let v: serde_json::Value = serde_json::from_str(&policy).unwrap();
 		let req = &v["transports"]["docker"]["reg/org/name"][0];
-		assert!(req["keyPath"].is_null(), "{policy}");
-		assert_eq!(req["keyPaths"][0], "/etc/pki/containers/k.pub");
-		assert_eq!(req["keyPaths"][1], "/etc/pki/containers/k-next.pub");
+		assert_eq!(req["keyPaths"], serde_json::json!(["/k1.pub", "/k2.pub"]));
 	}
 
 	#[test]
@@ -701,25 +852,82 @@ mod tests {
 	}
 
 	#[test]
-	fn blueprint_injects_the_three_signing_files() {
+	fn key_files_are_named_by_fingerprint_prefix() {
+		let pem = pem();
+		let fp = fingerprint(&pem).unwrap();
+		assert_eq!(fp.len(), 64);
+		let k = TrustKey::new("kiosk", pem.clone()).unwrap();
+		assert_eq!(k.path, format!("/etc/pki/containers/kiosk-{}.pub", &fp[..8]));
+		assert!(fingerprint("not a pem").is_err());
+	}
+
+	#[test]
+	fn blueprint_injects_the_trust_files() {
+		let pem = pem();
 		let p = Provisioning {
 			authorized_keys: "k\n".into(),
 			auth_json: Some("{\"auths\":{}}\n".into()),
-			signing: Some(SigningFiles {
-				name: "kiosk".into(),
-				pubkey_pem: "-----BEGIN PUBLIC KEY-----\nabc\n-----END PUBLIC KEY-----\n".into(),
-				policy_json: render_policy_json(
-					"reg/org/kiosk",
-					&["/etc/pki/containers/kiosk.pub"],
-				),
-				registries_d: render_registries_d("reg/org"),
-			}),
+			trust: Some(trust(vec![TrustKey::new("kiosk", pem.clone()).unwrap()])),
 		};
 		let cfg = p.blueprint().unwrap();
-		assert!(cfg.contains("/etc/pki/containers/kiosk.pub"), "{cfg}");
+		let fp8 = &fingerprint(&pem).unwrap()[..8];
+		assert!(cfg.contains(&format!("/etc/pki/containers/kiosk-{fp8}.pub")), "{cfg}");
 		assert!(cfg.contains("/etc/containers/policy.json"), "{cfg}");
 		assert!(cfg.contains("/etc/containers/registries.d/bootcher-signing.yaml"), "{cfg}");
 		assert!(cfg.contains("BEGIN PUBLIC KEY"), "{cfg}");
+	}
+
+	/// Run an install script against a scratch root: `sudo` is a no-op shim and every
+	/// absolute device path is rewritten under `root`.
+	fn run_script(script: &str, root: &Path) {
+		let script =
+			script.replace("/etc/", &format!("{}/etc/", root.display())).replace("sudo ", "");
+		let out = std::process::Command::new("sh").arg("-c").arg(&script).output().unwrap();
+		assert!(out.status.success(), "{}\n{}", String::from_utf8_lossy(&out.stderr), script);
+	}
+
+	#[test]
+	fn the_refresh_script_keeps_existing_keys_and_retire_prunes_them() {
+		let root = tempfile::tempdir().unwrap();
+		let dir = root.path().join("etc/pki/containers");
+		fs::create_dir_all(&dir).unwrap();
+		fs::create_dir_all(root.path().join("etc/containers/registries.d")).unwrap();
+		// A legacy unsuffixed key and a key from an earlier rotation are on the device.
+		fs::write(dir.join("kiosk.pub"), "legacy").unwrap();
+		fs::write(dir.join("kiosk-deadbeef.pub"), "old").unwrap();
+		fs::write(dir.join("kiosk-dev-01234567.pub"), "another image's key").unwrap();
+		let pem = pem();
+		let t = trust(vec![TrustKey::new("kiosk", pem.clone()).unwrap()]);
+		let current = t.keys[0].path.replace("/etc/", &format!("{}/etc/", root.path().display()));
+
+		// A routine refresh adds the current key and keeps the rotation's key.
+		run_script(&t.install_script(false), root.path());
+		let policy: serde_json::Value = serde_json::from_str(
+			&fs::read_to_string(root.path().join("etc/containers/policy.json")).unwrap(),
+		)
+		.unwrap();
+		let paths = policy["transports"]["docker"]["reg/org/kiosk"][0]["keyPaths"].clone();
+		let paths: Vec<String> = serde_json::from_value(paths).unwrap();
+		assert_eq!(paths.len(), 2, "{paths:?}");
+		assert!(
+			paths.contains(&current) && paths.iter().any(|p| p.ends_with("kiosk-deadbeef.pub"))
+		);
+		assert!(!dir.join("kiosk.pub").exists(), "the legacy key file is dropped");
+		assert!(dir.join("kiosk-dev-01234567.pub").exists(), "another image's key is untouched");
+		assert!(root.path().join("etc/containers/registries.d/bootcher-signing.yaml").exists());
+
+		// Retire trusts only the current key and deletes the rest.
+		run_script(&t.install_script(true), root.path());
+		let policy: serde_json::Value = serde_json::from_str(
+			&fs::read_to_string(root.path().join("etc/containers/policy.json")).unwrap(),
+		)
+		.unwrap();
+		assert_eq!(
+			policy["transports"]["docker"]["reg/org/kiosk"][0]["keyPaths"],
+			serde_json::json!([current])
+		);
+		assert!(!dir.join("kiosk-deadbeef.pub").exists());
+		assert!(dir.join("kiosk-dev-01234567.pub").exists());
 	}
 
 	#[test]

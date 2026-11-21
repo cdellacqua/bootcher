@@ -267,7 +267,7 @@ pub(crate) fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
 
 // ----------------------------------------------------------------- registry
 
-/// A throwaway `registry:2` container for the registry-mode e2e tests, removed on
+/// A throwaway `registry:2` container for the registry e2e tests, removed on
 /// drop. Both build host and guest pull a signed/unsigned image from it under the
 /// **same** reference string (see [`host_primary_ip`]). Named per test so two
 /// registry e2e binaries don't collide on the container name.
@@ -644,7 +644,7 @@ impl Ssh<'_> {
 
 /// The throwaway registry as the *build host* addresses it: bundles the podman env
 /// (project dir, throwaway `$HOME`, dedicated store) and the `<ns>/<name>` reference
-/// the registry-mode e2es query and push to. Every method shells out under that env so
+/// the registry e2es query and push to. Every method shells out under that env so
 /// the insecure-registry drop-in in `$HOME` applies. Built ad hoc per call (all borrows).
 pub(crate) struct RegistryClient<'a> {
 	pub proj: &'a Path,
