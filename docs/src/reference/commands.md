@@ -228,20 +228,24 @@ channels: a checklist pre-checking the stale or lagging ones. See
 
 ### `bootcher signing enroll [prefix] [--remote…] [-y]`
 
-Write `<prefix>.key` / `<prefix>.pub` (default `cosign`), set `[registry] key`, bake the
-install drop-in; on a running fleet, sign every served release in place and enforce
-signatures on the channel devices. Refuses when a key is configured.
+Write `<prefix>.key` / `<prefix>.pub` (default `cosign`); on a running fleet, sign every
+served release in place and enforce signatures on the reachable channel devices
+(unreachable ones are a warning); then set `[registry] key` and bake the install drop-in —
+last, so a failed run can be re-run (it reuses the keypair). Needs `-y` off a TTY only
+when there is something to sign or a device to update. Refuses when a key is configured.
 
 ### `bootcher signing rotate [prefix] [--remote…] [-y]`
 
 New keypair (`cosign-<fingerprint>` by default), new-key signatures on every served
 release, old + new keys trusted on the channel devices, then `[registry] key` repointed —
-last.
+last. After a failure, `rotate <prefix>` with the prefix it printed resumes with that
+keypair.
 
 ### `bootcher signing retire [--remote…] [-y]`
 
 Trust only the current key on the channel devices and delete the others. Only once every
-device has the new key.
+device has the new key; refuses while anything a channel serves doesn't verify under the
+current key.
 
 ### `bootcher signing verify <ref|name> [--pubkey <path>]`
 

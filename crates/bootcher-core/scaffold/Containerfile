@@ -49,8 +49,8 @@ COPY sysroot/ /
 # root-owned) to keep the image self-consistent.
 RUN mkdir -p /etc/ssh/authorized_keys.d && chmod 0755 /etc/ssh/authorized_keys.d
 
-# Dirs the image-signing files land in when signing is enabled (`[registry] key`
-# inline table): the cosign public key (/etc/pki/containers) and the
+# Dirs the image-signing files land in when signing is enabled (`key` in
+# `[registry]`, set by `bootcher signing enroll`): the cosign public key (/etc/pki/containers) and the
 # use-sigstore-attachments drop-in (/etc/containers/registries.d). `bootcher device provision`
 # injects those files via image-builder, which won't create a missing parent, so bake the dirs
 # here. Harmless when signing is off (two empty dirs).

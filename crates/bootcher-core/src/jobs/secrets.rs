@@ -73,7 +73,7 @@ impl Provisioning {
 	}
 
 	/// Like [`Self::collect`], but also returns the resolved admin **private** key
-	/// path. `bootcher takeover` needs it as the post-reboot `admin@host` SSH
+	/// path. `bootcher device takeover` needs it as the post-reboot `admin@host` SSH
 	/// identity (the stock cloud user is gone by then), not just the public half
 	/// baked into `authorized_keys`. The picker/discovery on a TTY (when `key` is
 	/// `None`) runs exactly once.
@@ -114,7 +114,7 @@ impl Provisioning {
 	}
 
 	/// The provisioning files as `(device path, octal mode, content)` triples, in a
-	/// stable order (admin key, then the registry-mode pull secret, then the three
+	/// stable order (admin key, then a channel device's pull secret, then the three
 	/// signing files when configured). The single source of truth for *what* gets
 	/// injected into a device's `/etc`, independent of *how*: [`Self::blueprint`]
 	/// wraps each into an `image-builder` `customizations.files` entry for disk
@@ -471,7 +471,7 @@ pub(crate) fn render_auth_json(ns: &str, user: &str, token: &str) -> String {
 
 /// Local check that a freshly collected pull credential authenticates to the
 /// registry, run up front — before provision bakes it into the disk, or before
-/// `bootcher rotate pull-token` starts its rollout — so a fat-fingered token surfaces
+/// `bootcher device rotate pull-token` starts its rollout — so a fat-fingered token surfaces
 /// immediately rather than after a device is provisioned or mid-fleet. Skipped
 /// entirely when the caller passes `--skip-pull-check`.
 ///

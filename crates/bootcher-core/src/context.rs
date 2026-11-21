@@ -766,7 +766,7 @@ impl RemoteConfig {
 	}
 
 	/// The steady-state **admin** [`Ssh`] for this remote (`admin@host` + `ssh_opts`)
-	/// with `identity` appended as an extra `-i <key>`. `bootcher takeover` uses this
+	/// with `identity` appended as an extra `-i <key>`. `bootcher device takeover` uses this
 	/// after the reboot, when the stock cloud user is gone and only the just-injected
 	/// admin key (`--ssh-key`'s private half) authenticates. Equivalent to
 	/// `Ssh::from(self)` plus the identity flag.
@@ -779,7 +779,7 @@ impl RemoteConfig {
 		Ssh::new(host, opts)
 	}
 
-	/// The **initial-connection** [`Ssh`] `bootcher takeover` uses *before* the
+	/// The **initial-connection** [`Ssh`] `bootcher device takeover` uses *before* the
 	/// reboot — the same host as the steady-state remote but with the user rewritten
 	/// to the resolved stock cloud login. The login is the remote's own
 	/// `takeover_login`, else `default_login` (the fleet-wide `--login`), else a hard
@@ -830,7 +830,7 @@ pub fn bare_host(dest: &str) -> &str {
 
 /// Resolve a slice of remotes into ready-to-drive [`Ssh`] connections.
 /// The `to_ssh` companion to the [`From<&RemoteConfig>`] bridge, so call sites read
-/// `ctx.deploy_remotes().to_ssh()` (cf. `[T]::to_vec`) instead of spelling out the
+/// `manifest.remotes().to_ssh()` (cf. `[T]::to_vec`) instead of spelling out the
 /// iterate-map-collect — keeping the `Ssh` operations type out of [`Manifest`]'s API.
 pub trait ToSsh {
 	fn to_ssh(&self) -> Vec<Ssh>;
@@ -1416,8 +1416,13 @@ pub fn valid_tag(tag: &str) -> bool {
 pub const RESERVED_TAG_PREFIXES: &[&str] = &["sha256-", "ci-"];
 
 /// Check a `[registry] channels` entry: a valid OCI tag outside the reserved
-/// prefixes.
-fn check_channel_name(ch: &str) -> Result<()> {
+/// prefixes. Also `bootcher init`'s channel prompt validator, so the prompt rejects
+/// exactly what loading the manifest later would.
+///
+/// # Errors
+///
+/// Returns an error naming why `ch` isn't a usable channel name.
+pub(crate) fn check_channel_name(ch: &str) -> Result<()> {
 	if !valid_tag(ch) {
 		bail!(
 			"`[registry] channels` entry `{ch}` isn't a valid OCI tag (letters, digits, `_`, \

@@ -45,8 +45,11 @@ local setup:
 2. runs the channel device step on the reachable channel devices: trust files, then
    `bootc switch --enforce-container-sigpolicy`.
 
-Devices **outside `remotes`** can't be reached, so they keep an unverified origin until
-they're re-provisioned or switched.
+`[registry] key` and the drop-in are written **after** both steps, so a failed run leaves
+the project unsigned and a re-run picks up the keypair it wrote. An unreachable device is
+only a warning: it gets its trust files with its next channel device step. Devices
+**outside `remotes`** can't be reached, so they keep an unverified origin until they're
+re-provisioned or switched.
 
 ## Rotating the key
 
@@ -74,8 +77,10 @@ new. New releases are signed with the new key only.
 `signing retire` makes the channel devices trust only the current key and deletes the
 other key files. Run it only once every device has the new key: a device outside
 `remotes` that still has only the old one would reject every update from then on.
-Releases no channel serves keep only their old signature; `channel promote` refuses
-them, pointing at `release refresh X --force` (re-signed with the current key).
+It refuses while anything a channel serves doesn't verify under the current key (finish
+the rotate first). Releases no channel serves keep only their old signature; `channel
+promote` refuses them, pointing at `release refresh X --force` (re-signed with the
+current key).
 
 ## Passphrase
 

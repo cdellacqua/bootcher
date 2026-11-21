@@ -170,8 +170,8 @@ pub(crate) struct HookMetadata {
 	pub credential: Option<Credential>,
 	/// Each device's outcome, in `remotes` order — `post` stage of the
 	/// `upgrade`, `takeover` and `rotate` phases only, which run `post` even after a
-	/// partial failure. Empty when the rollout attempted no device (e.g. a
-	/// registry-mode `upgrade` with no remotes, which only pushes).
+	/// partial failure. Empty when the rollout attempted no device (e.g. a channel
+	/// rollout after a promote with no device on the channel).
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub results: Option<Vec<Outcome>>,
 	/// The directory the hook runs in (the project root). Not part of the payload.

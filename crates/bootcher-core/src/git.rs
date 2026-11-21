@@ -140,10 +140,16 @@ pub(crate) fn push_tag(dir: &Path, remote: &str, tag: &str) -> Result<()> {
 /// A temporary `git worktree` of one commit, removed (and pruned) on drop. A
 /// refresh builds a release's recorded commit in one, under that commit's own
 /// config, without touching the checkout it was started from. Gitignored or
-/// generated build inputs don't exist in it.
+/// generated build inputs don't exist in it. It lives under the repository's git
+/// common dir (disk-backed, unlike a tmpfs `/tmp`, and on the same filesystem as the
+/// objects), and [`Worktree::project`] is the same subdirectory the project occupies
+/// in the checkout it was started from.
+#[derive(Debug)]
 pub(crate) struct Worktree {
 	repo: PathBuf,
 	dir: tempfile::TempDir,
+	/// The project's path relative to the worktree root (`git rev-parse --show-prefix`).
+	prefix: PathBuf,
 }
 
 impl Worktree {
@@ -167,22 +173,33 @@ impl Worktree {
 				format!("commit {commit} isn't in this clone; fetching it from {remote} failed")
 			})?;
 		}
+		let prefix = PathBuf::from(git(repo, &["rev-parse", "--show-prefix"])?);
+		let common = git(repo, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+		let parent = Path::new(&common).join("bootcher-worktrees");
+		std::fs::create_dir_all(&parent)
+			.with_context(|| format!("creating {}", parent.display()))?;
 		let dir = tempfile::Builder::new()
-			.prefix(&format!("bootcher-{}-", &commit[..12.min(commit.len())]))
-			.tempdir()
-			.context("creating a temp dir for the worktree")?;
-		let path = dir.path().to_str().context("temp dir path is not UTF-8")?;
+			.prefix(&format!("{}-", &commit[..12.min(commit.len())]))
+			.tempdir_in(&parent)
+			.with_context(|| format!("creating a worktree dir under {}", parent.display()))?;
+		let path = dir.path().to_str().context("worktree dir path is not UTF-8")?;
 		git(repo, &["worktree", "add", "--quiet", "--detach", path, commit])?;
-		let wt = Self { repo: repo.to_path_buf(), dir };
+		let wt = Self { repo: repo.to_path_buf(), dir, prefix };
 		if wt.path().join(".gitmodules").exists() {
 			git(wt.path(), &["submodule", "update", "--init", "--recursive", "--quiet"])?;
 		}
 		Ok(wt)
 	}
 
-	/// The worktree's directory.
+	/// The worktree's root directory.
 	pub(crate) fn path(&self) -> &Path {
 		self.dir.path()
+	}
+
+	/// The project's directory inside the worktree: the root, or the subdirectory the
+	/// project lives in when it isn't at the top of the repository.
+	pub(crate) fn project(&self) -> PathBuf {
+		self.dir.path().join(&self.prefix)
 	}
 }
 
@@ -266,5 +283,24 @@ pub(crate) mod tests {
 		assert!(!path.exists());
 		assert!(!run(r.path(), &["worktree", "list"]).contains(path.to_str().unwrap()));
 		assert!(Worktree::add(r.path(), "0123456789abcdef0123456789abcdef01234567").is_err());
+	}
+
+	/// A project in a subdirectory of the repository gets the same subdirectory in the
+	/// worktree, which lives under the git dir rather than the system temp dir.
+	#[test]
+	fn worktree_keeps_the_project_subdirectory() {
+		let r = repo();
+		let sub = r.path().join("deploy/image");
+		std::fs::create_dir_all(&sub).unwrap();
+		std::fs::write(sub.join("bootcher.toml"), "x\n").unwrap();
+		run(r.path(), &["add", "-A"]);
+		run(r.path(), &["commit", "-qm", "sub"]);
+		let commit = head(r.path()).unwrap().unwrap();
+		let wt = Worktree::add(&sub, &commit).unwrap();
+		assert_eq!(wt.project(), wt.path().join("deploy/image/"));
+		assert!(wt.project().join("bootcher.toml").is_file());
+		assert!(wt.path().starts_with(r.path().join(".git").canonicalize().unwrap()), "{wt:?}");
+		let root = Worktree::add(r.path(), &commit).unwrap();
+		assert_eq!(root.project(), root.path());
 	}
 }

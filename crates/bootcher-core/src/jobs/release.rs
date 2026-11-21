@@ -406,7 +406,7 @@ pub(crate) fn build_commit(
 ) -> Result<Vec<ImageRef>> {
 	let wt = git::Worktree::add(manifest.root(), commit)?;
 	let mut wt_manifest =
-		Manifest::load_in(wt.path(), &manifest.manifest_path).with_context(|| {
+		Manifest::load_in(&wt.project(), &manifest.manifest_path).with_context(|| {
 			format!(
 				"loading {} from commit {} — a refresh builds each release under its own config",
 				manifest.manifest_path.display(),
@@ -464,6 +464,18 @@ pub enum GitTag {
 	Push,
 	Local,
 	No,
+}
+
+impl GitTag {
+	/// The `--git-tag` value.
+	#[must_use]
+	pub fn as_str(self) -> &'static str {
+		match self {
+			GitTag::Push => "push",
+			GitTag::Local => "local",
+			GitTag::No => "no",
+		}
+	}
 }
 
 /// What the registry holds for `:X`, relative to HEAD.
@@ -615,6 +627,14 @@ pub fn publish(manifest: &Manifest, args: &PublishArgs) -> Result<()> {
 		}
 		_ => {}
 	}
+	// A `--git-tag` that can't be created fails here, before anything is pushed.
+	if let Some(h) = &head
+		&& matches!(args.git_tag, Some(GitTag::Push | GitTag::Local))
+		&& git::tag_commit(root, &name)?.as_deref() != Some(h.as_str())
+		&& !git::valid_tag_name(root, &name)?
+	{
+		bail!("`{name}` isn't a valid git tag name — pass `--git-tag no`, or pick another name");
+	}
 	let needs_push = matches!(state, PublishState::Absent) || args.rebuild;
 	if needs_push {
 		let mut b = Scope::root("publish", Some(2));
@@ -647,9 +667,10 @@ pub fn publish(manifest: &Manifest, args: &PublishArgs) -> Result<()> {
 	}
 
 	// The git tag: image first, tag second.
-	if let Some(h) = &head {
-		git_tag(manifest, &name, h, args.git_tag, &mut prompted)?;
-	}
+	let tag_choice = match &head {
+		Some(h) => git_tag(manifest, &name, h, args.git_tag, &mut prompted)?,
+		None => None,
+	};
 
 	// Then "promote to…", when asked or (on a TTY with nothing given) offered.
 	if promote.is_none() && args.name.is_none() && prompted && needs_push {
@@ -659,7 +680,11 @@ pub fn publish(manifest: &Manifest, args: &PublishArgs) -> Result<()> {
 		Equivalent::new(&["release", "publish", &name])
 			.flag_if(args.skip_build, "--skip-build")
 			.flag_if(args.rebuild, "--rebuild")
+			.opts("--git-tag", tag_choice.map(GitTag::as_str))
 			.opts("--promote", promote.iter())
+			.opts("--remote", promote.iter().flat_map(|_| &args.remotes))
+			.flag_if(promote.is_some() && args.skip_remotes, "--skip-remotes")
+			.flag_if(promote.is_some(), "-y")
 			.print();
 	}
 	if let Some(ch) = promote {
@@ -702,16 +727,17 @@ fn prompt_name(manifest: &Manifest, head: Option<&str>) -> Result<String> {
 }
 
 /// Create (and maybe push) the git tag `name` at HEAD per `flag`, or ask on a TTY.
+/// Returns what was chosen, or `None` when the tag already points at HEAD.
 fn git_tag(
 	manifest: &Manifest,
 	name: &str,
 	head: &str,
 	flag: Option<GitTag>,
 	prompted: &mut bool,
-) -> Result<()> {
+) -> Result<Option<GitTag>> {
 	let root = manifest.root();
 	if git::tag_commit(root, name)?.as_deref() == Some(head) {
-		return Ok(());
+		return Ok(None);
 	}
 	let remote = git::push_remote(root)?;
 	let choice = match flag {
@@ -726,7 +752,7 @@ fn git_tag(
 		None => GitTag::No,
 	};
 	if choice == GitTag::No {
-		return Ok(());
+		return Ok(Some(choice));
 	}
 	if !git::valid_tag_name(root, name)? {
 		bail!("`{name}` isn't a valid git tag name — publish succeeded, but pass `--git-tag no`");
@@ -742,7 +768,7 @@ fn git_tag(
 			None => eprintln!("warning: no remote to push git tag {name} to — it stays local"),
 		}
 	}
-	Ok(())
+	Ok(Some(choice))
 }
 
 // ------------------------------------------------------------------ refresh

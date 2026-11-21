@@ -171,7 +171,7 @@ fn probe(manifest: &Manifest, remotes: &[&RemoteConfig]) -> (Vec<Device>, Vec<Ou
 }
 
 /// Raise a run that attempted nothing but has unreachable devices to report.
-fn finish_unreachable(unreachable: &[Outcome]) -> Result<()> {
+pub(crate) fn finish_unreachable(unreachable: &[Outcome]) -> Result<()> {
 	if unreachable.is_empty() {
 		return Ok(());
 	}
@@ -697,6 +697,7 @@ pub fn takeover(manifest: &Manifest, args: &TakeoverArgs) -> Result<()> {
 			.flag_if(args.skip_build, "--skip-build")
 			.flag_if(args.anonymous, "--anonymous")
 			.flag_if(args.skip_pull_check, "--skip-pull-check")
+			.arg("-y")
 			.print();
 	}
 	let hosts: Vec<String> = targets.iter().map(|t| t.dest().to_owned()).collect();
@@ -843,27 +844,35 @@ pub fn deploy(manifest: &Manifest, skip_build: bool, remotes: &[String], yes: bo
 		manifest,
 		&manifest.images(),
 		&manifest.local_list_ref(),
+		None,
 		&ssh,
 		unreachable,
 		&mut b.child("upgrade"),
 	)
 }
 
-/// The direct device step across `targets`, bracketed by `[hooks.upgrade]`;
-/// `unreachable` are reported as failures alongside.
+/// The direct device step across `targets` with the list `list_ref`, bracketed by
+/// `[hooks.upgrade]`; `unreachable` are reported as failures alongside. `commit` is
+/// the commit the images were built from when it isn't the checkout's (a refresh);
+/// `None` reports the checkout's revision.
 pub(crate) fn direct_rollout(
 	manifest: &Manifest,
 	images: &[crate::context::ImageRef],
 	list_ref: &str,
+	commit: Option<&str>,
 	targets: &[Ssh],
 	unreachable: Vec<Outcome>,
 	job: &mut Scope,
 ) -> Result<()> {
-	let mut meta = HookMetadata::new(manifest, Phase::Upgrade, manifest.local_list_ref());
+	let mut meta = HookMetadata::new(manifest, Phase::Upgrade, list_ref.to_owned());
 	meta.remotes = Some(targets.iter().map(|s| s.host().to_owned()).collect());
-	let provenance = crate::context::GitProvenance::detect(manifest.root(), job);
-	meta.revision = provenance.revision;
-	meta.version = provenance.version;
+	if let Some(c) = commit {
+		meta.revision = Some(c.to_owned());
+	} else {
+		let provenance = crate::context::GitProvenance::detect(manifest.root(), job);
+		meta.revision = provenance.revision;
+		meta.version = provenance.version;
+	}
 	let hooks = manifest.hooks();
 	crate::hooks::run(&meta, hooks.upgrade.pre.as_deref(), job)?;
 	let report = upgrade::run_direct(
@@ -898,6 +907,11 @@ pub(crate) fn channel_rollout(
 	let trust = TrustFiles::for_manifest(manifest)?.map(|t| t.install_script(false));
 	let mut meta = HookMetadata::new(manifest, Phase::Upgrade, channel_ref.clone());
 	meta.channel = Some(channel.to_owned());
+	// The commit the release was built from (`bootcher.source`), best effort: a
+	// release that can't be read just reports none.
+	meta.revision = release.as_deref().and_then(|x| {
+		crate::jobs::release::read(manifest, x).ok().flatten()?.source().ok().flatten()
+	});
 	meta.release = release;
 	meta.remotes = Some(targets.iter().map(|s| s.host().to_owned()).collect());
 	let hooks = manifest.hooks();
@@ -1114,6 +1128,7 @@ pub fn switch(manifest: &Manifest, args: &SwitchArgs) -> Result<()> {
 				manifest,
 				&manifest.images(),
 				&manifest.local_list_ref(),
+				None,
 				&ssh,
 				unreachable,
 				&mut b.child("upgrade"),
@@ -1241,9 +1256,14 @@ fn read_booted(d: &Device, index: usize, cache: &mut crate::oci::BaseCache) -> R
 }
 
 /// The `device refresh` checklist: direct devices grouped by source commit,
-/// annotated with their base status, pre-checking the stale ones; devices with no
-/// recorded source are shown but disabled.
-pub(crate) fn refresh_choices(devices: &[Device], booted: &[Booted]) -> Vec<Choice<usize>> {
+/// annotated with their base status, pre-checking what a non-TTY run refreshes (the
+/// stale ones; every one with `force`); devices with no recorded source are shown but
+/// disabled.
+pub(crate) fn refresh_choices(
+	devices: &[Device],
+	booted: &[Booted],
+	force: bool,
+) -> Vec<Choice<usize>> {
 	let mut sorted: Vec<&Booted> = booted.iter().collect();
 	sorted.sort_by(|a, b| a.source.cmp(&b.source).then(a.device.cmp(&b.device)));
 	sorted
@@ -1254,7 +1274,7 @@ pub(crate) fn refresh_choices(devices: &[Device], booted: &[Booted]) -> Vec<Choi
 				Some(c) => Choice::new(
 					format!("{} · {name}: {}", crate::oci::short(c), b.base.describe()),
 					b.device,
-					b.base.is_stale(),
+					force || b.base.is_stale(),
 				),
 				None => Choice::disabled(
 					name,
@@ -1332,7 +1352,8 @@ pub fn refresh(manifest: &Manifest, remotes: &[String], force: bool, yes: bool) 
 	}
 	for b in booted.iter().filter(|b| b.source.is_none()) {
 		eprintln!(
-			"{}: built from a dirty tree or outside git, so there's no commit to rebuild — re-run 			 `bootcher device deploy`",
+			"{}: built from a dirty tree or outside git, so there's no commit to rebuild — re-run \
+			 `bootcher device deploy`",
 			devices[b.device].name()
 		);
 	}
@@ -1355,7 +1376,7 @@ pub fn refresh(manifest: &Manifest, remotes: &[String], force: bool, yes: bool) 
 			} else {
 				interactive::checklist(
 					"Refresh which direct devices?",
-					refresh_choices(&devices, &booted),
+					refresh_choices(&devices, &booted, force),
 				)?
 			}
 		}
@@ -1425,6 +1446,7 @@ pub fn refresh(manifest: &Manifest, remotes: &[String], force: bool, yes: bool) 
 				manifest,
 				&images,
 				&list,
+				Some(&commit),
 				&ssh,
 				std::mem::take(&mut unreachable),
 				&mut scope,
@@ -1764,11 +1786,14 @@ mod tests {
 			booted(3, Some("c1aaaaaaaaaaaa"), Arch::X86_64, false),
 			booted(1, None, Arch::X86_64, true),
 		];
-		let c = refresh_choices(&devices, &b);
+		let c = refresh_choices(&devices, &b, false);
 		// Grouped by commit (the dirty one sorts first, disabled).
 		assert!(c[0].disabled.is_some() && c[0].value == 1);
 		assert!(c[1].checked && c[1].value == 0);
 		assert!(!c[2].checked && c[2].value == 3);
+		// `--force` pre-checks every refreshable device, like its non-TTY default.
+		let c = refresh_choices(&devices, &b, true);
+		assert!(!c[0].checked && c[1].checked && c[2].checked);
 		assert!(c[1].label.starts_with("c1aaaaaaaaaa · admin@rpi-1: base stale"), "{}", c[1].label);
 	}
 

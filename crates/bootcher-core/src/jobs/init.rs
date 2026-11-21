@@ -524,10 +524,10 @@ fn questionnaire() -> Result<Settings> {
 					s.split(',').map(str::trim).filter(|c| !c.is_empty()).collect();
 				Ok(if chans.is_empty() {
 					inquire::validator::Validation::Invalid("name at least one channel".into())
-				} else if let Some(bad) = chans.iter().find(|c| !crate::context::valid_tag(c)) {
-					inquire::validator::Validation::Invalid(
-						format!("`{bad}` isn't a valid tag").into(),
-					)
+				} else if let Some(e) =
+					chans.iter().find_map(|c| crate::context::check_channel_name(c).err())
+				{
+					inquire::validator::Validation::Invalid(e.to_string().into())
 				} else {
 					inquire::validator::Validation::Valid
 				})

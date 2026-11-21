@@ -129,7 +129,9 @@ pub(crate) fn move_channel(
 	meta.revision = release.source().ok().flatten();
 	let hooks = manifest.hooks();
 	crate::hooks::run(&meta, hooks.promote.pre.as_deref(), job)?;
-	let src = manifest.tag_ref(name).context("a release ref")?;
+	// Copy the digest that was checked, not the tag: a tag moved between the checks and
+	// the copy must not slip an unchecked image onto the channel.
+	let src = format!("{}@{}", manifest.repo().context("a registry")?, release.index.digest);
 	oci::copy(&src, &ch_ref, true, None, job)?;
 	match &meta.previous_release {
 		Some(prev) => eprintln!(
@@ -446,8 +448,8 @@ pub struct RefreshArgs {
 	pub yes: bool,
 }
 
-/// The `channel refresh` checklist: every declared channel with its status,
-/// pre-checking the stale or lagging ones.
+/// The `channel refresh` checklist: every selected channel with its status, all the
+/// published ones pre-checked (what a non-TTY run refreshes).
 pub(crate) fn refresh_choices(rows: &[ChannelRow]) -> Vec<Choice<String>> {
 	rows.iter()
 		.map(|r| {
@@ -457,7 +459,7 @@ pub(crate) fn refresh_choices(rows: &[ChannelRow]) -> Vec<Choice<String>> {
 			);
 			let label = format!("{}: {what}, {}", r.channel, r.state);
 			if r.published {
-				Choice::new(label, r.channel.clone(), r.stale || r.lags)
+				Choice::new(label, r.channel.clone(), true)
 			} else {
 				Choice::disabled(label, r.channel.clone(), "not published")
 			}
@@ -536,7 +538,8 @@ pub fn refresh(manifest: &Manifest, args: &RefreshArgs) -> Result<()> {
 	}
 	if args.skip_build && groups.len() > 1 {
 		bail!(
-			"`--skip-build` takes the local images for one release, but the selected channels 			 serve {} — name the channels of one release (`bootcher channel refresh <channel>`)",
+			"`--skip-build` takes the local images for one release, but the selected channels \
+			 serve {} — name the channels of one release (`bootcher channel refresh <channel>`)",
 			groups.iter().map(|g| g.release.as_str()).collect::<Vec<_>>().join(", ")
 		);
 	}
@@ -577,6 +580,10 @@ pub fn refresh(manifest: &Manifest, args: &RefreshArgs) -> Result<()> {
 		lines.push(format!("  point {} at {}", chan_list(&group), group.release));
 		plans.push(Plan { group, release, commit, stale });
 	}
+	if plans.is_empty() {
+		eprintln!("nothing to refresh");
+		return Ok(());
+	}
 	let targets = if args.skip_remotes {
 		ChannelDevices::default()
 	} else {
@@ -587,10 +594,6 @@ pub fn refresh(manifest: &Manifest, args: &RefreshArgs) -> Result<()> {
 	lines.extend(
 		targets.devices.iter().map(|(ch, d)| format!("  then update {} (on :{ch})", d.name())),
 	);
-	if plans.is_empty() {
-		eprintln!("nothing to refresh");
-		return Ok(());
-	}
 	if prompted {
 		Equivalent::new(&["channel", "refresh"])
 			.args(plans.iter().flat_map(|p| p.group.channels.iter().map(|(c, _)| c.clone())))
@@ -651,6 +654,12 @@ pub fn refresh(manifest: &Manifest, args: &RefreshArgs) -> Result<()> {
 			first_err.get_or_insert(e);
 		}
 	}
+	// No channel moved, so no device step reported them: do it here.
+	if first_err.is_none()
+		&& let Err(e) = device::finish_unreachable(&unreachable)
+	{
+		first_err = Some(e);
+	}
 	match first_err {
 		Some(e) => Err(e),
 		None => Ok(()),
@@ -690,7 +699,7 @@ mod tests {
 	}
 
 	#[test]
-	fn refresh_checklist_prechecks_stale_or_lagging_channels() {
+	fn refresh_checklist_prechecks_every_published_channel() {
 		let rows = vec![
 			row("stable", Some("v1"), false, false),
 			row("next", Some("v2"), true, false),
@@ -698,7 +707,8 @@ mod tests {
 			row("edge", None, false, false),
 		];
 		let c = refresh_choices(&rows);
-		assert_eq!(c.iter().map(|c| c.checked).collect::<Vec<_>>(), [false, true, true, false]);
+		// Pre-checked like the non-TTY default (every channel); the status is the label.
+		assert_eq!(c.iter().map(|c| c.checked).collect::<Vec<_>>(), [true, true, true, false]);
 		assert!(c[3].disabled.is_some());
 		assert_eq!(c[0].label, "stable: v1 @ 0123456789ab, x");
 	}
