@@ -4,8 +4,8 @@ Part of the bootcher CI recipes; copy this directory into your repo as `ci/` and
 it as needed (the two settings below especially). Stdlib only; needs `skopeo`. Run it
 from the repo root, where the Containerfile is.
 
-It compares the release pinned in the Containerfile with the one the stable tag
-currently points at:
+It compares the release pinned in the Containerfile with the one CURRENT (the tag
+that follows Fedora's current release, `fedora-bootc:latest`) points at:
 
   - same release (or newer): prints that and exits 0;
   - one release behind: prints a warning (prefixed with WARNING_PREFIX) and exits with
@@ -20,7 +20,7 @@ Reads:
                     lists it in the job's `allow_failure: exit_codes`, so the job shows
                     as a warning
 
-The decision lives in `check()`, which takes the stable-release lookup as a function;
+The decision lives in `check()`, which takes the current-release lookup as a function;
 bootcher's repo tests it in
 https://github.com/cdellacqua/bootcher/tree/main/recipes/ci/tests
 """
@@ -28,22 +28,23 @@ https://github.com/cdellacqua/bootcher/tree/main/recipes/ci/tests
 import json, os, re, subprocess, sys
 
 # Adapt to your setup: where the Containerfile pins the release, and the tag that
-# follows the current stable one (point it at your mirror if you use one).
+# follows the current Fedora release (point it at your mirror if you use one). Not to
+# be confused with your project's release channels.
 PIN = re.compile(r"^\s*ARG FEDORA_VERSION=(\d+)\s*$", re.M)
-STABLE = "docker://quay.io/fedora/fedora-bootc:latest"
+CURRENT = "docker://quay.io/fedora/fedora-bootc:latest"
 
 
 class Unreadable(Exception):
-    """`skopeo` couldn't read STABLE (its stderr is the message)."""
+    """`skopeo` couldn't read CURRENT (its stderr is the message)."""
 
 
-def stable_release():
-    """The current Fedora release, read from STABLE's version label.
+def current_release():
+    """The current Fedora release, read from CURRENT's version label.
 
     Raises `Unreadable` when `skopeo` fails; a reply without the label is a bug to see
     in full, so its KeyError (or bad JSON's ValueError) propagates as a traceback.
     """
-    run = subprocess.run(["skopeo", "inspect", STABLE], capture_output=True, text=True)
+    run = subprocess.run(["skopeo", "inspect", CURRENT], capture_output=True, text=True)
     if run.returncode:
         raise Unreadable(run.stderr.strip())
     return int(json.loads(run.stdout)["Labels"]["org.opencontainers.image.version"].split(".")[0])
@@ -75,9 +76,9 @@ def main():
     warning = os.environ.get("WARNING_PREFIX") or "warning: "
     behind = int(os.environ.get("BEHIND_EXIT_CODE") or "0")
     try:
-        verdict, message = check(open("Containerfile").read(), stable_release)
+        verdict, message = check(open("Containerfile").read(), current_release)
     except Unreadable as e:
-        sys.exit(f"can't read {STABLE}: {e}")
+        sys.exit(f"can't read {CURRENT}: {e}")
     if verdict == "eol":
         sys.exit(message)
     if verdict == "behind":

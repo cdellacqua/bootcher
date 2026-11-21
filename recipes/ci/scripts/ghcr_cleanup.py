@@ -4,9 +4,12 @@ Part of the bootcher CI recipes (GitHub only); copy this directory into your rep
 `ci/` and adapt it as needed. Stdlib only (urllib/json); runs `bootcher --manifest
 bootcher.ci.toml info` from the repo root for the package name and channels.
 
-Keeps every version tagged with a channel (`latest` + any `[deploy] channels`) or a
-`ci-<arch>` scratch tag, plus the newest KEEP_PREVIOUS other tagged versions (the
-immutable CalVer releases), and deletes the rest.
+Keeps every version tagged with a channel (`[registry] channels`), every release a
+channel serves (the `bootcher.release` annotation on the entries of each channel's index,
+even when the channel lags its release), the in-flight `ci-<sha12>-<arch>` hand-off tags (younger than
+CI_MAX_AGE_HOURS), plus the newest KEEP_PREVIOUS other releases, and deletes the rest —
+including older `ci-*` scratch tags and the untagged digests a refresh orphaned when it
+re-pushed a release.
 
 Multi-arch safe: GHCR stores each arch's child manifest as its OWN version, usually
 untagged, so a naive count/age prune would delete the arch members of a release it
@@ -31,11 +34,13 @@ Reads:
                      `delete:packages`) (required)
   GITHUB_REPOSITORY  `<owner>/<repo>`, set by GitHub Actions; the owner owns the package
                      (required)
-  KEEP_PREVIOUS      how many CalVer releases to keep besides the channels (default 5)
+  KEEP_PREVIOUS      how many releases to keep besides the served ones (default 5)
+  CI_MAX_AGE_HOURS   how long a `ci-*` hand-off tag counts as in flight (default 24)
   DRY_RUN            "true" logs what would be deleted without deleting (default "false")
 """
 
 import base64, json, os, re, subprocess, sys, urllib.error, urllib.request
+from datetime import datetime, timedelta, timezone
 
 # cosign signatures/attestations are their own versions, tagged
 # `sha256-<subject hex>.sig|.att|.sbom`. They aren't releases (counting them would
@@ -56,21 +61,34 @@ def subject(v):
     return next((f"sha256:{m[1]}" for t in tags(v) if (m := ATTACHMENT.match(t))), None)
 
 
-def plan(versions, keep, channels, children_of):
+def created(v):
+    return datetime.fromisoformat(v["created_at"].replace("Z", "+00:00"))
+
+
+def plan(versions, keep, channels, served, children_of, now, ci_max_age=timedelta(hours=24)):
     """Decide which package versions to delete; the pure core of the cleanup.
 
     `versions` are GitHub package versions (`name` is the digest), `keep` is
-    KEEP_PREVIOUS, `channels` the protected channel tags, and `children_of(digest)`
-    returns the child manifest digests of a kept list (only called for kept ones).
+    KEEP_PREVIOUS, `channels` the declared channel tags, `served` the release names
+    those channels serve, `children_of(digest)` the child manifest digests of a kept
+    list (only called for kept ones), and `now` the time the `ci-*` age is measured at.
     Returns `(keep_all, doomed)`: the digests kept and the versions to delete.
     Raises `Refused` if nothing would be kept.
     """
-    # Protected = a channel pointer (latest + [deploy] channels) or a ci-<arch> scratch
-    # tag; those are mutable and never pruned by age.
-    protected = lambda v: any(t in channels or t.startswith("ci-") for t in tags(v))
+    def scratch(v):
+        return any(t.startswith("ci-") for t in tags(v))
+
+    def in_flight(v):
+        return scratch(v) and now - created(v) < ci_max_age
+
+    # Protected: a channel pointer, a release a channel serves, or an in-flight hand-off.
+    def protected(v):
+        return in_flight(v) or any(t in channels or t in served for t in tags(v))
+
     images = [v for v in versions if not subject(v)]
-    releases = sorted((v for v in images if tags(v) and not protected(v)),
-                      key=lambda v: v["created_at"], reverse=True)
+    # Releases: the other tagged images, newest first (scratch tags aren't releases).
+    releases = sorted((v for v in images if tags(v) and not protected(v) and not scratch(v)),
+                      key=created, reverse=True)
     keep_lists = {v["name"] for v in images if protected(v)} | {v["name"] for v in releases[:keep]}
 
     # Extend the keep-set with the arch children the kept lists reference, so a
@@ -104,13 +122,15 @@ def project_info():
 
 def main():
     keep = int(os.environ.get("KEEP_PREVIOUS", "5"))
+    ci_max_age = timedelta(hours=int(os.environ.get("CI_MAX_AGE_HOURS", "24")))
     dry_run = os.environ.get("DRY_RUN", "false") == "true"
     token = os.environ["GH_TOKEN"]
     owner = os.environ["GITHUB_REPOSITORY"].split("/")[0].lower()
 
     info = project_info()
     name, channels = info["name"], set(info["channels"])
-    print(f"cleanup: {owner}/{name} — keeping :latest + {keep} previous release(s) (dry-run={dry_run})")
+    print(f"cleanup: {owner}/{name} — keeping the channels, their releases and {keep} other "
+          f"release(s) (dry-run={dry_run})")
 
     api = "https://api.github.com"
     gh_headers = {
@@ -144,13 +164,27 @@ def main():
         "application/vnd.docker.distribution.manifest.v2+json",
     ])
 
+    def manifest(ref):
+        return fetch(f"https://ghcr.io/v2/{owner}/{name}/manifests/{ref}",
+                     {"Authorization": f"Bearer {reg}", "Accept": accept})
+
     def children_of(digest):
-        manifest = fetch(f"https://ghcr.io/v2/{owner}/{name}/manifests/{digest}",
-                         {"Authorization": f"Bearer {reg}", "Accept": accept})
-        return [m["digest"] for m in manifest.get("manifests", [])]
+        return [m["digest"] for m in manifest(digest).get("manifests", [])]
+
+    # The releases the channels serve (a channel that lags its release still names it).
+    tagged = {t for v in versions for t in tags(v)}
+    served = set()
+    for channel in channels & tagged:
+        # Every entry of a release's index names it (podman 4.9 can't annotate the index).
+        names = {e.get("annotations", {}).get("bootcher.release")
+                 for e in manifest(channel).get("manifests", [])}
+        if len(names) == 1 and None not in names:
+            served.add(names.pop())
+    print(f"cleanup: channels serve {', '.join(sorted(served)) or 'nothing yet'}")
 
     try:
-        _, doomed = plan(versions, keep, channels, children_of)
+        _, doomed = plan(versions, keep, channels, served, children_of,
+                         datetime.now(timezone.utc), ci_max_age)
     except Refused as e:
         sys.exit(str(e))
     print(f"cleanup: keeping {len(versions) - len(doomed)} version(s), deleting {len(doomed)}")

@@ -1,30 +1,28 @@
-//! Post-provision credential rotation on the already-deployed devices.
+//! Post-provision credential rotation on the already-deployed devices
+//! (`bootcher device rotate ssh-key | pull-token`).
 //!
-//! `provision` injects a device's credentials (the admin SSH key, and in
-//! registry mode the read-only pull token) into its persistent `/etc` once, at
-//! image-build time. This module rotates them afterwards, in place: it reuses
-//! the same collection logic as provision ([`crate::jobs::secrets`]) but
-//! delivers the result over the live SSH channel `deploy`/`upgrade` already use,
-//! writing the file straight to the device rather than baking it into a fresh
-//! image. Nothing is rebuilt or re-provisioned — only the on-device credential
-//! changes. The fleet-wide rollout runs in parallel across the configured remotes.
+//! `provision` injects a device's credentials (the admin SSH key, and for a channel
+//! device the read-only pull token) into its persistent `/etc` once, at image-build
+//! time. This module rotates them afterwards, in place: it reuses the same
+//! collection logic as provision ([`crate::jobs::secrets`]) but delivers the result
+//! over the live SSH channel, writing the file straight to the device rather than
+//! baking it into a fresh image. Nothing is rebuilt or re-provisioned — only the
+//! on-device credential changes. The rollout runs in parallel across the selected
+//! devices.
 //!
-//! Three subcommands:
+//! - [`registry_token`] — registry pull token (`/etc/ostree/auth.json`), channel
+//!   devices only; each device proves the token against **its own** channel ref.
+//! - [`ssh_key`] — admin SSH authorized key (`/etc/ssh/authorized_keys.d/admin`),
+//!   every device.
 //!
-//! - [`registry_token`] — registry pull token (`/etc/ostree/auth.json`), registry mode only.
-//! - [`ssh_key`] — admin SSH authorized key (`/etc/ssh/authorized_keys.d/admin`), all modes.
-//! - [`signing_key`] — image-signing public key + policy (`/etc/pki/containers/`,
-//!   `/etc/containers/policy.json`, `/etc/containers/registries.d/`), registry + signing only.
-//!   Also covers *enrolling* signing on a fleet provisioned before signing was enabled.
-//!
-//! [`registry_token`] and [`ssh_key`] are validate-then-commit, so a bad credential (or an
-//! interrupted run) never bricks a device. [`registry_token`] stages the candidate
-//! `auth.json` and only installs it once `podman` proves it authenticates. [`ssh_key`]
-//! is the same shape but with a twist unique to SSH: the new key can only be
-//! verified by a *fresh* login, so it can't be checked in the staging shell.
-//! Instead it leaves the old key live *alongside* the new one during validation —
-//! so even a mid-rotation crash leaves both keys working, never a lockout — and
-//! retires the old key only after the new one authenticates.
+//! Both are validate-then-commit, so a bad credential (or an interrupted run) never
+//! bricks a device. [`registry_token`] stages the candidate `auth.json` and only
+//! installs it once `podman` proves it authenticates. [`ssh_key`] is the same shape
+//! but with a twist unique to SSH: the new key can only be verified by a *fresh*
+//! login, so it can't be checked in the staging shell. Instead it leaves the old
+//! key live *alongside* the new one during validation — so even a mid-rotation
+//! crash leaves both keys working, never a lockout — and retires the old key only
+//! after the new one authenticates.
 //!
 //! Crucially, that "authenticates" check forces the *new* key specifically: the
 //! probe disables the agent and any config identity and offers only the new
@@ -32,42 +30,34 @@
 //! the old key (live below the marker) would answer and the probe would pass even
 //! for a typo'd new key — then the commit would retire the old key and lock the
 //! device out. So [`ssh_key`] needs the new *private* key, passed directly as the
-//! `--path` argument (the `.pub` sibling is derived from it for `authorized_keys`).
+//! `--ssh-key` argument (the `.pub` sibling is derived from it for
+//! `authorized_keys`).
 //!
-//! [`signing_key`] writes directly without a post-write check: verifying a new
-//! signing key would require pulling and staging an image signed with it, which is
-//! expensive and only makes sense when a new image is actually ready to deploy. A
-//! bad key only blocks future `bootc upgrade` attempts — SSH access is always
-//! unaffected, so the fleet is always recoverable by rotating the signing key again.
-//!
-//! Every subcommand honours the manifest's `[hooks.rotate]` `pre`/`post` commands,
-//! run once around the fleet rollout (after the new credential is collected and
-//! checked locally), with the credential kind in `BOOTCHER_METADATA`'s
-//! `credential` field. `post` runs even if some devices failed, with each
-//! device's outcome in `results` — e.g. to revoke the old credential only where
-//! the new one landed.
+//! Every rotation honours the manifest's `[hooks.rotate]` `pre`/`post` commands,
+//! run once around the rollout (after the new credential is collected and checked
+//! locally), with the credential kind in `BOOTCHER_METADATA`'s `credential` field.
+//! `post` runs even if some devices failed, with each device's outcome in
+//! `results` — e.g. to revoke the old credential only where the new one landed.
 
-use crate::context::{DEVICE_ADMIN_AUTHORIZED_KEYS, DEVICE_AUTH_JSON, Manifest, ToSsh};
-use crate::hooks::{Credential, HookMetadata, Phase, Stage};
+use crate::context::{DEVICE_ADMIN_AUTHORIZED_KEYS, DEVICE_AUTH_JSON, Manifest};
+use crate::hooks::{Credential, HookMetadata, Phase};
 use crate::preflight::Checks;
 use crate::progress::Scope;
 use crate::ssh::Ssh;
 use crate::{exec, fleet, jobs::secrets};
 use anyhow::{Context, Result, bail};
-use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
 /// Check the external tools a credential rotation needs: `ssh` always (every
 /// rotation writes the new secret to each device over the live SSH channel), plus
-/// `podman` when `pull_check` (the `rotate pull-token` local pre-flight, skipped by
-/// `--skip-pull-check`). Co-located with the rotate entry points; invoked before
-/// the rollout starts.
+/// `podman` when `pull_check` (the `pull-token` local pre-flight, skipped by
+/// `--skip-pull-check`).
 ///
 /// # Errors
 ///
 /// Returns an error listing every missing prerequisite.
-pub fn preflight(pull_check: bool) -> Result<()> {
+pub(crate) fn preflight(pull_check: bool) -> Result<()> {
 	let mut checks = Checks::default();
 	checks.bin("ssh", "reach the deployed devices over SSH");
 	if pull_check {
@@ -76,25 +66,12 @@ pub fn preflight(pull_check: bool) -> Result<()> {
 	checks.finish()
 }
 
-/// The fleet's `[deploy] remotes` as SSH targets, or an error naming `cmd` (the
-/// `rotate` subcommand) if none are configured — every rotation writes to those
-/// targets, so an empty set is a hard stop.
-fn deploy_remotes_or_bail(manifest: &Manifest, cmd: &str) -> Result<Vec<Ssh>> {
-	let remotes = manifest.deploy_remotes().to_ssh();
-	if remotes.is_empty() {
-		bail!(
-			"no devices to rotate — `rotate {cmd}` writes to the `[deploy] remotes` \
-			 targets, and none are configured in bootcher.toml"
-		);
-	}
-	Ok(remotes)
-}
-
-/// Bracket a rotation's fleet rollout with the `[hooks.rotate]` `pre`/`post`
-/// commands: `pre` before `rollout` touches any device, `post` once every device
-/// has finished, even if some failed (see [`crate::hooks::run_post`]).
-/// `credential` names the rotation for the hook metadata.
-fn with_hooks(
+/// Bracket a rotation's rollout with the `[hooks.rotate]` `pre`/`post` commands:
+/// `pre` before `rollout` touches any device, `post` once every device has
+/// finished, even if some failed (see [`crate::hooks::run_post`]). `credential`
+/// names the rotation for the hook metadata; `image_ref` is the registry namespace
+/// (or the local list, without a registry).
+pub(crate) fn with_hooks(
 	manifest: &Manifest,
 	credential: Credential,
 	remotes: &[Ssh],
@@ -102,91 +79,66 @@ fn with_hooks(
 	rollout: impl FnOnce(&mut Scope) -> Result<fleet::Report>,
 ) -> Result<()> {
 	let hooks = manifest.hooks();
-	let mut meta = HookMetadata {
-		phase: Phase::Rotate,
-		stage: Stage::Pre,
-		image_name: manifest.general.name.clone(),
-		arches: manifest.images().iter().map(|i| i.arch).collect(),
-		// The ref the devices track as their bootc origin (the default channel in
-		// registry mode; per-device channels aren't known here).
-		image_ref: manifest
-			.registry_list_ref(crate::context::DEFAULT_CHANNEL)
-			.unwrap_or_else(|| manifest.local_list_ref()),
-		// Nothing is built, so there's no image provenance to report.
-		revision: None,
-		version: None,
-		output_dir: None,
-		targets: None,
-		remotes: Some(remotes.iter().map(|r| r.host().to_owned()).collect()),
-		credential: Some(credential),
-		results: None,
-	};
+	let image_ref =
+		manifest.registry().map_or_else(|| manifest.local_list_ref(), |r| r.url.clone());
+	let mut meta = HookMetadata::new(manifest, Phase::Rotate, image_ref);
+	meta.remotes = Some(remotes.iter().map(|r| r.host().to_owned()).collect());
+	meta.credential = Some(credential);
 	crate::hooks::run(&meta, hooks.rotate.pre.as_deref(), job)?;
 	let report = rollout(job)?;
 	crate::hooks::run_post(&mut meta, hooks.rotate.post.as_deref(), &report, job)
 }
 
-/// Rotate the registry pull token on every configured device. Collects a fresh
-/// credential once up front (env or TTY prompt, like provision), verifies it
-/// against the registry from this machine, then per device verifies it actually
-/// pulls the project's image before committing it to [`DEVICE_AUTH_JSON`].
-/// Registry mode only — a LAN device carries no pull secret.
+/// Rotate the registry pull token on `devices` (each a channel device and its
+/// channel ref). Collects a fresh credential once up front (env or TTY prompt, like
+/// provision), verifies it against the registry from this machine, then per device
+/// verifies it actually reaches that device's own channel ref before committing it
+/// to [`DEVICE_AUTH_JSON`].
 ///
 /// `skip_pull_check` (`--skip-pull-check`) bypasses only the eager *local* pre-flight;
 /// the per-device on-device check — the authoritative guard against committing a
 /// bad token — always runs.
 ///
-/// # Panics
-///
-/// Panics if `[targets]` is empty (validated non-empty by manifest loading).
-///
 /// # Errors
 ///
-/// Returns an error if registry mode is not configured, no devices are set, credential
-/// collection fails, a hook fails, or any device's rotation fails.
-pub fn registry_token(manifest: &Manifest, skip_pull_check: bool, job: &mut Scope) -> Result<()> {
-	let Some(ns) = manifest.registry() else {
-		bail!(
-			"`rotate pull-token` only applies in registry mode, but `[deploy] registry` \
-			 is not set in bootcher.toml — LAN devices carry no pull secret to rotate"
-		);
-	};
-	let remotes = deploy_remotes_or_bail(manifest, "pull-token")?;
-
+/// Returns an error if there's no registry, credential collection fails, a hook
+/// fails, or any device's rotation fails.
+pub(crate) fn registry_token(
+	manifest: &Manifest,
+	devices: &[(Ssh, String)],
+	skip_pull_check: bool,
+	extra: Vec<fleet::Outcome>,
+	job: &mut Scope,
+) -> Result<()> {
+	let ns = &manifest.require_registry("`device rotate pull-token`")?.url;
 	// Collect the new credential once, before touching any device. Verify it from
 	// here up front (unless opted out) so a typo'd token fails the whole command
-	// before the rollout starts, rather than device-by-device. A blank username
-	// (the public-registry opt-out) has no meaning here — there's no token to roll —
-	// so it's a hard error rather than silently wiping each device's credential.
+	// before the rollout starts. A blank username (the public-registry opt-out) has no
+	// meaning here — there's no token to roll — so it's a hard error rather than
+	// silently wiping each device's credential.
 	let Some((user, token)) = secrets::collect_pull_credential(ns)? else {
 		bail!(
-			"`rotate pull-token` needs a credential, but none was provided (a blank username means \
-			 a public registry, which has no token to rotate)"
+			"`device rotate pull-token` needs a credential, but none was provided (a blank \
+			 username means a public registry, which has no token to rotate)"
 		);
 	};
 	if !skip_pull_check {
 		secrets::verify_pull_login(ns, &user, &token)?;
 	}
 	let auth_json = secrets::render_auth_json(ns, &user, &token);
-	// A suffix-free, multi-arch registry ref the new credential is verified against on
-	// the device before it's committed. Channel-agnostic: pull auth is scoped to the
-	// registry namespace, not the tag, and the default `latest` channel is the ref
-	// most likely to exist — so a credential probe uses it regardless of which channel
-	// a given device tracks. Project-level (arch-independent), straight off the manifest.
-	let registry_ref = manifest
-		.registry_list_ref(crate::context::DEFAULT_CHANNEL)
-		.expect("registry set ⇒ a registry ref exists");
-
+	let remotes: Vec<Ssh> = devices.iter().map(|(s, _)| s.clone()).collect();
 	with_hooks(manifest, Credential::PullToken, &remotes, job, |job| {
-		fleet::for_each_remote(
-			&remotes,
+		let report = fleet::for_each_host(
+			devices,
 			"pull-token rotation",
+			|(ssh, _)| ssh.host().to_owned(),
 			manifest.concurrency().rotate,
 			job,
-			|remote, scope| {
-				verify_and_commit_token(remote, scope, &registry_ref, DEVICE_AUTH_JSON, &auth_json)
+			|(remote, channel_ref), scope| {
+				verify_and_commit_token(remote, scope, channel_ref, DEVICE_AUTH_JSON, &auth_json)
 			},
-		)
+		)?;
+		Ok(report.with(extra))
 	})
 }
 
@@ -199,7 +151,7 @@ pub fn registry_token(manifest: &Manifest, skip_pull_check: bool, job: &mut Scop
 /// with no old file to restore. The script rides ssh stdin with the candidate in a
 /// quoted heredoc, `set -e` skipping the commit on a failed probe, and a `trap`
 /// cleaning the temp (see [`Ssh`] for why stdin, not argv).
-fn verify_and_commit_token(
+pub(crate) fn verify_and_commit_token(
 	remote: &Ssh,
 	scope: &Scope,
 	registry_ref: &str,
@@ -239,25 +191,28 @@ const RETIRING_MARKER: &str = "# bootcher-retiring: removed on the next successf
 /// over a momentary hiccup.
 const KEY_VALIDATE_ATTEMPTS: usize = 3;
 
-/// Rotate the admin SSH key on every configured device. Collects the new key once
-/// up front (a private key path or a TTY picker), then rolls the fleet in parallel.
-/// Each device is lockout-safe: the new key is staged and proven with a real login
+/// Rotate the admin SSH key on `remotes`. Collects the new key once up front (a
+/// private key path or a TTY picker), then rolls the devices in parallel. Each
+/// device is lockout-safe: the new key is staged and proven with a real login
 /// before the old key is retired, so a failed or interrupted rotation always leaves
-/// a working key in place. Applies regardless of LAN/registry mode.
+/// a working key in place. `extra` are outcomes (unreachable devices) to report
+/// alongside.
 ///
 /// # Errors
 ///
-/// Returns an error if no devices are configured, key collection fails, a hook
-/// fails, or any device's rotation fails.
-pub fn ssh_key(manifest: &Manifest, key: Option<&str>, job: &mut Scope) -> Result<()> {
-	let remotes = deploy_remotes_or_bail(manifest, "ssh-key")?;
-
-	// Collect the new key; may run the interactive picker on a TTY.
-	let (authorized_keys, key_path) = secrets::collect_authorized_keys(key, "--path")?;
-
-	with_hooks(manifest, Credential::SshKey, &remotes, job, |job| {
-		fleet::for_each_remote(
-			&remotes,
+/// Returns an error if key collection fails, a hook fails, or any device's
+/// rotation fails.
+pub(crate) fn ssh_key(
+	manifest: &Manifest,
+	remotes: &[Ssh],
+	authorized_keys: &str,
+	key_path: &Path,
+	extra: Vec<fleet::Outcome>,
+	job: &mut Scope,
+) -> Result<()> {
+	with_hooks(manifest, Credential::SshKey, remotes, job, |job| {
+		let report = fleet::for_each_remote(
+			remotes,
 			"admin-key rotation",
 			manifest.concurrency().rotate,
 			job,
@@ -266,121 +221,13 @@ pub fn ssh_key(manifest: &Manifest, key: Option<&str>, job: &mut Scope) -> Resul
 					remote,
 					scope,
 					DEVICE_ADMIN_AUTHORIZED_KEYS,
-					&authorized_keys,
-					&key_path,
+					authorized_keys,
+					key_path,
 				)
 			},
-		)
+		)?;
+		Ok(report.with(extra))
 	})
-}
-
-/// Push the image-signing config to every configured device. Registry mode only;
-/// targets `[deploy] remotes`. Two use cases:
-///
-/// - **Enrolling signing** on a fleet provisioned before signing was enabled — run
-///   this, then `bootcher deploy` to switch the bootc origin to the verifying
-///   transport.
-/// - **Rotating the signing key** when the cosign key has leaked or is expiring —
-///   run this, then `bootcher deploy`; the window between the two steps leaves
-///   `bootc upgrade` failing verification (the registry still carries the old
-///   signature), but SSH access is unaffected and the fleet is always recoverable.
-///
-/// Connects via SSH to each device and atomically overwrites its trusted key
-/// (`/etc/pki/containers/<name>.pub`), `policy.json`, and the `registries.d`
-/// sigstore-attachment drop-in. Defaults to the public key from `[deploy] registry`
-/// in bootcher.toml; pass `--pubkey` to use a different one.
-///
-/// # Errors
-///
-/// Returns an error if registry/signing mode is not configured, key collection fails,
-/// a hook fails, or any device's update fails.
-pub fn signing_key(manifest: &Manifest, pubkey: Option<&str>, job: &mut Scope) -> Result<()> {
-	let Some(ns) = manifest.registry() else {
-		bail!(
-			"`rotate sign-key` only applies in registry mode, but `[deploy] registry` is not set \
-			 in bootcher.toml — image signing is a registry-mode feature"
-		);
-	};
-	let Some(signing) = manifest.signing() else {
-		bail!(
-			"`[deploy] registry` is a plain URL with no signing config — there's no signing key to \
-			 rotate. Expand it to the signing form: \
-			 `registry = {{ url = \"...\", key = \"cosign.key\" }}`"
-		);
-	};
-	let remotes = deploy_remotes_or_bail(manifest, "sign-key")?;
-
-	let name = &manifest.general.name;
-	let device_pubkey_path = secrets::device_pubkey_path(name);
-	let policy_json = secrets::render_policy_json(&format!("{ns}/{name}"), &[&device_pubkey_path]);
-	let registries_d_path = secrets::device_registries_d_path();
-	let registries_d = secrets::render_registries_d(ns);
-
-	let pubkey_path = pubkey.map_or_else(|| signing.public_key_path(), str::to_owned);
-	let pubkey_pem = read_pubkey(&pubkey_path)?;
-	let script = signing_key_script(
-		&pubkey_pem,
-		&device_pubkey_path,
-		&policy_json,
-		&registries_d_path,
-		&registries_d,
-	);
-
-	with_hooks(manifest, Credential::SignKey, &remotes, job, |job| {
-		fleet::for_each_remote(
-			&remotes,
-			"sign-key rotation",
-			manifest.concurrency().rotate,
-			job,
-			|remote, scope| {
-				remote.run_sh(
-					scope,
-					format!("replace signing key on {}", remote.host()),
-					&[],
-					script.clone(),
-				)
-			},
-		)
-	})
-}
-
-/// Read a public-key PEM from `path`, with a pointer to enroll on a miss.
-fn read_pubkey(path: &str) -> Result<String> {
-	fs::read_to_string(path).with_context(|| {
-		format!("reading the signing public key {path} — generate one with `bootcher sign enroll`")
-	})
-}
-
-/// Device script: overwrite `pubkey_path` with the new key's PEM, install
-/// `policy.json` trusting it as the sole signing key, and ensure the
-/// `registries.d` drop-in enabling sigstore-attachment lookups is present.
-/// Writing the drop-in is idempotent for devices already provisioned with
-/// signing; it's what makes this command also cover enrolling signing on a
-/// device that was provisioned unsigned.
-fn signing_key_script(
-	pubkey_pem: &str,
-	pubkey_path: &str,
-	policy_json: &str,
-	registries_d_path: &str,
-	registries_d: &str,
-) -> String {
-	format!(
-		"set -eu\n\
-		 ptmp=$(mktemp); poltmp=$(mktemp); rdtmp=$(mktemp)\n\
-		 trap 'rm -f \"$ptmp\" \"$poltmp\" \"$rdtmp\"' EXIT\n\
-		 cat > \"$ptmp\" <<'BOOTCHER_PUB'\n\
-		 {pubkey_pem}\
-		 BOOTCHER_PUB\n\
-		 sudo install -m 0644 -D \"$ptmp\" {pubkey_path}\n\
-		 cat > \"$poltmp\" <<'BOOTCHER_POL'\n\
-		 {policy_json}\
-		 BOOTCHER_POL\n\
-		 sudo install -m 0644 \"$poltmp\" /etc/containers/policy.json\n\
-		 cat > \"$rdtmp\" <<'BOOTCHER_REGD'\n\
-		 {registries_d}\
-		 BOOTCHER_REGD\n\
-		 sudo install -m 0644 -D \"$rdtmp\" {registries_d_path}\n"
-	)
 }
 
 /// Rotate the admin SSH key on one `remote`, lockout-safe. An SSH key can only be

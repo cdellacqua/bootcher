@@ -91,6 +91,16 @@ pub fn interrupted() -> bool {
 	INTERRUPTED.get().is_some_and(|f| f.load(Ordering::Relaxed))
 }
 
+/// Record an interruption that didn't come from a signal — an interactive prompt
+/// the user cancelled (Esc or Ctrl-C inside `inquire`, which reads the terminal
+/// raw so no SIGINT is raised). The run then unwinds and exits 130 exactly as
+/// after a Ctrl-C. A no-op where [`install`] never ran (tests).
+pub(crate) fn mark_interrupted() {
+	if let Some(flag) = INTERRUPTED.get() {
+		flag.store(true, Ordering::SeqCst);
+	}
+}
+
 /// `Err("interrupted")` once a shutdown signal has arrived, else `Ok(())`. Drop
 /// `signals::check()?` into long loops: the error unwinds through the RAII
 /// guards, leaving no loop device, mount, or qemu behind.

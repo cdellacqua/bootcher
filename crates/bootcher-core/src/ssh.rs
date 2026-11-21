@@ -1,7 +1,7 @@
 //! `ssh` to a remote host — the one place that knows the connection details every
 //! ssh call needs, which the scattered bare `ssh <remote>` sites kept getting
 //! wrong. Used by both the deploy path (`upgrade`/`deploy`/`rotate`, reaching a
-//! `[deploy] remotes` device) and the remote image builder, which drives a build
+//! `remotes` device) and the remote image builder, which drives a build
 //! host the same way (a real box or a throwaway local VM).
 //!
 //! It bundles three things:
@@ -110,6 +110,12 @@ impl Ssh {
 	/// [`unchecked`]: duct::Expression::unchecked
 	pub(crate) fn sh_expr(&self, script: &str) -> duct::Expression {
 		self.expr(&[], "sh").stdin_bytes(script.to_owned())
+	}
+
+	/// [`Self::sh_expr`] with extra ssh options `pre` (e.g. a short `ConnectTimeout`
+	/// for a probe that should fail fast).
+	pub(crate) fn sh_expr_with(&self, pre: &[&str], script: &str) -> duct::Expression {
+		self.expr(pre, "sh").stdin_bytes(script.to_owned())
 	}
 
 	/// Run `script` on the device under `sh` — the script rides stdin, so the login

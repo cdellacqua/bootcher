@@ -1,11 +1,11 @@
 //! Convert a live, SSH-reachable host into a bootc system *in place* with `bootc
-//! install to-existing-root` — the engine behind `bootcher takeover`.
+//! install to-existing-root` — the engine behind `bootcher device takeover`.
 //!
-//! Takeover is a one-time funnel into the existing deploy flow: it builds the
-//! image (the pipeline's first phase) then, over the `[deploy] remotes` SSH
-//! channel, replaces each host's stock OS (Ubuntu/Debian/Rocky on a VPS) with the
-//! built image. Afterwards the host is an ordinary bootc device pointing at the
-//! same origin, so `deploy`/`rotate` work against it unchanged.
+//! Takeover is a one-time funnel: over the `remotes` SSH channel it replaces each
+//! selected host's stock OS (Ubuntu/Debian/Rocky on a VPS) with the project image.
+//! Afterwards the host is an ordinary bootc device — a direct one updated by
+//! `device deploy`, or a channel one following its channel — so every other device
+//! command works against it unchanged.
 //!
 //! ## Two SSH identities
 //!
@@ -45,19 +45,25 @@
 //! honoured. Only takeover does this: `upgrade`/`deploy` treat a changed key as
 //! the error it is there.
 //!
-//! ## Backends
+//! ## Modes
 //!
-//! Mirrors the upgrade job: in LAN mode each host pulls the matching arch
-//! member from a loopback registry over an `ssh -R` tunnel (reusing upgrade's
-//! transfer); in registry mode the multi-arch list is pushed once and each host pulls the
-//! configured ref directly. Either way the image lands in the host's
-//! containers-storage, `bootc install to-existing-root` converts the disk, the
-//! provisioning secrets are installed into the staged deployment's `/etc`, and the
-//! host reboots into bootc.
+//! - **direct** (`--direct`): the image is built here and each host pulls its arch
+//!   member from a loopback registry over an `ssh -R` tunnel (the direct device
+//!   step's transfer), then installs it with a `containers-storage` origin
+//!   (`localhost/<name>:latest`). No pull credential, no trust files.
+//! - **channel** (`--channel ch`): nothing is built or pushed; each host pulls
+//!   `<registry>/<name>:<ch>` itself (with the pull credential, when there is one)
+//!   and installs with that registry origin. The pull credential and, with signing
+//!   on, the trust files go into the staged `/etc`.
+//!
+//! Either way `bootc install to-existing-root` converts the disk, the provisioning
+//! files are installed into the staged deployment's `/etc`, and the host reboots
+//! into bootc.
 
 use crate::context::{DEVICE_AUTH_JSON, ImageRef, Manifest, RemoteConfig};
-use crate::hooks::{HookMetadata, Phase, Stage};
-use crate::jobs::secrets::{DeviceFile, Provisioning};
+use crate::hooks::{HookMetadata, Phase};
+use crate::interactive::{Gate, Prompted, gate};
+use crate::jobs::secrets::{DeviceFile, InstallMode, Provisioning};
 use crate::jobs::upgrade;
 use crate::known_hosts;
 use crate::preflight::{self, Checks};
@@ -66,7 +72,6 @@ use crate::ssh::Ssh;
 use crate::{fleet, registry};
 use anyhow::{Context, Result, bail};
 use std::fmt::Write as _;
-use std::io::IsTerminal;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
@@ -115,54 +120,51 @@ enum HostReadiness {
 	Unsupported(Vec<String>),
 }
 
-/// The takeover *job*'s prerequisites, for the `--skip-build` path (the build phase
-/// is skipped, so [`crate::jobs::build::preflight`] doesn't run): a local `podman`
-/// (the job assembles the multi-arch list and, in registry mode, pushes it) plus the
-/// per-host over-SSH readiness checks. The build-inclusive pipeline reaches `podman`
-/// through `build::preflight` instead and calls [`host_preflight`] directly.
+/// The takeover *job*'s local prerequisites beyond the build: `podman` (assemble or
+/// serve the image) and `ssh`.
 ///
 /// # Errors
 ///
-/// Returns an error if `podman`/`ssh` are missing, no remotes are configured, or any
-/// host is ineligible.
-pub(crate) fn preflight(manifest: &Manifest, login: Option<&str>) -> Result<()> {
+/// Returns an error listing every missing prerequisite.
+pub(crate) fn preflight_tools(mode: &InstallMode) -> Result<()> {
 	let mut checks = Checks::default();
-	checks.bin("podman", preflight::PODMAN_HINT);
-	checks.finish()?;
-	host_preflight(manifest, login)
+	if *mode == InstallMode::Direct {
+		checks.bin("podman", preflight::PODMAN_HINT);
+	}
+	checks.bin("ssh", "reach the takeover targets over SSH");
+	checks.finish()
 }
 
-/// Per-remote, over-SSH readiness checks, run up front (before the build) so an
-/// obvious disqualifier — a missing `podman`/`sudo`, an arch the project doesn't
-/// build, an unadoptable root filesystem — fails fast rather than after a multi-GB
-/// build. `login` is the fleet-wide `--login` default; each host may override it
-/// with its own `takeover_login`.
+/// Per-host, over-SSH readiness checks for `targets`, run up front (before the
+/// build) so an obvious disqualifier — a missing `podman`/`sudo`, an arch the
+/// project doesn't build, an unadoptable root filesystem — fails fast rather than
+/// after a multi-GB build. `login` is the fleet-wide `--login` default; each host
+/// may override it with its own `takeover_login`.
 ///
-/// Accumulates failures across the whole fleet (like [`Checks`]) and reports them
-/// together. A host already on bootc is noted and skipped, not failed — takeover is
-/// idempotent. bootc runs the authoritative layout check at install start; this is
+/// A host is first probed as `admin@` with the `--ssh-key` identity: an
+/// already-converted host has no stock login any more, and answering as admin with
+/// a working `bootc status` is what marks it converted (and skipped — takeover is
+/// idempotent). Only then is the stock login tried.
+///
+/// Accumulates failures across the whole set (like [`Checks`]) and reports them
+/// together. bootc runs the authoritative layout check at install start; this is
 /// the cheap pre-filter.
 ///
 /// # Errors
 ///
-/// Returns an error if `ssh` is missing locally, no remotes are configured, a host
-/// is unreachable, or any host is ineligible.
-pub(crate) fn host_preflight(manifest: &Manifest, login: Option<&str>) -> Result<()> {
-	// The whole rollout is SSH; without it locally we can't even probe.
-	let mut checks = Checks::default();
-	checks.bin("ssh", "reach the takeover targets over SSH");
-	checks.finish()?;
-
-	let remotes = manifest.deploy_remotes();
-	if remotes.is_empty() {
-		bail!(
-			"takeover needs at least one target in `[deploy] remotes` (the live host to convert) \
-			 in bootcher.toml"
-		);
-	}
-
+/// Returns an error if a host is unreachable, or any host is ineligible.
+pub(crate) fn host_preflight(
+	targets: &[RemoteConfig],
+	login: Option<&str>,
+	ssh_key: &str,
+) -> Result<()> {
 	let mut failures: Vec<String> = Vec::new();
-	for remote in remotes {
+	for remote in targets {
+		let admin = remote.admin_ssh(ssh_key);
+		if admin_is_bootc(&admin) {
+			eprintln!("takeover: {} is already a bootc system — it will be skipped", admin.host());
+			continue;
+		}
 		let initial = remote.takeover_ssh(login)?;
 		let host = initial.host().to_owned();
 		let probe = initial
@@ -245,115 +247,92 @@ fn evaluate_probe(out: &str) -> HostReadiness {
 	if reasons.is_empty() { HostReadiness::Ready } else { HostReadiness::Unsupported(reasons) }
 }
 
-/// Run the takeover across the configured fleet: get the image onto each live
-/// host, convert it in place, inject the provisioning secrets, and reboot into
-/// bootc — verifying over the new `admin@` identity.
+/// Run the takeover across `targets`: get the image onto each live host, convert it
+/// in place, inject the provisioning files, and reboot into bootc — verifying over
+/// the new `admin@` identity.
 ///
 /// `login` is the fleet-wide stock login (`--login`); `provisioning` is the same
-/// secret set disk provisioning bakes (its [`Provisioning::files`] are installed
+/// file set disk provisioning bakes (its [`Provisioning::files`] are installed
 /// into the staged `/etc`); `ssh_key` is the resolved admin **private** key path —
 /// its public half is injected, its private half is the post-reboot identity.
 /// `yes` (`-y`) trusts each host's new SSH host key without asking (see the module
-/// docs).
-///
-/// Dispatches on registry vs LAN exactly like [`upgrade::run`]: a configured
-/// registry pushes the multi-arch list and has each host pull the ref; otherwise
-/// each host pulls its arch member from a shared loopback registry over `ssh -R`.
+/// docs). For a direct takeover the local list (`localhost/<name>:latest`) must
+/// already be built.
 ///
 /// The manifest's `[hooks.takeover]` `pre`/`post` commands run once around the
-/// whole push + per-host rollout — so they fire with or without `--skip-build`.
-/// The `pre` hook runs after the targets resolve but before the push; `post` after
-/// every host has finished, even if some failed (each host's outcome in its
-/// metadata `results`) — the run still fails afterwards if any host did.
+/// whole per-host rollout. `post` runs after every host has finished, even if some
+/// failed (each host's outcome in its metadata `results`) — the run still fails
+/// afterwards if any host did.
 ///
 /// # Errors
 ///
-/// Returns an error if no arches/remotes are configured, a hook fails, the push
-/// fails, or any host's takeover fails.
+/// Returns an error if a hook fails, the image can't be served, or any host's
+/// takeover fails.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
 	manifest: &Manifest,
+	targets: &[RemoteConfig],
 	login: Option<&str>,
 	provisioning: &Provisioning,
 	ssh_key: &str,
-	channel: &str,
+	mode: &InstallMode,
 	yes: bool,
 	job: &mut Scope,
 ) -> Result<()> {
 	let images = manifest.images();
-	if images.is_empty() {
-		bail!("no target arches to take over — set `[targets]` in bootcher.toml");
-	}
-	let remotes = manifest.deploy_remotes();
-	if remotes.is_empty() {
-		bail!("takeover needs at least one target in `[deploy] remotes` in bootcher.toml");
-	}
-
-	let targets = resolve_targets(remotes, login, ssh_key)?;
+	let targets = resolve_targets(targets, login, ssh_key)?;
 	let files = provisioning.files();
 	let max_workers = manifest.concurrency().takeover;
-
-	let provenance = crate::context::GitProvenance::detect(std::path::Path::new("."), job);
-	// Compute the immutable CalVer tag now, while `provenance` is still whole (its
-	// fields are moved into `meta` just below).
-	let calver = crate::context::calver_now(provenance.short_sha().as_deref());
 	let hooks = manifest.hooks();
-	let mut meta = HookMetadata {
-		phase: Phase::Takeover,
-		stage: Stage::Pre,
-		image_name: manifest.general.name.clone(),
-		arches: images.iter().map(|i| i.arch).collect(),
-		// The ref pushed/served and recorded as the host's bootc origin, as at `upgrade`.
-		image_ref: manifest.registry_list_ref(channel).unwrap_or_else(|| manifest.local_list_ref()),
-		revision: provenance.revision,
-		version: provenance.version,
-		output_dir: None,
-		targets: None,
-		remotes: Some(targets.iter().map(|t| t.host.clone()).collect()),
-		credential: None,
-		results: None,
+
+	let (image_ref, channel) = match mode {
+		InstallMode::Channel { channel, .. } => (
+			manifest.tag_ref(channel).context("a channel takeover needs `[registry]`")?,
+			Some(channel.clone()),
+		),
+		InstallMode::Direct => (manifest.local_list_ref(), None),
 	};
+	let mut meta = HookMetadata::new(manifest, Phase::Takeover, image_ref.clone());
+	meta.channel = channel;
+	meta.remotes = Some(targets.iter().map(|t| t.host.clone()).collect());
+	if *mode == InstallMode::Direct {
+		let provenance = crate::context::GitProvenance::detect(manifest.root(), job);
+		meta.revision = provenance.revision;
+		meta.version = provenance.version;
+	}
 	crate::hooks::run(&meta, hooks.takeover.pre.as_deref(), job)?;
-	let report = if let Some(channel_ref) = manifest.registry_list_ref(channel)
-		&& let Some(version_ref) = manifest.registry_version_ref(&calver)
-	{
-		// Registry mode: the host pulls the ref directly, so it must be in the registry
-		// first. Push the multi-arch list (signing it if configured), then hand each
-		// host the ref + the pull credential (the device `auth.json`, when present).
-		upgrade::push_multiarch_list(
-			&manifest.local_list_ref(),
-			&channel_ref,
-			&version_ref,
-			manifest.signing().as_ref(),
-			job,
-		)?;
-		let auth_json = files.iter().find(|f| f.path == DEVICE_AUTH_JSON).map(|f| f.data.as_str());
-		let backend = Backend::Registry { reference: &channel_ref, auth_json };
-		run_fleet(&targets, &backend, &files, yes, max_workers, job)?
-	} else {
-		// LAN mode: stand up one loopback registry for the whole fleet (it handles
-		// concurrent pulls) and tear it down once every host has finished. The list
-		// object was assembled by the build phase; just name it.
-		let local_list_ref = manifest.local_list_ref();
-		let reg = registry::serve_manifest_list(&local_list_ref, "latest", job)?;
-		let backend =
-			Backend::Lan { images: &images, local_list_ref: &local_list_ref, port: reg.port() };
-		let result = run_fleet(&targets, &backend, &files, yes, max_workers, job);
-		drop(reg);
-		result?
+	let report = match mode {
+		InstallMode::Channel { .. } => {
+			// The host pulls the channel ref itself (authenticating with the device
+			// pull credential, when there is one); nothing is pushed from here.
+			let auth_json =
+				files.iter().find(|f| f.path == DEVICE_AUTH_JSON).map(|f| f.data.as_str());
+			let backend = Backend::Channel { reference: &image_ref, auth_json };
+			run_fleet(&targets, &backend, &files, yes, max_workers, job)?
+		}
+		InstallMode::Direct => {
+			// Stand up one loopback registry for the whole fleet (it handles concurrent
+			// pulls) and tear it down once every host has finished.
+			let reg = registry::serve_manifest_list(&image_ref, "latest", job)?;
+			let backend =
+				Backend::Direct { images: &images, local_list_ref: &image_ref, port: reg.port() };
+			let result = run_fleet(&targets, &backend, &files, yes, max_workers, job);
+			drop(reg);
+			result?
+		}
 	};
 	crate::hooks::run_post(&mut meta, hooks.takeover.post.as_deref(), &report, job)
 }
 
-/// How a host obtains the image into its containers-storage. The two backends from
-/// [`upgrade`], specialised for takeover's stock-login connection.
+/// How a host obtains the image into its containers-storage.
 enum Backend<'a> {
 	/// Pull the matching arch member from the shared loopback registry on `port` over
 	/// an `ssh -R` tunnel; install from the local `containers-storage` ref
-	/// (`local_list_ref`, the project's [`Manifest::local_list_ref`]).
-	Lan { images: &'a [ImageRef], local_list_ref: &'a str, port: u16 },
-	/// Pull `reference` straight from the configured registry, authenticating with
+	/// (`local_list_ref`, the project's `localhost/<name>:latest`).
+	Direct { images: &'a [ImageRef], local_list_ref: &'a str, port: u16 },
+	/// Pull the channel `reference` straight from the registry, authenticating with
 	/// `auth_json` (the device pull secret) when present; install from that ref.
-	Registry { reference: &'a str, auth_json: Option<&'a str> },
+	Channel { reference: &'a str, auth_json: Option<&'a str> },
 }
 
 /// One takeover target: its display name plus both SSH identities.
@@ -366,7 +345,7 @@ struct Target {
 	admin: Ssh,
 }
 
-/// Resolve every remote into both SSH identities up front, surfacing a missing
+/// Resolve every target into both SSH identities up front, surfacing a missing
 /// stock login (no `takeover_login`, no `--login`) before any work starts.
 fn resolve_targets(
 	remotes: &[RemoteConfig],
@@ -414,23 +393,23 @@ fn takeover_host(
 	yes: bool,
 	job: &mut Scope,
 ) -> Result<()> {
-	let initial = &target.initial;
-
 	// Idempotency: a host already converted (e.g. a re-run after a partial failure
-	// past the reboot) is a no-op. Cheaper than re-shipping the image to discover it.
-	if already_bootc(initial)? {
+	// past the reboot) is a no-op. Checked as `admin@` first — a converted host has no
+	// stock login left — then over the stock login.
+	if admin_is_bootc(&target.admin) || already_bootc(&target.initial)? {
 		job.println(format!("{}: already a bootc system — nothing to do", target.host));
 		return Ok(());
 	}
+	let initial = &target.initial;
 
 	// 1. Get the arch-matched image into the host's containers-storage; the ref to
-	//    install from (and record as the bootc origin) depends on the backend.
+	//    install from (and record as the bootc origin) depends on the mode.
 	let install_ref = match backend {
-		Backend::Lan { images, local_list_ref, port } => {
-			stage_lan_image(initial, images, local_list_ref, *port, job)?
+		Backend::Direct { images, local_list_ref, port } => {
+			stage_direct_image(initial, images, local_list_ref, *port, job)?
 		}
-		Backend::Registry { reference, auth_json } => {
-			stage_registry_image(initial, reference, *auth_json, job)?;
+		Backend::Channel { reference, auth_json } => {
+			stage_channel_image(initial, reference, *auth_json, job)?;
 			(*reference).to_owned()
 		}
 	};
@@ -438,10 +417,10 @@ fn takeover_host(
 	// 2. Convert the disk in place.
 	install_to_existing_root(initial, &install_ref, backend, job)?;
 
-	// 3. Inject the provisioning secrets into the staged deployment's /etc — the
-	//    load-bearing step (admin key, pull token, signing policy). Signing
-	//    enforcement otherwise rides the image's baked install config, exactly as in
-	//    disk provisioning. The same step masks the ESP automount (see
+	// 3. Inject the provisioning files into the staged deployment's /etc — the
+	//    load-bearing step (admin key; for a channel host the pull token and trust
+	//    files). Signing enforcement otherwise rides the image's baked install config,
+	//    exactly as in disk provisioning. The same step masks the ESP automount (see
 	//    `MASK_ESP_AUTOMOUNT_SH`), which would otherwise break every later upgrade.
 	inject_secrets(initial, &install_ref, files, job)?;
 
@@ -552,7 +531,7 @@ fn trust_new_host_key(target: &Target, fresh: &Path, yes: bool, job: &Scope) -> 
 			new_fps.join(", "),
 		));
 	};
-	match gate(yes, std::io::stdin().is_terminal()) {
+	match gate(yes, crate::interactive::is_tty()) {
 		Gate::Proceed => log_trusted("-y"),
 		Gate::Prompt if trust.accept_all => log_trusted("accepted for all hosts"),
 		Gate::Prompt => {
@@ -580,6 +559,7 @@ fn trust_new_host_key(target: &Target, fresh: &Path, yes: bool, job: &Scope) -> 
 				.with_help_message("y: yes · n: no · a: yes, and for every further host this run")
 				.with_error_message("answer y (yes), n (no) or a (all)")
 				.prompt()
+				.prompted()
 			})?;
 			match answer {
 				TrustAnswer::Yes => {}
@@ -603,10 +583,10 @@ fn trust_new_host_key(target: &Target, fresh: &Path, yes: bool, job: &Scope) -> 
 	known_hosts::append(&entry.file, &new)
 }
 
-/// LAN backend: identify the host's arch, ship it the matching member from the
+/// Direct mode: identify the host's arch, ship it the matching member from the
 /// shared loopback registry, and return the local `containers-storage` ref to
 /// install from (the suffix-free `localhost/<name>:latest` list tag).
-fn stage_lan_image(
+fn stage_direct_image(
 	initial: &Ssh,
 	images: &[ImageRef],
 	local_list_ref: &str,
@@ -627,11 +607,11 @@ fn stage_lan_image(
 	Ok(local_list_ref.to_owned())
 }
 
-/// Registry backend: write the device pull credential (if any) to a host temp file
-/// and `sudo podman pull` the ref into containers-storage. Install then runs from
-/// the same registry ref (so the recorded origin is the registry, matching the
+/// Channel mode: write the device pull credential (if any) to a host temp file and
+/// `sudo podman pull` the channel ref into containers-storage. Install then runs
+/// from the same registry ref (so the recorded origin is the channel, matching the
 /// device's steady state).
-fn stage_registry_image(
+fn stage_channel_image(
 	initial: &Ssh,
 	reference: &str,
 	auth_json: Option<&str>,
@@ -654,8 +634,8 @@ fn stage_registry_image(
 /// `podman run … bootc install to-existing-root` over the stock login — the
 /// destructive conversion. The privileged container mounts the host root, dev, and
 /// container store; `--target-imgref` pins the recorded bootc origin to the ref the
-/// host will track afterwards (a local `containers-storage` ref in LAN mode, the
-/// registry ref otherwise).
+/// host will track afterwards (a local `containers-storage` ref for a direct host,
+/// the channel ref for a channel one).
 ///
 /// The exact flags here are the ones validated on the e2e VM; signing enforcement
 /// is not set explicitly — it rides the image's baked install config, exactly as in
@@ -675,12 +655,12 @@ fn install_to_existing_root(
 	backend: &Backend,
 	job: &Scope,
 ) -> Result<()> {
-	// LAN installs from a local containers-storage image; registry from the registry.
+	// Direct installs from a local containers-storage image; channel from the registry.
 	let target_flags = match backend {
-		Backend::Lan { .. } => {
+		Backend::Direct { .. } => {
 			format!("--target-transport containers-storage --target-imgref {install_ref}")
 		}
-		Backend::Registry { .. } => format!("--target-imgref {install_ref}"),
+		Backend::Channel { .. } => format!("--target-imgref {install_ref}"),
 	};
 	let script = format!(
 		"set -eu\n\
@@ -767,6 +747,22 @@ fn etc_relative(path: &str) -> Result<&str> {
 		.with_context(|| format!("provisioning path {path} is not under /etc"))
 }
 
+/// Whether the host answers as `admin@` (the `--ssh-key` identity) with a working
+/// `bootc status` — i.e. it's already converted. Quick to fail (short connect
+/// timeout, `BatchMode`), since on a stock host the admin login simply doesn't
+/// exist yet.
+fn admin_is_bootc(admin: &Ssh) -> bool {
+	admin
+		.sh_expr_with(
+			&["-o", "ConnectTimeout=10", "-o", "IdentitiesOnly=yes"],
+			"command -v bootc >/dev/null 2>&1 && sudo bootc status >/dev/null 2>&1 && echo yes || echo no",
+		)
+		.stderr_null()
+		.unchecked()
+		.read()
+		.is_ok_and(|out| out.trim() == "yes")
+}
+
 /// Whether the host is already a bootc system. A `command -v bootc` guard keeps the
 /// probe from erroring on a stock distro that lacks bootc entirely; `unchecked` so a
 /// non-bootc host's failing `bootc status` reports `no` rather than erroring.
@@ -802,15 +798,16 @@ fn verify_bootc(admin: &Ssh, job: &Scope) -> Result<()> {
 	})
 }
 
-/// The destructive-confirmation gate for `bootcher takeover`. `-y/--yes` proceeds;
-/// otherwise it's an interactive y/N naming every target, and a non-TTY run without
-/// `-y` fails closed (no one to ask ⇒ don't wipe a host on a guess).
+/// The destructive-confirmation gate for `bootcher device takeover`. `-y/--yes`
+/// proceeds; otherwise it's an interactive y/N naming every target and the mode it
+/// will end up in, and a non-TTY run without `-y` fails closed (no one to ask ⇒
+/// don't wipe a host on a guess). Enter answers no: this one is irreversible.
 ///
 /// # Errors
 ///
 /// Returns an error when the user declines, or on a non-TTY run without `-y`.
-pub fn confirm(hosts: &[String], yes: bool) -> Result<()> {
-	match gate(yes, std::io::stdin().is_terminal()) {
+pub(crate) fn confirm(hosts: &[String], mode: &str, yes: bool) -> Result<()> {
+	match gate(yes, crate::interactive::is_tty()) {
 		Gate::Proceed => Ok(()),
 		Gate::Bail => bail!(
 			"takeover irreversibly wipes each target's current OS, and stdin is not a TTY to \
@@ -821,37 +818,19 @@ pub fn confirm(hosts: &[String], yes: bool) -> Result<()> {
 				"takeover will IRREVERSIBLY convert these hosts to bootc, wiping their current OS:"
 			);
 			for h in hosts {
-				eprintln!("  - {h}");
+				eprintln!("  - {h} → {mode}");
 			}
 			eprintln!("Back up anything you need first.");
-			if inquire::Confirm::new("Proceed with takeover?").with_default(false).prompt()? {
+			if inquire::Confirm::new("Proceed with takeover?")
+				.with_default(false)
+				.prompt()
+				.prompted()?
+			{
 				Ok(())
 			} else {
 				bail!("aborted: takeover not confirmed");
 			}
 		}
-	}
-}
-
-/// The three outcomes of the confirmation gate, factored out of [`confirm`] for
-/// testability (the actual prompt needs a TTY).
-#[derive(Debug, PartialEq, Eq)]
-enum Gate {
-	/// `-y` given — go ahead with no prompt.
-	Proceed,
-	/// Interactive TTY — ask y/N.
-	Prompt,
-	/// Non-TTY without `-y` — fail closed.
-	Bail,
-}
-
-fn gate(yes: bool, is_tty: bool) -> Gate {
-	if yes {
-		Gate::Proceed
-	} else if is_tty {
-		Gate::Prompt
-	} else {
-		Gate::Bail
 	}
 }
 
@@ -919,16 +898,6 @@ mod tests {
 		// A path outside /etc (or the deceptive `/etcfoo`) is rejected.
 		assert!(etc_relative("/var/lib/x").is_err());
 		assert!(etc_relative("/etcfoo/x").is_err());
-	}
-
-	#[test]
-	fn confirmation_gate_fails_closed_off_a_tty() {
-		// -y always proceeds; a TTY prompts; a non-TTY without -y bails (never wipes
-		// a host on a guess).
-		assert_eq!(gate(true, false), Gate::Proceed);
-		assert_eq!(gate(true, true), Gate::Proceed);
-		assert_eq!(gate(false, true), Gate::Prompt);
-		assert_eq!(gate(false, false), Gate::Bail);
 	}
 
 	#[test]

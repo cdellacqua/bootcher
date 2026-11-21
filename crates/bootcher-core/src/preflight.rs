@@ -135,7 +135,7 @@ impl Checks {
 /// True if `bin` is on `PATH` and runnable. Tries `--version` first (cheap and
 /// true for podman/ssh/qemu/sudo), falling back to `command -v` for anything that
 /// doesn't accept it.
-fn binary_available(bin: &str) -> bool {
+pub(crate) fn binary_available(bin: &str) -> bool {
 	duct::cmd(bin, ["--version"])
 		.stdout_null()
 		.stderr_null()
