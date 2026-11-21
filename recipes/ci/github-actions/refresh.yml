@@ -55,7 +55,7 @@ jobs:
       contents: read
       packages: read
     container:
-      image: ghcr.io/cdellacqua/bootcher:latest
+      image: ghcr.io/cdellacqua/bootcher:v0.3.0-snap.gb4326e4
     outputs:
       channel: ${{ steps.plan.outputs.channel }}
       release: ${{ steps.plan.outputs.release }}
@@ -156,7 +156,7 @@ jobs:
       contents: read
       packages: write
     container:
-      image: ghcr.io/cdellacqua/bootcher:latest
+      image: ghcr.io/cdellacqua/bootcher:v0.3.0-snap.gb4326e4
       options: --privileged
     steps:
       - uses: actions/checkout@v7
@@ -199,7 +199,7 @@ jobs:
       contents: read
       packages: write
     container:
-      image: ghcr.io/cdellacqua/bootcher:latest
+      image: ghcr.io/cdellacqua/bootcher:v0.3.0-snap.gb4326e4
       options: --privileged
     steps:
       - uses: actions/checkout@v7 # the default branch: it owns publishing
@@ -255,7 +255,7 @@ jobs:
       contents: read
       packages: write
     container:
-      image: ghcr.io/cdellacqua/bootcher:latest
+      image: ghcr.io/cdellacqua/bootcher:v0.3.0-snap.gb4326e4
     steps:
       - uses: actions/checkout@v7
       - name: Prune old image versions

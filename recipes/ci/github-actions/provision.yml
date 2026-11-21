@@ -37,7 +37,7 @@ jobs:
     permissions:
       contents: read
     container:
-      image: ghcr.io/cdellacqua/bootcher:latest
+      image: ghcr.io/cdellacqua/bootcher:v0.3.0-snap.gb4326e4
     outputs:
       matrix: ${{ steps.arches.outputs.matrix }}
     steps:
@@ -61,7 +61,7 @@ jobs:
       contents: write # create the Release + upload the disk as an asset
       packages: read # pull the channel's members
     container:
-      image: ghcr.io/cdellacqua/bootcher:latest
+      image: ghcr.io/cdellacqua/bootcher:v0.3.0-snap.gb4326e4
       options: --privileged
     steps:
       - uses: actions/checkout@v7
