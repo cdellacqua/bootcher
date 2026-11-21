@@ -401,6 +401,386 @@ pub fn promote(manifest: &Manifest, args: &PromoteArgs) -> Result<()> {
 	device_step(manifest, &channel, Some(&name), targets, &mut job)
 }
 
+// ------------------------------------------------------------------ status
+
+/// One arch of a channel's release, for `channel status` / `release list`.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ArchRow {
+	pub(crate) arch: String,
+	pub(crate) digest: String,
+	pub(crate) base: oci::BaseStatus,
+}
+
+/// One `channel status` row (also its JSON; template fields match
+/// case-insensitively: `{{ .Release }}`, `{{ .Commit }}`, `{{ .Stale }}`).
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ChannelRow {
+	pub(crate) channel: String,
+	/// Whether `:ch` exists.
+	pub(crate) published: bool,
+	/// The release it serves (its `bootcher.release`).
+	pub(crate) release: Option<String>,
+	/// `:ch`'s digest.
+	pub(crate) digest: Option<String>,
+	/// `:X`'s digest.
+	pub(crate) release_digest: Option<String>,
+	/// The release's source commit.
+	pub(crate) commit: Option<String>,
+	/// Whether any member's base moved (or can't be read).
+	pub(crate) stale: bool,
+	/// Whether `:ch` isn't `:X` any more (a refresh or rebuild since the promote).
+	pub(crate) lags: bool,
+	/// `current`, `stale`, `lags`, … for the table.
+	pub(crate) state: String,
+	pub(crate) arches: Vec<ArchRow>,
+}
+
+/// Read one channel's status.
+pub(crate) fn channel_row(
+	manifest: &Manifest,
+	channel: &str,
+	cache: &mut BaseCache,
+) -> Result<ChannelRow> {
+	let mut row = ChannelRow {
+		channel: channel.to_owned(),
+		published: false,
+		release: None,
+		digest: None,
+		release_digest: None,
+		commit: None,
+		stale: false,
+		lags: false,
+		state: "not published".to_owned(),
+		arches: Vec::new(),
+	};
+	let Some(chan) = release::read(manifest, channel)? else { return Ok(row) };
+	row.published = true;
+	row.digest = Some(chan.index.digest.clone());
+	row.release = chan.index.manifest.release().map(str::to_owned);
+	row.commit = chan.source().ok().flatten();
+	row.arches = chan
+		.bases(cache)
+		.into_iter()
+		.zip(&chan.members)
+		.map(|((arch, base), m)| ArchRow { arch: arch.to_string(), digest: m.digest.clone(), base })
+		.collect();
+	row.stale = row.arches.iter().any(|a| a.base.is_stale());
+	if let Some(x) = &row.release {
+		let r = manifest.tag_ref(x).context("a release ref")?;
+		row.release_digest = oci::fetch(&r)?.map(|f| f.digest);
+		row.lags = row.release_digest.as_deref() != Some(chan.index.digest.as_str());
+	}
+	let mut notes = Vec::new();
+	if row.stale {
+		notes.push("base stale");
+	}
+	if row.lags {
+		notes.push(if row.release_digest.is_some() {
+			"lags its release"
+		} else {
+			"its release is gone"
+		});
+	}
+	row.state = if notes.is_empty() { "current".to_owned() } else { notes.join(", ") };
+	Ok(row)
+}
+
+/// The channels a `channel status|refresh` run selects: the named ones (each must
+/// be declared), else every declared one.
+fn select_channels(manifest: &Manifest, named: &[String]) -> Result<Vec<String>> {
+	if named.is_empty() {
+		return Ok(manifest.channels().to_vec());
+	}
+	for ch in named {
+		manifest.check_channel(ch)?;
+	}
+	Ok(named.to_vec())
+}
+
+/// `bootcher channel status [ch…]`: per channel, the release it serves, its source
+/// commit, per-arch base current/stale, and whether it lags its release. A table by
+/// default, `--format json` for any selection, or a template (`{{ .Stale }}`) when
+/// exactly one channel is selected — which is what a scheduled CI refresh gates on.
+/// Read-only.
+///
+/// # Errors
+///
+/// Returns an error if a channel isn't declared, the registry can't be read, or the
+/// format is invalid.
+pub fn status(manifest: &Manifest, channels: &[String], format: Option<&str>) -> Result<()> {
+	manifest.require_registry("`channel status`")?;
+	let mut checks = Checks::default();
+	checks.bin("skopeo", oci::SKOPEO_HINT);
+	checks.finish()?;
+	let selected = select_channels(manifest, channels)?;
+	let mut cache = BaseCache::default();
+	let rows: Vec<ChannelRow> =
+		selected.iter().map(|ch| channel_row(manifest, ch, &mut cache)).collect::<Result<_>>()?;
+	let out = match format {
+		None | Some("json") => crate::jobs::device::render_rows(
+			&rows,
+			format,
+			&["channel", "release", "commit", "state"],
+		)?,
+		Some(tmpl) => match rows.as_slice() {
+			[one] => crate::jobs::info::render_template(tmpl, &serde_json::to_value(one)?)?,
+			_ => bail!(
+				"a `--format` template needs exactly one channel (`bootcher channel status <channel> --format …`); use `--format json` for several"
+			),
+		},
+	};
+	println!("{out}");
+	Ok(())
+}
+
+// ------------------------------------------------------------------ refresh
+
+/// `bootcher channel refresh`'s options.
+#[derive(Clone, Debug, Default)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct RefreshArgs {
+	pub channels: Vec<String>,
+	pub exclude: Vec<String>,
+	pub force: bool,
+	pub skip_build: bool,
+	pub remotes: Vec<String>,
+	pub skip_remotes: bool,
+	pub yes: bool,
+}
+
+/// The `channel refresh` checklist: every selected channel with its status, all the
+/// published ones pre-checked (what a non-TTY run refreshes).
+pub(crate) fn refresh_choices(rows: &[ChannelRow]) -> Vec<Choice<String>> {
+	rows.iter()
+		.map(|r| {
+			let what = r.release.as_deref().map_or_else(
+				|| "nothing".to_owned(),
+				|x| format!("{x} @ {}", r.commit.as_deref().map_or("no source", oci::short)),
+			);
+			let label = format!("{}: {what}, {}", r.channel, r.state);
+			if r.published {
+				Choice::new(label, r.channel.clone(), true)
+			} else {
+				Choice::disabled(label, r.channel.clone(), "not published")
+			}
+		})
+		.collect()
+}
+
+/// One release a refresh run works on: its name, the channels (selected) serving
+/// it and the channel digests read at the start.
+#[derive(Debug)]
+pub(crate) struct Group {
+	pub(crate) release: String,
+	pub(crate) channels: Vec<(String, String)>,
+}
+
+/// Group selected channel rows by the release they serve (skipping unpublished
+/// channels and ones whose index names no release).
+pub(crate) fn group_by_release(rows: &[ChannelRow]) -> (Vec<Group>, Vec<String>) {
+	let mut groups: Vec<Group> = Vec::new();
+	let mut skipped = Vec::new();
+	for r in rows {
+		match (&r.release, &r.digest) {
+			(Some(x), Some(d)) => match groups.iter_mut().find(|g| g.release == *x) {
+				Some(g) => g.channels.push((r.channel.clone(), d.clone())),
+				None => groups.push(Group {
+					release: x.clone(),
+					channels: vec![(r.channel.clone(), d.clone())],
+				}),
+			},
+			(None, Some(_)) => skipped
+				.push(format!(":{} serves an index with no release name — skipped", r.channel)),
+			_ => skipped.push(format!(":{} isn't published — skipped", r.channel)),
+		}
+	}
+	(groups, skipped)
+}
+
+/// `bootcher channel refresh [ch…]`: base patches for channels. Per release the
+/// selected channels serve: rebuild its stale arches (all with `--force`) from its
+/// recorded commit under that commit's own config, re-push `:X` signed, then copy
+/// `:X` to every selected channel serving it whose digest differs — re-checking each
+/// channel first and skipping one a concurrent promote moved. Then the device step
+/// for every selected channel (`--skip-remotes` skips it).
+///
+/// # Errors
+///
+/// Returns an error if a selection is invalid, the user declines, a rebuild/push
+/// fails, or any device fails or is unreachable.
+#[allow(clippy::too_many_lines)]
+pub fn refresh(manifest: &Manifest, args: &RefreshArgs) -> Result<()> {
+	manifest.require_registry("`channel refresh`")?;
+	let mut checks = Checks::default();
+	checks.bin("skopeo", oci::SKOPEO_HINT);
+	checks.bin("podman", crate::preflight::PODMAN_HINT);
+	if !args.skip_build {
+		checks.bin("git", "check out each release's commit");
+	}
+	checks.finish()?;
+	for ch in &args.exclude {
+		manifest.check_channel(ch)?;
+	}
+	let mut cache = BaseCache::default();
+	let mut prompted = false;
+	let mut selected = select_channels(manifest, &args.channels)?;
+	selected.retain(|c| !args.exclude.contains(c));
+	let mut rows: Vec<ChannelRow> =
+		selected.iter().map(|ch| channel_row(manifest, ch, &mut cache)).collect::<Result<_>>()?;
+	if args.channels.is_empty() && interactive::is_tty() && !args.yes {
+		prompted = true;
+		let picked = interactive::checklist("Refresh which channels?", refresh_choices(&rows))?;
+		rows.retain(|r| picked.contains(&r.channel));
+	}
+	let (groups, skipped) = group_by_release(&rows);
+	for s in &skipped {
+		eprintln!("{s}");
+	}
+	if args.skip_build && groups.len() > 1 {
+		bail!(
+			"`--skip-build` takes the local images for one release, but the selected channels \
+			 serve {} — name the channels of one release (`bootcher channel refresh <channel>`)",
+			groups.iter().map(|g| g.release.as_str()).collect::<Vec<_>>().join(", ")
+		);
+	}
+
+	// Plan each release: what to rebuild, what to copy.
+	let mut plans = Vec::new();
+	let mut lines = vec!["channel refresh will:".to_owned()];
+	for group in groups {
+		let release = release::read(manifest, &group.release)?;
+		let Some(rel) = &release else {
+			eprintln!(
+				"warning: {} (served by {}) no longer exists — skipped",
+				group.release,
+				chan_list(&group)
+			);
+			continue;
+		};
+		let commit = rel.source().ok().flatten();
+		let stale: Vec<_> = rel
+			.bases(&mut cache)
+			.into_iter()
+			.filter(|(_, s)| args.force || s.is_stale())
+			.map(|(a, _)| a)
+			.collect();
+		match (&commit, stale.is_empty()) {
+			(None, false) => eprintln!(
+				"warning: {} records no source commit, so it can't be rebuilt — skipped (publish a new release)",
+				group.release
+			),
+			(Some(c), false) => lines.push(format!(
+				"  rebuild {} ({}) at {} on the current base, re-push it",
+				group.release,
+				stale.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
+				oci::short(c)
+			)),
+			(_, true) => {}
+		}
+		lines.push(format!("  point {} at {}", chan_list(&group), group.release));
+		plans.push(Plan { group, release, commit, stale });
+	}
+	if plans.is_empty() {
+		eprintln!("nothing to refresh");
+		return Ok(());
+	}
+	let targets = if args.skip_remotes {
+		ChannelDevices::default()
+	} else {
+		let chans: Vec<String> =
+			plans.iter().flat_map(|p| p.group.channels.iter().map(|(c, _)| c.clone())).collect();
+		device::channel_devices(manifest, &chans, &args.remotes)?
+	};
+	lines.extend(
+		targets.devices.iter().map(|(ch, d)| format!("  then update {} (on :{ch})", d.name())),
+	);
+	if prompted {
+		Equivalent::new(&["channel", "refresh"])
+			.args(plans.iter().flat_map(|p| p.group.channels.iter().map(|(c, _)| c.clone())))
+			.flag_if(args.force, "--force")
+			.flag_if(args.skip_build, "--skip-build")
+			.opts("--remote", &args.remotes)
+			.flag_if(args.skip_remotes, "--skip-remotes")
+			.arg("-y")
+			.print();
+	}
+	interactive::confirm(args.yes, "`channel refresh` moves channels", &lines, "Proceed?", true)?;
+
+	let mut job = Scope::standalone();
+	let mut moved_channels: Vec<(String, String)> = Vec::new();
+	for plan in plans {
+		let name = plan.group.release.clone();
+		let Some(mut rel) = plan.release else { continue };
+		if let Some(commit) = &plan.commit
+			&& !plan.stale.is_empty()
+		{
+			release::rebuild(
+				manifest,
+				&name,
+				&rel,
+				commit,
+				&plan.stale,
+				args.force,
+				args.skip_build,
+				&mut cache,
+				&mut job,
+			)?;
+			rel = release::read(manifest, &name)?
+				.with_context(|| format!("{name} vanished after its push"))?;
+		}
+		for (ch, seen) in &plan.group.channels {
+			let ch_ref = manifest.tag_ref(ch).context("a channel ref")?;
+			let now = oci::fetch(&ch_ref)?;
+			if now.as_ref().map(|f| f.digest.as_str()) != Some(seen.as_str()) {
+				eprintln!(
+					":{ch} moved since this run read it (a concurrent promote?) — left alone"
+				);
+				continue;
+			}
+			move_channel(manifest, &name, &rel, ch, now.as_ref(), &mut job)?;
+			moved_channels.push((ch.clone(), name.clone()));
+		}
+	}
+	if args.skip_remotes {
+		return Ok(());
+	}
+	let mut first_err = None;
+	let ChannelDevices { devices, mut unreachable } = targets;
+	for (ch, name) in &moved_channels {
+		let on: Vec<_> = devices.iter().filter(|(c, _)| c == ch).cloned().collect();
+		let t = ChannelDevices { devices: on, unreachable: std::mem::take(&mut unreachable) };
+		if let Err(e) = device_step(manifest, ch, Some(name), t, &mut job) {
+			eprintln!("{e:#}");
+			first_err.get_or_insert(e);
+		}
+	}
+	// No channel moved, so no device step reported them: do it here.
+	if first_err.is_none()
+		&& let Err(e) = device::finish_unreachable(&unreachable)
+	{
+		first_err = Some(e);
+	}
+	match first_err {
+		Some(e) => Err(e),
+		None => Ok(()),
+	}
+}
+
+/// One release's part of a `channel refresh` run: what to rebuild, what to copy.
+struct Plan {
+	group: Group,
+	release: Option<Published>,
+	commit: Option<String>,
+	stale: Vec<crate::context::Arch>,
+}
+
+/// `:a, :b` for a group's channels.
+fn chan_list(group: &Group) -> String {
+	group.channels.iter().map(|(c, _)| format!(":{c}")).collect::<Vec<_>>().join(", ")
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -424,6 +804,54 @@ mod tests {
 		// The target isn't known yet (picked on a TTY afterwards).
 		let err = check_source_current("next", "v1.4", old, new, None).unwrap_err().to_string();
 		assert!(err.contains("bootcher channel promote v1.4 <channel>"), "{err}");
+	}
+
+	fn row(channel: &str, release: Option<&str>, stale: bool, lags: bool) -> ChannelRow {
+		ChannelRow {
+			channel: channel.into(),
+			published: release.is_some(),
+			release: release.map(str::to_owned),
+			digest: release.map(|r| format!("sha256:{r}")),
+			release_digest: None,
+			commit: Some("0123456789abcdef".into()),
+			stale,
+			lags,
+			state: "x".into(),
+			arches: Vec::new(),
+		}
+	}
+
+	#[test]
+	fn refresh_checklist_prechecks_every_published_channel() {
+		let rows = vec![
+			row("stable", Some("v1"), false, false),
+			row("next", Some("v2"), true, false),
+			row("beta", Some("v2"), false, true),
+			row("edge", None, false, false),
+		];
+		let c = refresh_choices(&rows);
+		// Pre-checked like the non-TTY default (every channel); the status is the label.
+		assert_eq!(c.iter().map(|c| c.checked).collect::<Vec<_>>(), [true, true, true, false]);
+		assert!(c[3].disabled.is_some());
+		assert_eq!(c[0].label, "stable: v1 @ 0123456789ab, x");
+	}
+
+	#[test]
+	fn channels_group_by_the_release_they_serve() {
+		let rows = vec![
+			row("stable", Some("v1"), false, false),
+			row("next", Some("v2"), false, false),
+			row("beta", Some("v2"), false, false),
+			row("edge", None, false, false),
+		];
+		let (groups, skipped) = group_by_release(&rows);
+		assert_eq!(groups.len(), 2);
+		assert_eq!(groups[1].release, "v2");
+		assert_eq!(
+			groups[1].channels.iter().map(|(c, _)| c.as_str()).collect::<Vec<_>>(),
+			["next", "beta"]
+		);
+		assert_eq!(skipped, [":edge isn't published — skipped"]);
 	}
 
 	#[test]

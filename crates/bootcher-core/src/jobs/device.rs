@@ -1185,6 +1185,284 @@ pub fn switch(manifest: &Manifest, args: &SwitchArgs) -> Result<()> {
 	}
 }
 
+// ------------------------------------------------------------------ refresh
+
+/// What `device refresh` read from one direct device's booted image.
+#[derive(Clone, Debug)]
+pub(crate) struct Booted {
+	/// Index into the probed devices.
+	pub(crate) device: usize,
+	pub(crate) arch: Option<Arch>,
+	/// The clean commit it was built from (`None`: dirty or outside git).
+	pub(crate) source: Option<String>,
+	pub(crate) base: crate::oci::BaseStatus,
+}
+
+/// The separator between the config and manifest halves of the metadata probe.
+const METADATA_SEPARATOR: &str = "---bootcher-manifest---";
+
+/// The device script reading the booted image's config and manifest straight from
+/// the ostree repo (S6): works on a never-deployed disk, copies nothing.
+fn metadata_script(imgref: &str) -> String {
+	let r = crate::exec::sh_quote(imgref);
+	format!(
+		"set -e
+		 sudo ostree container image metadata --repo /sysroot/ostree/repo --config {r}
+		 echo {METADATA_SEPARATOR}
+		 sudo ostree container image metadata --repo /sysroot/ostree/repo {r}
+"
+	)
+}
+
+/// Parse a [`metadata_script`] output into the source label, arch and manifest.
+pub(crate) fn parse_metadata(
+	out: &str,
+) -> Result<(Option<String>, Option<Arch>, crate::oci::Manifest)> {
+	let (config, manifest) =
+		out.split_once(METADATA_SEPARATOR).context("the metadata probe printed no manifest")?;
+	let config: serde_json::Value =
+		serde_json::from_str(config.trim()).context("parsing the image config")?;
+	let source = config
+		.pointer(&format!("/config/Labels/{}", crate::context::SOURCE_LABEL.replace('/', "~1")))
+		.and_then(|v| v.as_str())
+		.filter(|s| !s.is_empty())
+		.map(str::to_owned);
+	let arch = match config.get("architecture").and_then(|a| a.as_str()) {
+		Some("amd64") => Some(Arch::X86_64),
+		Some("arm64") => Some(Arch::Aarch64),
+		_ => None,
+	};
+	let manifest = serde_json::from_str(manifest.trim()).context("parsing the image manifest")?;
+	Ok((source, arch, manifest))
+}
+
+/// Read what a direct device booted: its source commit, arch and base status.
+fn read_booted(d: &Device, index: usize, cache: &mut crate::oci::BaseCache) -> Result<Booted> {
+	let status = d.status().context("unreachable")?;
+	let spec = status
+		.booted
+		.as_ref()
+		.and_then(|b| b.image.as_ref())
+		.or(status.spec.as_ref())
+		.context("no booted image")?;
+	let out = d.ssh.read_sh(&metadata_script(&spec.ostree_imgref()))?;
+	let (source, arch, manifest) = parse_metadata(&out)?;
+	let arch = arch.or(status.arch);
+	let base = match arch {
+		Some(a) => cache.status(&manifest, a),
+		None => crate::oci::BaseStatus::Unknown { reason: "unknown arch".to_owned() },
+	};
+	Ok(Booted { device: index, arch, source, base })
+}
+
+/// The `device refresh` checklist: direct devices grouped by source commit,
+/// annotated with their base status, pre-checking what a non-TTY run refreshes (the
+/// stale ones; every one with `force`); devices with no recorded source are shown but
+/// disabled.
+pub(crate) fn refresh_choices(
+	devices: &[Device],
+	booted: &[Booted],
+	force: bool,
+) -> Vec<Choice<usize>> {
+	let mut sorted: Vec<&Booted> = booted.iter().collect();
+	sorted.sort_by(|a, b| a.source.cmp(&b.source).then(a.device.cmp(&b.device)));
+	sorted
+		.into_iter()
+		.map(|b| {
+			let name = devices[b.device].name();
+			match &b.source {
+				Some(c) => Choice::new(
+					format!("{} · {name}: {}", crate::oci::short(c), b.base.describe()),
+					b.device,
+					force || b.base.is_stale(),
+				),
+				None => Choice::disabled(
+					name,
+					b.device,
+					"built from a dirty tree or outside git — re-run `device deploy`",
+				),
+			}
+		})
+		.collect()
+}
+
+/// Group the selected direct devices by source commit: per commit, the arches its
+/// devices need and the devices. Devices without a source are left out.
+pub(crate) fn group_by_commit(
+	booted: &[Booted],
+	selected: &[usize],
+) -> Vec<(String, Vec<Arch>, Vec<usize>)> {
+	let mut groups: Vec<(String, Vec<Arch>, Vec<usize>)> = Vec::new();
+	for b in booted.iter().filter(|b| selected.contains(&b.device)) {
+		let Some(commit) = &b.source else { continue };
+		let idx = if let Some(i) = groups.iter().position(|(c, ..)| c == commit) {
+			i
+		} else {
+			groups.push((commit.clone(), Vec::new(), Vec::new()));
+			groups.len() - 1
+		};
+		let g = &mut groups[idx];
+		if let Some(a) = b.arch
+			&& !g.1.contains(&a)
+		{
+			g.1.push(a);
+		}
+		g.2.push(b.device);
+	}
+	groups
+}
+
+/// `bootcher device refresh`: base patches for direct devices, without shipping
+/// unreleased source. Reads the commit each direct device booted (its
+/// `bootcher.source`), groups the devices by commit, rebuilds each commit (whose
+/// devices aren't all on the current base, or every one with `force`) in a
+/// temporary worktree under its own config, and ships it back to just those devices
+/// with the direct device step. Needs a build environment but no registry, and no
+/// clean root tree (nothing is built from it).
+///
+/// # Errors
+///
+/// Returns an error if a `--remote` isn't direct, the user declines, or a build or
+/// any device fails or is unreachable.
+#[allow(clippy::too_many_lines)]
+pub fn refresh(manifest: &Manifest, remotes: &[String], force: bool, yes: bool) -> Result<()> {
+	require_remotes(manifest, "device refresh")?;
+	let mut checks = Checks::default();
+	checks.bin("skopeo", oci::SKOPEO_HINT);
+	checks.bin("git", "check out each device's commit");
+	checks.finish()?;
+	upgrade::preflight_direct()?;
+	let explicit = !remotes.is_empty();
+	let picked = candidates(manifest, remotes)?;
+	let (devices, mut unreachable) = probe(manifest, &picked);
+	let (direct, skipped) = deploy_targets(&devices, explicit)?;
+	for s in &skipped {
+		eprintln!("{s}");
+	}
+	let mut cache = crate::oci::BaseCache::default();
+	let mut booted = Vec::new();
+	for &i in &direct {
+		match read_booted(&devices[i], i, &mut cache) {
+			Ok(b) => booted.push(b),
+			Err(e) => {
+				eprintln!("{}: couldn't read its booted image ({e:#})", devices[i].name());
+				unreachable.push(Outcome::failed(devices[i].name(), format!("{e:#}")));
+			}
+		}
+	}
+	for b in booted.iter().filter(|b| b.source.is_none()) {
+		eprintln!(
+			"{}: built from a dirty tree or outside git, so there's no commit to rebuild — re-run \
+			 `bootcher device deploy`",
+			devices[b.device].name()
+		);
+	}
+	let default: Vec<usize> = booted
+		.iter()
+		.filter(|b| b.source.is_some() && (force || b.base.is_stale()))
+		.map(|b| b.device)
+		.collect();
+	let mut prompted = false;
+	let selected: Vec<usize> = match gate(yes, interactive::is_tty()) {
+		Gate::Proceed => default,
+		Gate::Bail => bail!(
+			"`device refresh` updates devices, and stdin is not a TTY to confirm — re-run with -y/--yes to proceed"
+		),
+		Gate::Prompt if explicit => default,
+		Gate::Prompt => {
+			prompted = true;
+			if booted.iter().all(|b| b.source.is_none()) {
+				Vec::new()
+			} else {
+				interactive::checklist(
+					"Refresh which direct devices?",
+					refresh_choices(&devices, &booted, force),
+				)?
+			}
+		}
+	};
+	let groups = group_by_commit(&booted, &selected);
+	if groups.is_empty() {
+		eprintln!(
+			"no direct device needs a refresh{}",
+			if force { "" } else { " (every base is current; `--force` rebuilds anyway)" }
+		);
+		return finish_unreachable(&unreachable);
+	}
+	let mut lines = vec!["device refresh will:".to_owned()];
+	for (commit, arches, members) in &groups {
+		lines.push(format!(
+			"  rebuild {} ({}) on the current base",
+			oci::short(commit),
+			arches.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+		));
+		for &i in members {
+			let Some(b) = booted.iter().find(|b| b.device == i) else { continue };
+			let base = match &b.base {
+				crate::oci::BaseStatus::Stale { built, current, .. } => {
+					format!("base {} → {}", oci::short(built), oci::short(current))
+				}
+				other => other.describe(),
+			};
+			lines.push(format!(
+				"    {}: {} → refreshed ({base})",
+				devices[i].name(),
+				devices[i].describe()
+			));
+		}
+	}
+	if prompted {
+		Equivalent::new(&["device", "refresh"])
+			.opts(
+				"--remote",
+				groups.iter().flat_map(|(_, _, m)| m.iter().map(|&i| devices[i].name())),
+			)
+			.flag_if(force, "--force")
+			.arg("-y")
+			.print();
+	}
+	if yes || prompted {
+		for l in &lines {
+			eprintln!("{l}");
+		}
+	} else {
+		interactive::confirm(yes, "`device refresh` updates devices", &lines, "Proceed?", true)?;
+	}
+
+	let mut job = Scope::root("refresh", Some(groups.len() as u64));
+	let mut failure = None;
+	for (commit, arches, members) in groups {
+		let prefix = format!("refresh-{}", &commit[..12.min(commit.len())]);
+		let mut ship = || -> Result<()> {
+			let mut scope = job.child(format!("refresh {}", oci::short(&commit)));
+			let images = crate::jobs::release::build_commit(
+				manifest, &commit, &arches, &prefix, force, &mut scope,
+			)?;
+			crate::jobs::release::require_current_base(&images, &mut cache)?;
+			let list = manifest.local_list_ref_tagged(&prefix);
+			build::manifest_list(&images, &list, &mut scope.child("manifest list"))?;
+			let ssh: Vec<Ssh> = members.iter().map(|&i| devices[i].ssh.clone()).collect();
+			direct_rollout(
+				manifest,
+				&images,
+				&list,
+				Some(&commit),
+				&ssh,
+				std::mem::take(&mut unreachable),
+				&mut scope,
+			)
+		};
+		if let Err(e) = ship() {
+			eprintln!("{} failed: {e:#}", oci::short(&commit));
+			failure.get_or_insert(e);
+		}
+	}
+	match failure {
+		Some(e) => Err(e),
+		None => finish_unreachable(&unreachable),
+	}
+}
+
 // ------------------------------------------------------------------ rotate
 
 /// `bootcher device rotate ssh-key`: roll the admin SSH key on every reachable
@@ -1446,6 +1724,77 @@ mod tests {
 		let row = status_row(&channel_dev("sha256:lock-layer", None), &channels, &lookup);
 		assert_eq!(row.class, "channel");
 		assert!(row.state.contains("provisioned, not yet updated"), "{}", row.state);
+	}
+
+	#[test]
+	fn refresh_reads_the_source_arch_and_base_from_the_ostree_metadata() {
+		let out = format!(
+			r#"{{"architecture":"arm64","config":{{"Labels":{{"bootcher.source":"abc123"}}}}}}
+{METADATA_SEPARATOR}
+{{"schemaVersion":2,"config":{{"digest":"sha256:c"}},"layers":[],"annotations":{{"org.opencontainers.image.base.name":"q.io/f/b:44","org.opencontainers.image.base.digest":"sha256:b"}}}}"#
+		);
+		let (source, arch, m) = parse_metadata(&out).unwrap();
+		assert_eq!(source.as_deref(), Some("abc123"));
+		assert_eq!(arch, Some(Arch::Aarch64));
+		assert_eq!(m.base(), Some(("q.io/f/b:44", "sha256:b")));
+		// A dirty build's empty label is no source.
+		let dirty = format!(
+			r#"{{"config":{{"Labels":{{"bootcher.source":""}}}}}}{METADATA_SEPARATOR}{{}}"#
+		);
+		assert_eq!(parse_metadata(&dirty).unwrap().0, None);
+		assert!(
+			metadata_script("containers-storage:localhost/k:latest")
+				.contains("--config containers-storage:localhost/k:latest")
+		);
+	}
+
+	fn booted(device: usize, source: Option<&str>, arch: Arch, stale: bool) -> Booted {
+		let base = if stale {
+			crate::oci::BaseStatus::Stale {
+				name: "b".into(),
+				built: "sha256:1".into(),
+				current: "sha256:2".into(),
+			}
+		} else {
+			crate::oci::BaseStatus::Current { name: "b".into(), digest: "sha256:2".into() }
+		};
+		Booted { device, arch: Some(arch), source: source.map(str::to_owned), base }
+	}
+
+	#[test]
+	fn refresh_groups_devices_by_commit_not_digest() {
+		// Two devices on one commit (different arches), one on another, one dirty.
+		let b = vec![
+			booted(0, Some("c1"), Arch::X86_64, true),
+			booted(1, Some("c1"), Arch::Aarch64, false),
+			booted(2, Some("c2"), Arch::X86_64, true),
+			booted(3, None, Arch::X86_64, true),
+		];
+		let groups = group_by_commit(&b, &[0, 1, 2, 3]);
+		assert_eq!(groups.len(), 2);
+		assert_eq!(groups[0], ("c1".to_owned(), vec![Arch::X86_64, Arch::Aarch64], vec![0, 1]));
+		assert_eq!(groups[1], ("c2".to_owned(), vec![Arch::X86_64], vec![2]));
+		// Only selected devices count.
+		assert_eq!(group_by_commit(&b, &[1]), [("c1".to_owned(), vec![Arch::Aarch64], vec![1])]);
+	}
+
+	#[test]
+	fn refresh_checklist_prechecks_stale_devices_and_disables_dirty_ones() {
+		let devices = fleet();
+		let b = vec![
+			booted(0, Some("c1aaaaaaaaaaaa"), Arch::X86_64, true),
+			booted(3, Some("c1aaaaaaaaaaaa"), Arch::X86_64, false),
+			booted(1, None, Arch::X86_64, true),
+		];
+		let c = refresh_choices(&devices, &b, false);
+		// Grouped by commit (the dirty one sorts first, disabled).
+		assert!(c[0].disabled.is_some() && c[0].value == 1);
+		assert!(c[1].checked && c[1].value == 0);
+		assert!(!c[2].checked && c[2].value == 3);
+		// `--force` pre-checks every refreshable device, like its non-TTY default.
+		let c = refresh_choices(&devices, &b, true);
+		assert!(!c[0].checked && c[1].checked && c[2].checked);
+		assert!(c[1].label.starts_with("c1aaaaaaaaaa · admin@rpi-1: base stale"), "{}", c[1].label);
 	}
 
 	#[test]

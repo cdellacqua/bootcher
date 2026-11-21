@@ -493,3 +493,407 @@ fn enroll_on_a_running_fleet_signs_what_the_channels_serve() {
 		.failure()
 		.stderr(stderr_has("signing rotate"));
 }
+
+// ------------------------------------------------------------------ status, list, refresh
+
+#[test]
+fn status_and_list_report_release_commit_staleness_and_channels() {
+	let w = World::new(5978);
+	let head = w.git(&["rev-parse", "HEAD"]);
+	w.bootcher(&["release", "publish", "v1"]).assert().success();
+	w.bootcher(&["channel", "promote", "v1", "stable", "-y"]).assert().success();
+
+	let out = w
+		.bootcher(&["channel", "status", "--format", "json"])
+		.assert()
+		.success()
+		.get_output()
+		.stdout
+		.clone();
+	let rows: Value = serde_json::from_slice(&out).unwrap();
+	let stable = rows.as_array().unwrap().iter().find(|r| r["channel"] == "stable").unwrap();
+	assert_eq!(stable["release"], "v1");
+	assert_eq!(stable["commit"], head.as_str());
+	assert_eq!((stable["stale"].as_bool(), stable["lags"].as_bool()), (Some(false), Some(false)));
+	let next = rows.as_array().unwrap().iter().find(|r| r["channel"] == "next").unwrap();
+	assert_eq!(next["published"], false);
+
+	// The single-channel template CI gates on.
+	w.bootcher(&["channel", "status", "stable", "--format", "{{ .Release }} {{ .Stale }}"])
+		.assert()
+		.success()
+		.stdout("v1 false\n");
+	w.bootcher(&["channel", "status", "--format", "{{ .Stale }}"])
+		.assert()
+		.failure()
+		.stderr(stderr_has("exactly one channel"));
+
+	w.push_base("base v2");
+	w.bootcher(&["channel", "status", "stable", "--format", "{{ .Stale }}"])
+		.assert()
+		.success()
+		.stdout("true\n");
+
+	let out = w
+		.bootcher(&["release", "list", "--format", "json"])
+		.assert()
+		.success()
+		.get_output()
+		.stdout
+		.clone();
+	let rows: Value = serde_json::from_slice(&out).unwrap();
+	let v1 = &rows.as_array().unwrap()[0];
+	assert_eq!(v1["release"], "v1");
+	assert_eq!(v1["channels"], serde_json::json!(["stable"]));
+	assert_eq!(v1["stale"], true);
+	// The channel tags themselves aren't listed as releases.
+	assert_eq!(rows.as_array().unwrap().len(), 1);
+	w.bootcher(&["release", "list", "--format", "{{ .Release }}={{ .Commit }}"])
+		.assert()
+		.success()
+		.stdout(format!("v1={head}\n"));
+}
+
+#[test]
+fn channel_refresh_rebuilds_repoints_and_honours_exclude() {
+	let w = World::new(5979);
+	w.bootcher(&["release", "publish", "v1"]).assert().success();
+	w.bootcher(&["channel", "promote", "v1", "stable", "-y"]).assert().success();
+	w.bootcher(&["channel", "promote", "v1", "next", "-y"]).assert().success();
+	let d1 = w.digest("v1");
+	w.bootcher(&["build"]).assert().success();
+	let latest = format!("localhost/app:latest-{}", Arch::host().unwrap_or(Arch::X86_64));
+	let latest_id = w.local_image_id(&latest).unwrap();
+
+	// Nothing stale: nothing happens.
+	w.bootcher(&["channel", "refresh", "-y", "--skip-remotes"]).assert().success();
+	assert_eq!(w.digest("v1"), d1);
+
+	// Moving a channel needs -y even with --skip-remotes.
+	w.push_base("base v2");
+	w.bootcher(&["channel", "refresh", "--skip-remotes"])
+		.assert()
+		.failure()
+		.stderr(stderr_has("-y"));
+
+	// HEAD moves on (unreleased work): the refresh rebuilds v1's own commit.
+	let commit = w.source("v1");
+	w.write("app.txt", "unreleased\n");
+	w.commit("unreleased");
+	w.bootcher(&["channel", "refresh", "-y", "--skip-remotes", "--exclude", "next"])
+		.assert()
+		.success();
+	let d2 = w.digest("v1");
+	assert_ne!(d2, d1);
+	assert_eq!(w.source("v1"), commit);
+	assert_eq!(w.digest("stable"), d2, "stable re-pointed at the refreshed v1");
+	assert_eq!(w.digest("next"), d1, "--exclude leaves next alone");
+	assert_eq!(w.local_image_id(&latest).unwrap(), latest_id, "latest-<arch> untouched");
+	w.bootcher(&["channel", "status", "stable", "--format", "{{ .Stale }} {{ .Lags }}"])
+		.assert()
+		.success()
+		.stdout("false false\n");
+	// next now lags its (refreshed) release: a refresh re-copies it without a rebuild.
+	w.bootcher(&["channel", "status", "next", "--format", "{{ .Lags }}"])
+		.assert()
+		.success()
+		.stdout("true\n");
+	w.bootcher(&["channel", "refresh", "next", "-y", "--skip-remotes"]).assert().success();
+	assert_eq!(w.digest("next"), d2);
+}
+
+#[test]
+fn channel_refresh_skip_build_needs_one_release_built_from_its_commit() {
+	let w = World::new(5969);
+	w.bootcher(&["release", "publish", "v1"]).assert().success();
+	w.bootcher(&["channel", "promote", "v1", "stable", "-y"]).assert().success();
+	w.write("app.txt", "app v2\n");
+	w.commit("v2");
+	w.bootcher(&["release", "publish", "v2"]).assert().success();
+	w.bootcher(&["channel", "promote", "v2", "next", "-y"]).assert().success();
+	w.push_base("base v2");
+
+	// Two releases served: --skip-build can't take local images for both.
+	w.bootcher(&["channel", "refresh", "-y", "--skip-remotes", "--skip-build"])
+		.assert()
+		.failure()
+		.stderr(stderr_has("serve v1, v2"));
+	// The local image is v2's commit, not v1's: refused.
+	w.bootcher(&["build"]).assert().success();
+	w.bootcher(&["channel", "refresh", "stable", "-y", "--skip-remotes", "--skip-build"])
+		.assert()
+		.failure()
+		.stderr(stderr_has("rebuild, or check out"));
+	// The right commit's local image: published without a build here.
+	w.bootcher(&["channel", "refresh", "next", "-y", "--skip-remotes", "--skip-build"])
+		.assert()
+		.success();
+	assert_eq!(w.digest("next"), w.digest("v2"));
+	w.bootcher(&["channel", "status", "next", "--format", "{{ .Stale }}"])
+		.assert()
+		.success()
+		.stdout("false\n");
+}
+
+// ------------------------------------------------------------------ fresh-project enroll, resume
+
+impl World {
+	/// Prepend `remotes` pointing at closed loopback ports (not-yet-booted devices).
+	fn add_unbooted_remotes(&self) {
+		let manifest = std::fs::read_to_string(self.proj.join("bootcher.toml")).unwrap();
+		let remotes: Vec<String> = (0..2)
+			.map(|_| {
+				let p = bootcher_core::qemu::free_port().unwrap();
+				format!(
+					"{{ remote = \"ssh://admin@127.0.0.1:{p}\", ssh_opts = [\"-o\", \
+					 \"ConnectTimeout=2\"] }}"
+				)
+			})
+			.collect();
+		self.write("bootcher.toml", &format!("remotes = [{}]\n{manifest}", remotes.join(", ")));
+	}
+
+	/// Append `[hooks.<phase>] <stage> = "<cmd>"` to the manifest.
+	fn add_hook(&self, phase: &str, stage: &str, cmd: &str) {
+		let manifest = std::fs::read_to_string(self.proj.join("bootcher.toml")).unwrap();
+		let cmd = cmd.replace('\\', "\\\\").replace('"', "\\\"");
+		self.write("bootcher.toml", &format!("{manifest}\n[hooks.{phase}]\n{stage} = \"{cmd}\"\n"));
+	}
+
+	fn manifest_has_key(&self) -> bool {
+		std::fs::read_to_string(self.proj.join("bootcher.toml")).unwrap().contains("key = ")
+	}
+
+	/// `skopeo copy` between two tags of the project repo, by plain HTTP.
+	fn copy_tag(&self, from: &str, to: &str) {
+		self.tool(
+			"skopeo",
+			&[
+				"copy",
+				"--all",
+				"--preserve-digests",
+				"--src-tls-verify=false",
+				"--dest-tls-verify=false",
+				&format!("docker://{}", self.tag_ref(from)),
+				&format!("docker://{}", self.tag_ref(to)),
+			],
+		)
+		.stdout_null()
+		.run()
+		.unwrap();
+	}
+}
+
+/// Enrolling before the first provision just works: remotes declared but not yet
+/// booted, nothing served, no TTY and no `-y`.
+#[test]
+fn enroll_on_a_fresh_project_needs_no_devices_and_no_yes() {
+	let w = World::new(5968);
+	w.add_unbooted_remotes();
+	w.commit("remotes");
+	w.bootcher(&["signing", "enroll"]).assert().success();
+	assert!(w.manifest_has_key());
+	assert!(w.proj.join("cosign.key").is_file());
+	assert!(w.proj.join("sysroot/usr/lib/bootc/install/30-bootcher-signing.toml").is_file());
+}
+
+/// With a release served and the devices unreachable, `-y` is needed (there is
+/// something to sign) but the unreachable devices are only a warning.
+#[test]
+fn enroll_warns_about_unreachable_devices_and_a_failed_run_resumes() {
+	let w = World::new(5967);
+	w.bootcher(&["release", "publish", "v1"]).assert().success();
+	w.bootcher(&["channel", "promote", "v1", "stable", "-y"]).assert().success();
+	w.add_unbooted_remotes();
+	// The signing step fails (a failing publish hook brackets each re-sign).
+	let marker = w.proj.parent().unwrap().join("fail-publish");
+	std::fs::write(&marker, "").unwrap();
+	w.add_hook("publish", "pre", &format!("test ! -e {}", marker.display()));
+	w.commit("remotes, hook");
+	w.bootcher(&["signing", "enroll"]).assert().failure().stderr(stderr_has("-y"));
+	w.bootcher(&["signing", "enroll", "-y"]).assert().failure();
+	assert!(!w.manifest_has_key(), "`[registry] key` written before the run succeeded");
+	assert!(w.proj.join("cosign.key").is_file());
+	// A wrong passphrase doesn't reuse the keypair.
+	std::fs::remove_file(&marker).unwrap();
+	w.bootcher(&["signing", "enroll", "-y"])
+		.env("BOOTCHER_SIGN_PASSPHRASE", "not-it")
+		.assert()
+		.failure()
+		.stderr(stderr_has("doesn't open"));
+	// The re-run reuses the keypair and succeeds, the devices only warned about.
+	w.bootcher(&["signing", "enroll", "-y"])
+		.assert()
+		.success()
+		.stderr(stderr_has("reusing cosign.key").and(stderr_has("unreachable")));
+	assert!(w.manifest_has_key());
+	w.bootcher(&["signing", "verify", "stable"]).assert().success();
+}
+
+/// A rotate that fails part-way resumes with the keypair it wrote; `signing retire`
+/// refuses while a served ref isn't signed by the current key.
+#[test]
+fn rotate_resumes_and_retire_checks_what_is_served() {
+	let w = World::new(5966);
+	w.bootcher(&["release", "publish", "v0"]).assert().success();
+	w.enroll();
+	w.write("app.txt", "app v1\nsigned\n");
+	w.commit("v1");
+	w.bootcher(&["release", "publish", "v1"]).assert().success();
+	w.bootcher(&["channel", "promote", "v1", "stable", "-y"]).assert().success();
+
+	let marker = w.proj.parent().unwrap().join("fail-publish");
+	std::fs::write(&marker, "").unwrap();
+	w.add_hook("publish", "pre", &format!("test ! -e {}", marker.display()));
+	w.commit("hook");
+	w.bootcher(&["signing", "rotate", "cosign-next", "-y"])
+		.assert()
+		.failure()
+		.stderr(stderr_has("signing rotate cosign-next"));
+	assert!(
+		std::fs::read_to_string(w.proj.join("bootcher.toml")).unwrap().contains("cosign.key"),
+		"a failed rotate repointed the config"
+	);
+	let pem = std::fs::read_to_string(w.proj.join("cosign-next.pub")).unwrap();
+	std::fs::remove_file(&marker).unwrap();
+	w.bootcher(&["signing", "rotate", "cosign-next", "-y"])
+		.assert()
+		.success()
+		.stderr(stderr_has("resuming with cosign-next.key"));
+	assert_eq!(std::fs::read_to_string(w.proj.join("cosign-next.pub")).unwrap(), pem);
+	w.commit("rotated");
+	let new_pub = w.proj.join("cosign-next.pub");
+	w.bootcher(&["signing", "verify", "stable", "--pubkey", new_pub.to_str().unwrap()])
+		.assert()
+		.success();
+
+	// An unsigned release copied onto a channel behind bootcher's back: retire refuses.
+	w.copy_tag("v0", "next");
+	w.bootcher(&["signing", "retire", "-y"]).assert().failure().stderr(
+		stderr_has("not signed by the current key").and(stderr_has(":v0 (served by next)")),
+	);
+	// Once every served ref verifies, retire goes ahead (no device to update here).
+	w.copy_tag("v1", "next");
+	w.bootcher(&["signing", "retire", "-y"]).assert().success();
+}
+
+// ------------------------------------------------------------------ git tag preflight
+
+#[test]
+fn an_invalid_git_tag_name_fails_before_anything_is_pushed() {
+	let w = World::new(5965);
+	// A valid OCI tag, but not a valid git ref.
+	w.bootcher(&["release", "publish", "a..b", "--git-tag", "local"])
+		.assert()
+		.failure()
+		.stderr(stderr_has("valid git tag"));
+	assert!(w.raw("a..b").is_none(), "pushed before the git tag check");
+	w.bootcher(&["release", "publish", "a..b", "--git-tag", "no"]).assert().success();
+}
+
+// ------------------------------------------------------------------ refresh races
+
+/// A promote that moves a channel while `channel refresh` rebuilds its release:
+/// the refresh leaves that channel alone.
+#[test]
+fn channel_refresh_skips_a_channel_a_concurrent_promote_moved() {
+	let w = World::new(5964);
+	w.bootcher(&["release", "publish", "v1"]).assert().success();
+	w.write("app.txt", "app v2\n");
+	w.commit("v2");
+	w.bootcher(&["release", "publish", "v2"]).assert().success();
+	w.bootcher(&["channel", "promote", "v1", "stable", "-y"]).assert().success();
+	w.push_base("base v2");
+	// The "concurrent promote": v2 copied onto :stable right after v1's re-push.
+	let to = format!("docker://{}", w.tag_ref("stable"));
+	let from = format!("docker://{}", w.tag_ref("v2"));
+	w.add_hook(
+		"publish",
+		"post",
+		&format!(
+			"skopeo copy --all --preserve-digests --src-tls-verify=false \
+			 --dest-tls-verify=false {from} {to}"
+		),
+	);
+	let d1 = w.digest("v1");
+	w.bootcher(&["channel", "refresh", "stable", "-y", "--skip-remotes"])
+		.assert()
+		.success()
+		.stderr(stderr_has("moved since this run read it"));
+	assert_ne!(w.digest("v1"), d1, "v1 was rebuilt");
+	assert_eq!(w.digest("stable"), w.digest("v2"), "the refresh overwrote the promote");
+}
+
+/// A rebuild that doesn't land on the base the run judged current fails loudly
+/// instead of re-pushing the release.
+#[test]
+fn refresh_fails_when_the_rebuild_is_not_on_the_current_base() {
+	let w = World::new(5963);
+	// The release's own config carries a build hook that, when armed, moves `base:1`
+	// to another image just before the rebuild pulls it.
+	let marker = w.proj.parent().unwrap().join("move-base");
+	let spare = format!("docker://localhost:{}/base:spare", w.port);
+	let base = format!("docker://localhost:{}/base:1", w.port);
+	w.add_hook(
+		"build",
+		"pre",
+		&format!(
+			"if [ -e {m} ]; then rm {m}; skopeo copy --src-tls-verify=false \
+			 --dest-tls-verify=false {spare} {base}; fi",
+			m = marker.display()
+		),
+	);
+	w.commit("build hook");
+	w.bootcher(&["release", "publish", "v1"]).assert().success();
+	let d1 = w.digest("v1");
+	w.push_base("base v2");
+	w.tool("skopeo", &["copy", "--src-tls-verify=false", "--dest-tls-verify=false", &base, &spare])
+		.stdout_null()
+		.run()
+		.unwrap();
+	w.push_base("base v3");
+	std::fs::write(&marker, "").unwrap();
+	// The run reads base v3 as current; the hook swaps in v2 before the build.
+	w.bootcher(&["release", "refresh", "v1"])
+		.assert()
+		.failure()
+		.stderr(stderr_has("still isn't on the current base"));
+	assert_eq!(w.digest("v1"), d1, "a release not on the current base was pushed");
+}
+
+// ------------------------------------------------------------------ project in a subdirectory
+
+/// A project that isn't at the top of its git repository: the refreshes build the
+/// release's commit from the same subdirectory of the worktree.
+#[test]
+fn refreshes_work_for_a_project_in_a_subdirectory() {
+	let w = World::new(5962);
+	let sub = w.proj.join("image");
+	std::fs::create_dir_all(&sub).unwrap();
+	for f in ["bootcher.toml", "Containerfile", "app.txt"] {
+		w.git(&["mv", f, &format!("image/{f}")]);
+	}
+	w.commit("move the project into image/");
+	let run = |args: &[&str]| {
+		let mut c = w.bootcher(args);
+		c.current_dir(&sub);
+		c
+	};
+	run(&["release", "publish", "v1"]).assert().success();
+	let commit = w.source("v1");
+	run(&["channel", "promote", "v1", "stable", "-y"]).assert().success();
+	let d1 = w.digest("v1");
+	// HEAD moves on, so a refresh really builds from the worktree.
+	w.write("image/app.txt", "unreleased\n");
+	w.commit("unreleased");
+	w.push_base("base v2");
+	run(&["release", "refresh", "v1"]).assert().success();
+	let d2 = w.digest("v1");
+	assert_ne!(d2, d1);
+	assert_eq!(w.source("v1"), commit);
+	w.push_base("base v3");
+	run(&["channel", "refresh", "stable", "-y", "--skip-remotes"]).assert().success();
+	assert_ne!(w.digest("stable"), d2);
+	assert_eq!(w.digest("stable"), w.digest("v1"));
+	assert_eq!(w.source("v1"), commit);
+}
