@@ -1,8 +1,8 @@
 //! Run an independent operation across a set of items in parallel.
 //!
 //! Two embarrassingly-parallel fan-outs share this engine:
-//! - a `deploy`/`upgrade`/`rotate` applies the same action to every `[deploy]
-//!   remotes` device — each an isolated ssh round-trip ([`for_each_remote`]);
+//! - a device step (`device deploy`, the channel step, `device rotate`) applies the same
+//!   action to every selected device in `remotes`, each an isolated ssh round-trip ([`for_each_remote`]);
 //! - a multi-arch `build`/`image`/`provision` builds every target arch on its
 //!   own builder — independent `podman`/`image-builder` runs, possibly each on its own VM
 //!   (`build::run` / `disk::run`).
@@ -240,7 +240,7 @@ where
 	})
 }
 
-/// The fan-out specialised to the deploy fleet: the items are `[deploy] remotes`
+/// The fan-out specialised to the deploy fleet: the items are `remotes`
 /// destinations, each its own ssh round-trip. Returns the per-device [`Report`]
 /// rather than a verdict, so the device phases (`upgrade`, `rotate`) run their
 /// `post` hook over a partial outcome before raising it. `limit` is the relevant
