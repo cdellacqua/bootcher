@@ -20,6 +20,8 @@ Both schemas are generated from the same types bootcher uses at runtime, so they
 
 ```toml
 #:schema ./schemas/bootcher.schema.json
+remotes = []               # devices: "admin@host" or { remote = "...", ssh_opts = [...] }
+
 [general]
 name = "my-os"             # image name; used as the container tag
 rootfs = "ext4"            # root filesystem (default: ext4)
@@ -34,11 +36,10 @@ image = "local"            # disk-image (image-builder) backend
 # [builder.aarch64]          # per-arch override: route cross-arch image-builder to a VM
 # image = "vm"
 
-[deploy]
-# registry = "registry.gitlab.com/org/project"       # plain: registry mode, no signing
-# registry = { url = "registry.gitlab.com/org/project", key = "cosign.key" }  # with signing
-remotes = []               # SSH targets: "admin@host" or { remote = "...", ssh_opts = [...] }
-# channels = ["stable", "next"]   # extra release channels beyond the implicit "latest" (registry mode)
+# [registry]               # optional: publish releases, move channels
+# url = "registry.example.com/org/project"
+# channels = ["stable", "next"]   # required with a registry
+# key = "cosign.key"       # optional: sign releases (set by `bootcher signing enroll`)
 
 # [concurrency]
 # build   = 2              # max parallel container builds
@@ -54,6 +55,12 @@ remotes = []               # SSH targets: "admin@host" or { remote = "...", ssh_
 # [hooks.disk]
 # pre  = "sh pre-disk.sh"
 # post = "dd if=output/x86_64/qcow2/disk.qcow2 of=/dev/sdX"
+
+# [hooks.publish]
+# post = "sh notify-release.sh"
+
+# [hooks.promote]
+# post = "sh announce-rollout.sh"
 
 # [hooks.upgrade]
 # pre  = "sh drain.sh"
@@ -83,15 +90,17 @@ build = "vm"          # CI builds in a VM; everything else inherited from bootch
 ```
 
 ```sh
-bootcher --manifest bootcher.ci.toml provision
+bootcher --manifest bootcher.ci.toml device provision --channel stable
 ```
 
 Merge semantics:
 
-- **Tables merge recursively** — `[builder] build = "vm"` above overrides only that one key; the base's `image`, `[general]`, `[deploy]`, etc. are inherited intact.
+- **Tables merge recursively** — `[builder] build = "vm"` above overrides only that one key; the base's `image`, `[general]`, `[registry]`, `remotes`, etc. are inherited intact.
 - **Scalars and arrays replace wholesale** — a child that sets `x86_64 = ["qcow2"]` replaces the base's list rather than appending to it.
 
 `extend` chains are followed (a parent may itself `extend` a grandparent, applied underneath) and cycles are rejected. Only the manifest is redirected: the build context and every other relative path (Containerfile, `sysroot/`, keys) stay anchored to the working directory, so a variant layers over the same project tree. `extend` is resolved at load time and never appears in a serialized manifest.
+
+A refresh builds an older release commit under **that commit's** manifest, loaded from the same relative `--manifest` path (and, for a project below the top of its git repository, the same subdirectory) in a temporary worktree of the commit under `.git/bootcher-worktrees/`, with normal validation and no merging with today's config. Unknown tables (an old `[deploy]`, say) are ignored rather than rejected.
 
 ---
 
@@ -100,9 +109,11 @@ Merge semantics:
 ### `name` *(required)*
 
 The image name. Used as:
-- The local container tag: `localhost/<name>:latest-<arch>` and `localhost/<name>:latest`
-- The per-device signing key path: `/etc/pki/containers/<name>.pub`
-- The registry reference: `<registry>/<name>:latest` (registry mode)
+- The local container tags: `localhost/<name>:latest-<arch>` and `localhost/<name>:latest`
+- The registry repository: `<url>/<name>`, whose tags are the releases and channels
+- The on-device signing key files: `/etc/pki/containers/<name>-<fp8>.pub`
+
+Renaming it makes the devices that followed the old name foreign: bring them back with `device switch`.
 
 ### `rootfs`
 
@@ -120,14 +131,14 @@ x86_64  = ["qcow2", "bootc-installer"]   # a VM image and an installer ISO
 aarch64 = "raw"                          # a raw image for an edge device
 ```
 
-The two axes are independent. **Architecture** is the container/registry axis: `build`, `deploy` and `upgrade` fan out over the distinct arches, and a multi-arch project (more than one key) publishes one multi-arch manifest list. **Disk type** is a per-arch artifact axis only the `disk`/`provision` step fans out over — an arch listing several types reuses its single container build to render each, and disk types never enter the manifest list (an installer ISO isn't something a device `bootc upgrade`s to).
+The two axes are independent. **Architecture** is the container/registry axis: builds and releases fan out over the distinct arches, and a multi-arch project (more than one key) publishes one multi-arch manifest list. **Disk type** is a per-arch artifact axis only the `disk`/`provision` step fans out over — an arch listing several types reuses its single container build to render each, and disk types never enter the manifest list (an installer ISO isn't something a device `bootc upgrade`s to).
 
 If `[targets]` is omitted, it defaults to the host architecture mapped to a single `qcow2` (falling back to `x86_64` on unrecognised hosts).
 
 `build` and `provision` can build a subset of this matrix without editing the manifest, so a CI pipeline can fan the arches out across native runners instead of cross-building under emulation:
 
-- `provision --target <arch>` restricts the run to one architecture, and `--disk <type>` (repeatable, requires `--target`) further restricts it to specific disk types of that arch — e.g. one provision job per arch on a per-arch CI runner.
-- `build --target <arch>` builds just that arch's container and stops at the per-arch `localhost/<name>:latest-<arch>` member, **without** assembling the multi-arch `:latest` list. That's the producer half of a split deploy: build each arch on its own runner in parallel, transfer the members (`podman save`/`load`), then one `deploy --skip-build` (re)assembles the list from every arch's member and pushes it — the only job that needs registry push credentials and the signing key.
+- `device provision --target <arch>` restricts the run to one architecture, and `--disk <type>` (repeatable, requires `--target`) further restricts it to specific disk types of that arch — e.g. one provision job per arch on a per-arch CI runner.
+- `build --target <arch>` builds just that arch's container and stops at the per-arch `localhost/<name>:latest-<arch>` member, **without** assembling the multi-arch list. That's the producer half of a split pipeline: build each arch on its own runner in parallel, hand the members over, then one `release publish X --skip-build` assembles and pushes the release — the only job that needs the signing key.
 
 Either way the value must name an arch / type the manifest actually lists.
 
@@ -158,7 +169,7 @@ Accepted type values:
 
 ### `build` / `image`
 
-Builder spec for the container build (the `build` step shared by `build`/`provision`/`deploy`/`takeover`) and the image-builder disk-image step (the disk step of `provision`) respectively.
+Builder spec for the container build (every building command) and the image-builder disk-image step (the disk step of `device provision`) respectively.
 
 Each value is either a **bare-string shorthand** for the no-opts common case, or an **explicit table** tagged by `type` when it carries extra `ssh_opts` and/or `podman_opts`. Each `type` exposes only the fields valid for it (`host`/`ssh_opts` live on `remote` alone).
 
@@ -235,31 +246,11 @@ image = "vm"    # route aarch64 image-builder to a VM; aarch64 container build s
 
 ---
 
-## `[deploy]`
+## `remotes` *(top-level)*
 
-### `registry`
-
-Selects the registry deploy backend and optionally enables image signing. Accepts two forms:
-
-**Plain string** — registry namespace only, no signing:
-```toml
-registry = "registry.gitlab.com/org/project"
-```
-
-**Inline table** — namespace plus cosign signing config:
-```toml
-registry = { url = "registry.gitlab.com/org/project", key = "cosign.key" }
-```
-
-When set (either form), images are pushed to `<registry>/<name>:latest` and devices pull from there. When absent, the LAN (SSH-tunnel) backend is used.
-
-The URL is not a credential — safe to commit. The pull token is collected at provision time; the push auth is managed by `podman login` on the builder.
-
-For the `key` signing field, see [Image signing](../concepts/signing.md).
-
-### `remotes`
-
-Array of SSH targets to deploy to and rotate credentials on. Each entry is either a bare connection string or an object with per-target SSH options:
+The devices bootcher reaches over SSH: `device status`, `deploy`, `refresh`, `switch`,
+`takeover`, `rotate`, and the device steps of `channel promote`/`refresh` and `signing`.
+Each entry is either a bare connection string or an object with per-device options:
 
 ```toml
 remotes = [
@@ -269,20 +260,25 @@ remotes = [
 ]
 ```
 
-The connection string format is anything `ssh` accepts as a destination: `[user@]host` or `ssh://[user@]host[:port]`.
+Being a top-level array, `remotes` must come before the first `[table]` in the file.
+The connection string is anything `ssh` accepts as a destination: `[user@]host` or
+`ssh://[user@]host[:port]`. On the command line, `--remote` names a device by its full
+destination or its bare host.
 
-In LAN mode, at least one remote is required. In registry mode, `remotes` may be empty — devices self-update on their timer — but listing them triggers an immediate `bootc upgrade` after each `deploy` push.
+There is no per-device mode or channel: what each device follows is read live from the
+device ([Direct and channel devices](../concepts/devices.md)). Devices you can't reach
+(an edge fleet behind NAT) just aren't listed: channel devices update themselves.
 
-The object form accepts these per-target keys:
+The object form accepts these per-device keys:
 
 | Key | Purpose |
 |---|---|
 | `ssh_opts` | Extra `ssh` args prepended to every connection (identity file, port, host-key policy, …) |
-| `takeover_login` | The stock cloud login (`debian`/`ubuntu`/`cloud-user`/`root`) [`bootcher takeover`](../workflows/takeover.md) uses for its *initial* connection, before the image's `admin` user replaces it. Per-host override of `--login`. Unused outside takeover — the steady-state identity stays `admin@`, so after takeover this is an ordinary remote |
+| `takeover_login` | The stock cloud login (`debian`/`ubuntu`/`cloud-user`/`root`) [`bootcher device takeover`](../workflows/takeover.md) uses for its *initial* connection, before the image's `admin` user replaces it. Per-host override of `--login`. Unused outside takeover — the steady-state identity stays `admin@`, so after takeover this is an ordinary remote |
 
 #### Host-key verification
 
-bootcher connects with `-o StrictHostKeyChecking=accept-new`, because a device that was just provisioned has no entry in `known_hosts` yet and a strict policy would refuse the first deploy outright. This is **trust on first use**: the first connection to a given host accepts whatever key it presents and pins it, and every later connection is verified against that pin. A mismatch afterwards fails loudly.
+bootcher connects with `-o StrictHostKeyChecking=accept-new`, because a device that was just provisioned has no entry in `known_hosts` yet and a strict policy would refuse the first connection outright. This is **trust on first use**: the first connection to a given host accepts whatever key it presents and pins it, and every later connection is verified against that pin. A mismatch afterwards fails loudly.
 
 The exposure is therefore limited to that first connection — but on a network where someone could be impersonating the device, that is enough to hand them the session. If you provision over a network you don't control, pin the key yourself instead: read it off the device locally (`ssh-keyscan` on the bench, or the host key printed in the console log), add it to `known_hosts`, and set a strict policy for that remote:
 
@@ -292,25 +288,40 @@ remotes = [
 ]
 ```
 
-`ssh_opts` is prepended to every connection bootcher makes to that host, so the override covers `deploy`, `upgrade`, `rotate`, and `takeover` alike.
+`ssh_opts` is prepended to every connection bootcher makes to that host, so the override covers every device command alike.
 
-### `channels`
+---
 
-The named release channels this project publishes, **beyond** the implicit `latest` every project always has. A channel is a mutable registry tag a subset of devices tracks (`<registry>/<name>:<channel>`); `deploy --channel <name>` pushes the multi-arch list under that tag instead of `:latest`, and `provision`/`takeover --channel <name>` set a device's bootc origin to it so the device follows that channel from then on.
+## `[registry]` *(optional)*
+
+Where releases are published and channels moved. Without it every device is direct.
 
 ```toml
-[deploy]
-registry = "registry.example.com/org/project"
-channels = ["stable", "next", "testing"]
+[registry]
+url = "registry.example.com/org/project"
+channels = ["stable", "next"]
+key = "cosign.key"
 ```
 
-Declaring channels is opt-in and does two things: it **validates** `--channel` against a known set (a typo'd `--channel nightyl` is rejected rather than silently minting a stray tag), and it gives `bootcher init` something to seed. Leaving it empty (the default) keeps the project on just `latest` — the single-channel case, where `--channel` is never needed.
+### `url` *(required)*
 
-A channel is a *pointer*, not a separate identity: the same digest a `deploy` produces is **also** tagged with its immutable `:CalVer` (see [Image identity](../concepts/image-identity.md)) regardless of channel, so the version tag is the durable rollback/audit handle and the channel tag is just which subscribers see it. Channels are a **registry-mode** concept — they have no LAN (SSH-tunnel) equivalent, so a non-`latest` `--channel` with no `registry` configured is an error.
+The registry namespace: the image is `<url>/<name>`, and every release and channel is a
+tag on it. Not a credential — safe to commit. Push auth is `podman login` on your
+workstation or CI; a channel device's read-only pull token is collected at provision.
 
-> **Note** — `latest` is always a valid channel without being listed here, and is the default when `--channel` is omitted. Existing devices provisioned before channels existed track `:latest` and stay on it untouched. Don't rename `latest`; add named channels alongside it.
+### `channels` *(required)*
 
-For a complete CI pipeline that publishes `latest` from the default branch and promotes a `v*` tag to `stable`, see the [release-channels recipe](https://github.com/cdellacqua/bootcher/tree/main/recipes/ci/channels) ([Recipes](../recipes/index.md)).
+The channels devices can follow — mutable tags (`<url>/<name>:<channel>`), each a copy of
+some release, moved by `channel promote`. Required and non-empty; each must be a valid OCI
+tag and may not start with `sha256-` or `ci-`. `latest` isn't special: declare it to use
+it. Removing a channel makes the devices on it foreign. See
+[Releases and channels](../concepts/releases.md).
+
+### `key` *(optional)*
+
+The cosign/sigstore **private** key every release is signed with (its public half is the
+`.pub` sibling). Set by `bootcher signing enroll` and repointed by `signing rotate`; see
+[Image signing](../concepts/signing.md).
 
 ---
 
@@ -320,11 +331,11 @@ Optional caps on parallel worker counts. When unset, each activity is unbounded 
 
 | Key | Default | Activity capped |
 |---|---|---|
-| `build` | unbounded | Parallel per-arch container builds (`build`, `provision`, `deploy`) |
-| `disk` | unbounded | Parallel per-arch image-builder runs (the disk step of `provision`) |
-| `upgrade` | unbounded | Parallel per-device upgrade SSHes (the rollout step of `deploy`) |
-| `rotate` | unbounded | Parallel per-device rotate SSHes (`rotate pull-token`, `rotate key`, `rotate sign-key`) |
-| `takeover` | unbounded | Parallel per-host takeover rollouts (`takeover`) — its own knob, since a takeover moves files in place on a live host (and may pull a multi-GB image per host) rather than wiping a disk |
+| `build` | unbounded | Parallel per-arch container builds (every building command) |
+| `disk` | unbounded | Parallel per-arch image-builder runs (the disk step of `device provision`) |
+| `upgrade` | unbounded | Parallel per-device rollouts: `device deploy/refresh/switch` and every channel device step |
+| `rotate` | unbounded | Parallel per-device credential rollouts (`device rotate`) |
+| `takeover` | unbounded | Parallel per-host takeover rollouts (`device takeover`) — its own knob, since a takeover moves files in place on a live host (and may pull a multi-GB image per host) rather than wiping a disk |
 
 "unbounded" means the pool scales to `min(host cores, work items)`; the values shown in the example above (`build = 2`, etc.) are illustrative caps, not defaults.
 
@@ -334,19 +345,21 @@ Each value must be ≥ 1. Setting a cap only ever lowers the pool — it is boun
 
 ## `[hooks.<phase>]`
 
-Pre/post shell commands wrapping a phase. Each hook is run with `sh -c` from the project root; a non-zero exit aborts the run.
+Pre/post shell commands wrapping a phase. Each hook is run with `sh -c` from the project root (for a refresh build, the release commit's worktree — whose own hooks run); a non-zero exit aborts the run.
 
-A `post` hook runs once its phase succeeded — except on the device-fleet phases (`upgrade`, `takeover`, `rotate`), where it runs once every device has been attempted, even if some failed, with each device's outcome in `BOOTCHER_METADATA`'s `results`; the run still fails afterwards if any device did. A failure before any device is attempted (e.g. the registry push) still aborts without `post`.
+A `post` hook runs once its phase succeeded — except on the device-fleet phases (`upgrade`, `takeover`, `rotate`), where it runs once every device has been attempted, even if some failed, with each device's outcome in `BOOTCHER_METADATA`'s `results`; the run still fails afterwards if any device did. A failure before any device is attempted still aborts without `post`.
 
 Because of this, **a `bootcher.toml` is executable content**, not inert configuration: a hook runs with the privileges of the phase it brackets, and `[hooks.disk]` brackets a step that runs under `sudo`. Treat a manifest from somewhere else — a recipe you copied, a colleague's project, a repository you just cloned — exactly as you would treat their `Makefile`, and read its hooks before the first run.
 
 | Phase | Wraps |
 |---|---|
-| `[hooks.build]` | Container build (`build`, `provision`, `deploy`) |
-| `[hooks.disk]` | image-builder disk-image step (`disk`, `provision`) |
-| `[hooks.upgrade]` | Push + `bootc upgrade` per device (`upgrade`, `deploy`) |
-| `[hooks.takeover]` | Image transfer + in-place conversion per host (`takeover`) |
-| `[hooks.rotate]` | Per-device credential rollout (`rotate pull-token`, `rotate ssh-key`, `rotate sign-key`) |
+| `[hooks.build]` | Every container build, including a refresh's worktree build (which runs that commit's hook) |
+| `[hooks.disk]` | The image-builder disk-image step (`device provision`) |
+| `[hooks.publish]` | Pushing a release `:X` (`release publish/refresh`, `channel refresh`, and the re-signing in `signing enroll/rotate`) |
+| `[hooks.promote]` | Moving a channel (`channel promote/refresh`, `release publish --promote`) |
+| `[hooks.upgrade]` | The device rollout only: `device deploy/refresh/switch` and every channel device step |
+| `[hooks.takeover]` | Per-host in-place conversion (`device takeover`) |
+| `[hooks.rotate]` | Per-device credential rollout (`device rotate`, and the `signing` device steps with `credential = "sign-key"`) |
 
 Each `[hooks.<phase>]` table accepts `pre` and/or `post` string keys. Absent keys are no-ops.
 
@@ -356,13 +369,18 @@ Every hook is run with a single environment variable, `BOOTCHER_METADATA`, holdi
 
 ```jsonc
 {
-  "phase": "disk",            // "build" | "disk" | "upgrade" | "takeover" | "rotate"
+  "phase": "disk",            // "build" | "disk" | "publish" | "promote" | "upgrade" | "takeover" | "rotate"
   "stage": "post",            // "pre" | "post"
   "image_name": "kiosk",
   "arches": ["x86_64", "aarch64"],
-  "image_ref": "registry.example.com/org/kiosk:latest",
+  "image_ref": "localhost/kiosk:latest", // what the phase acts on: the local list, or a release/channel ref
   "revision": "9f3a1c2-dirty",        // git commit the image was built from (omitted outside a git tree)
   "version": "v1.4.0-2-g9f3a1c2",      // git describe: nearest tag / short SHA (omitted outside a git tree)
+
+  // publish / promote, and a promote's device rollout:
+  "release": "v1.4",
+  "channel": "stable",                 // promote, and a channel rollout
+  "previous_release": "v1.3",          // promote: what the channel served before
 
   // disk phase only:
   "output_dir": "output",
@@ -390,14 +408,17 @@ Every hook is run with a single environment variable, `BOOTCHER_METADATA`, holdi
 | `phase`, `stage` | all | branch a shared script on `"\(.phase).\(.stage)"` |
 | `image_name` | all | `[general] name` |
 | `arches` | all | the `[targets]` keys |
-| `image_ref` | all | suffix-free ref: local list ref at `build`, bootc-origin source ref at `disk`, pushed/served list ref at `upgrade` / `takeover`, the devices' bootc-origin ref (default channel) at `rotate` |
-| `revision` | all but rotate | git commit the image was built from (`git rev-parse HEAD`, `-dirty`-suffixed for an uncommitted tree); the `org.opencontainers.image.revision` label stamped on the container. Omitted outside a git work tree, and at `rotate` (nothing is built) |
-| `version` | all but rotate | human build description (`git describe --tags --always --dirty`: nearest tag, else short SHA); the `org.opencontainers.image.version` label. Omitted outside a git work tree, and at `rotate` |
+| `image_ref` | all | the local list ref at `build`, the recorded origin at `disk`, the pushed release ref at `publish`, the channel ref at `promote` and a channel rollout, the local list ref at a direct rollout, the host's origin at `takeover`, the registry namespace at `rotate` |
+| `revision` | when known | for a build, the git commit (`-dirty`-suffixed for an uncommitted tree; the `org.opencontainers.image.revision` label); for commands that build nothing, the release's `bootcher.source`. Omitted when unknown |
+| `version` | builds | human build description (`git describe --tags --always --dirty`); the `org.opencontainers.image.version` label. Omitted outside a git work tree |
+| `release` | publish, promote, a promote's rollout | the release name |
+| `channel` | promote, channel rollouts, channel takeovers | the channel |
+| `previous_release` | promote | the release the channel served before (omitted when it served none) |
 | `output_dir` | disk | base output dir, relative to the project root |
 | `targets[]` | disk | the `(arch × disk_type)` build matrix; `file` is the resolved `disk.<ext>`, present only at `disk.post` (and omitted if a dir doesn't hold exactly one `disk.*` — fall back to `dir`) |
-| `remotes[]` | upgrade, takeover, rotate | the `[deploy] remotes` ssh targets; at `upgrade`, omitted in pure-registry mode with no remotes; at `takeover`, always set, as the post-takeover `admin@host`; at `rotate`, always set |
-| `credential` | rotate | the `rotate` subcommand: `pull-token`, `ssh-key` or `sign-key` |
-| `results[]` | upgrade, takeover, rotate (`post` only) | each device's outcome in `[deploy] remotes` order: `host`, `ok`, and `error` (only when `ok` is false). Empty when no device was attempted (a registry `upgrade` with no remotes, or `--skip-bootc-upgrade`) |
+| `remotes[]` | upgrade, takeover, rotate | the devices the rollout targets; at `takeover`, as the post-takeover `admin@host` |
+| `credential` | rotate | `pull-token`, `ssh-key`, or `sign-key` (the `signing` device steps) |
+| `results[]` | upgrade, takeover, rotate (`post` only) | each device's outcome: `host`, `ok`, and `error` (only when `ok` is false); unreachable devices are failures |
 
 Paths are relative to the project root (the hook's working directory). A `disk.post` recipe walks the matrix straight from the JSON — e.g. embedding Raspberry Pi firmware into the aarch64 raw image:
 

@@ -4,11 +4,15 @@ A [bootc](https://bootc-dev.github.io/bootc/) image scaffolded by `bootcher`.
 Edit `Containerfile` and the `sysroot/` overlay to taste, then:
 
 ```sh
-bootcher provision    # build → disk image under output/ (prompts for your SSH key)
-bootcher deploy       # build → push an update to the configured targets
+bootcher device provision   # build → disk image under output/ (prompts for your SSH key)
+bootcher device deploy      # build → push an update to the direct devices in `remotes`
 ```
 
-`provision` leaves the disk image under `output/<arch>/` for you to write or
+With a `[registry]`, publish releases and move channels instead:
+`bootcher release publish v1.0`, `bootcher channel promote v1.0 stable`, and
+`bootcher device provision --channel stable` for devices that follow the channel.
+
+`device provision` leaves the disk image under `output/<arch>/` for you to write or
 upload to your target. It grows its root filesystem to fill the disk on first
 boot.
 
@@ -27,76 +31,38 @@ The target arch and build location live in `bootcher.toml` (the `[targets]` and
   `derive-userdb.sh`.
 - `bootcher.toml` — project manifest. The `[general]` table holds `name` and
   `rootfs` (default `ext4`); the `[targets]` table maps each target arch to its
-  disk type(s) (image-builder image type, default `qcow2`), and `[deploy]` carries
-  an optional `registry` (set it for registry-mode deploys); the `[builder]` table
-  sets where the container build and the disk-image step run
-  (`local`, `vm`, or an ssh destination — `[user@]host`, or
-  `ssh://[user@]host[:port]` for a non-default port). Cross-arch, `local` builds
-  in-process under qemu-user emulation (slower than native); a native-arch
-  `remote` runs with no emulation and is by far the fastest; a `vm` is a clean
-  local sandbox needing no second machine, but cross-arch it runs under
-  full-system emulation, slower still. The `[deploy]` table's
-  `remotes = ["user@host", …]` lists the
-  targets `deploy` / `upgrade` ship to (required for LAN, optional in registry
-  mode). A remote needing extra ssh args takes the object form instead —
-  `{ remote = "user@host", ssh_opts = ["-i", "/path/to/key"] }`.
+  disk type(s) (image-builder image type, default `qcow2`); the optional
+  `[registry]` table (`url`, `channels`, and `key` with signing on) is where releases
+  and channels are published; the `[builder]` table sets where the container build and
+  the disk-image step run (`local`, `vm`, or an ssh destination). The top-level
+  `remotes = ["admin@host", …]` lists the devices bootcher reaches over SSH (what each
+  follows — direct or a channel — is read from the device). A remote needing extra ssh
+  args takes the object form — `{ remote = "admin@host", ssh_opts = ["-i", "/path/to/key"] }`.
 
 ## Admin login
 
 The `admin` user (uid 1000, passwordless `sudo` via `wheel`, `fish` shell) logs
 in over SSH by key only. sshd reads authorized keys from
-`/etc/ssh/authorized_keys.d/admin`, which `bootcher provision` bakes into the
+`/etc/ssh/authorized_keys.d/admin`, which `bootcher device provision` bakes into the
 disk image's persistent `/etc` — **never into the OCI container image**. Rotate it
-by re-provisioning, or by editing that file on the device over SSH.
+with `bootcher device rotate ssh-key`.
 
-## Image signing (registry mode)
+## Image signing
 
-Optionally sign pushed images with a [cosign](https://docs.sigstore.dev/) key so
-devices **reject unsigned or tampered images** on `bootc upgrade`. It's opt-in and
-registry-mode only (a LAN deploy's integrity already rides the ssh channel). To
-enable it:
-
-```sh
-bootcher sign enroll          # writes cosign.key (private, git-ignored) + cosign.pub
-```
-
-That single command does the whole wiring: it writes the keypair, rewrites
-`[deploy] registry` in `bootcher.toml` from a plain URL to the signing form (so the
-registry must already be set first):
-
-```toml
-[deploy]
-registry = { url = "<your-registry>", key = "cosign.key" }
-```
-
-and bakes `sysroot/usr/lib/bootc/install/30-bootcher-signing.toml` so a freshly
-provisioned device enforces signatures from first boot:
-
-```toml
-[install]
-enforce-container-sigpolicy = true
-```
-
-(`bootcher init` runs this for you when you enable signing during setup, so a
-project scaffolded with signing on is ready to `provision` straight away.)
-
-With this set, `deploy`/`upgrade` sign the pushed multi-arch image, and
-`provision` bakes the public key and a signature-requiring
-`/etc/containers/policy.json` into the disk image. `deploy` points the device's bootc
-origin at the verifying `ostree-image-signed:` scheme.
-
-If the signing key leaks or expires, rotate it without reprovisioning:
+Optionally sign every release with a [cosign](https://docs.sigstore.dev/) key so
+channel devices **reject unsigned or tampered images** on `bootc upgrade` (direct
+devices' trust is the SSH channel). With a `[registry]` set:
 
 ```sh
-bootcher sign enroll newcosign        # new keypair (newcosign.key + newcosign.pub)
-# update [deploy] registry key to "newcosign.key" in bootcher.toml, then:
-bootcher rotate sign-key              # push newcosign.pub to every device
-bootcher deploy                       # re-sign + push with the new key
+bootcher signing enroll       # cosign.key (private, git-ignored) + cosign.pub, [registry] key
 ```
 
-Note: between `rotate sign-key` and `deploy`, devices will fail `bootc upgrade` (the
-registry still carries the old signature). They keep running their current image; SSH
-access is unaffected. The fleet recovers as soon as `deploy` runs.
+It also bakes `sysroot/usr/lib/bootc/install/30-bootcher-signing.toml`
+(`enforce-container-sigpolicy = true`), so every install records a verifying origin, and
+on a running fleet signs what the channels serve and enforces signatures on the channel
+devices. Rotate with `bootcher signing rotate` (devices trust old and new keys, no
+window of rejected upgrades), then `bootcher signing retire` once every device has the
+new key.
 
 ## Adding users
 

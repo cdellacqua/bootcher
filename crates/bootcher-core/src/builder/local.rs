@@ -181,7 +181,7 @@ impl Builder for LocalBuilder {
 		// The in-container command, run by the shell we override the entrypoint to:
 		// make the arch member available under `source_ref` in this container's private
 		// COW upper (so image-builder builds from — and records as the bootc origin —
-		// the suffix-free localhost ref, or the registry ref in registry mode), then
+		// the suffix-free localhost ref, or the registry ref for a channel device), then
 		// `exec` image-builder. This is a pure metadata retag — the one store operation
 		// proven safe in the `:O` upper. The refs, flags and container paths are all safe
 		// tokens, so the inner stays free of the single quotes the outer `-v` paths use

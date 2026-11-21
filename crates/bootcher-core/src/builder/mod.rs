@@ -100,7 +100,7 @@ pub(crate) trait Builder {
 	///
 	/// `config` is an optional blueprint file (TOML contents) passed via
 	/// `--blueprint`; bootcher uses it to inject provision-time files (the admin
-	/// SSH key, and the registry pull secret in registry mode) into the image's
+	/// SSH key, and the registry pull secret for a channel device) into the image's
 	/// `/etc` as `customizations.files`. The builder writes it wherever
 	/// `image-builder` will run (a local tempfile, or uploaded to the remote).
 	///
