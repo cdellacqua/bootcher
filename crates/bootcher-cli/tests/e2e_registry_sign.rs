@@ -72,8 +72,11 @@ fn signing_direct_install_channel_enforcement_rotate_retire() {
 			status.contains("containers-storage"),
 			"deploy should re-pin to containers-storage:\n{status}"
 		);
+		// The rollback deployment is the original (verifying) install: only the spec and
+		// the booted deployment describe the device's origin now.
+		let current = status.split("\n  rollback:").next().unwrap_or(&status);
 		assert!(
-			!status.contains("signature: containerPolicy"),
+			!current.contains("signature: containerPolicy"),
 			"a direct device's origin is unverified:\n{status}"
 		);
 	}
