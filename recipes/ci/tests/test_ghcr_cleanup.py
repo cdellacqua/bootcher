@@ -10,11 +10,17 @@ import json
 import os
 import unittest
 import urllib.error
+from datetime import datetime, timezone
 from unittest import mock
 
 from support import load_script
 
 cleanup = load_script("ghcr_cleanup")
+
+# Every fake version is created within the hour after 2026-01-01T00:00Z, so at NOW every
+# `ci-*` tag is still in flight; LATER is two days on, when none is.
+NOW = datetime(2026, 1, 1, 1, 0, tzinfo=timezone.utc)
+LATER = datetime(2026, 1, 3, 0, 0, tzinfo=timezone.utc)
 
 
 def digest(label):
@@ -28,6 +34,7 @@ class Package:
     def __init__(self):
         self.versions = []
         self.children = {}
+        self.annotations = {}
         self._clock = 0
 
     def _add(self, name, tags):
@@ -43,23 +50,26 @@ class Package:
     def signature(self, of):
         return self._add(digest(f"sig-{of}"), [f"sha256-{of.split(':')[1]}.sig"])
 
-    def release(self, label, tags=(), arches=("amd64", "arm64"), signed=False):
-        """A multi-arch list tagged `tags`, with untagged per-arch members."""
+    def release(self, label, tags=(), arches=("amd64", "arm64"), signed=False, release=None):
+        """A multi-arch list tagged `tags`, with untagged per-arch members, annotated as
+        `release` (a channel's copy names the release it serves)."""
         members = [self._add(digest(f"{label}-{a}"), []) for a in arches]
         lst = self._add(digest(label), tags)
         self.children[lst] = members
+        if release:
+            self.annotations[lst] = {"bootcher.release": release}
         if signed:
             self.signature(lst)
             for m in members:
                 self.signature(m)
         return lst
 
-    def plan(self, keep, channels=("latest",)):
-        return cleanup.plan(self.versions, keep, set(channels),
-                            lambda d: self.children.get(d, []))
+    def plan(self, keep, channels=("latest",), served=(), now=NOW):
+        return cleanup.plan(self.versions, keep, set(channels), set(served),
+                            lambda d: self.children.get(d, []), now)
 
-    def deleted(self, keep, channels=("latest",)):
-        _, doomed = self.plan(keep, channels)
+    def deleted(self, keep, channels=("latest",), served=(), now=NOW):
+        _, doomed = self.plan(keep, channels, served, now)
         return {v["name"] for v in doomed}
 
     def family(self, lst):
@@ -120,7 +130,7 @@ class PlanTest(unittest.TestCase):
     def test_channel_and_scratch_tags_are_kept_and_take_no_slot(self):
         pkg = Package()
         stable = pkg.release("stable", ["stable"])
-        scratch = pkg.release("scratch", ["ci-x86_64"])
+        scratch = pkg.release("scratch", ["ci-0123456789ab-x86_64"])
         releases = [pkg.release(f"r{i}", [f"2026.1.{i}"]) for i in range(1, 4)]
         latest = pkg.release("latest", ["latest"])
 
@@ -129,6 +139,38 @@ class PlanTest(unittest.TestCase):
         for kept in [stable, scratch, latest, *releases[1:]]:
             self.assertFalse(pkg.family(kept) & deleted, f"{kept} deleted")
         self.assertEqual(deleted, pkg.family(releases[0]))
+
+    def test_served_releases_are_kept_beyond_keep_previous(self):
+        # A channel that lags its release (a refresh re-pushed :v1 and the channel hasn't
+        # been re-copied) still serves v1: both v1's current digest and the channel's
+        # older copy stay, whatever KEEP_PREVIOUS says.
+        pkg = Package()
+        served = pkg.release("v1", ["v1"])
+        lagging = pkg.release("v1-old", ["stable"], release="v1")
+        others = [pkg.release(f"r{i}", [f"r{i}"]) for i in range(3)]
+        deleted = pkg.deleted(keep=1, channels=("stable",), served=("v1",))
+        for kept in [served, lagging, others[-1]]:
+            self.assertFalse(pkg.family(kept) & deleted, f"{kept} deleted")
+        self.assertEqual(deleted, pkg.family(others[0]) | pkg.family(others[1]))
+
+    def test_old_scratch_tags_are_pruned_and_take_no_slot(self):
+        pkg = Package()
+        old_scratch = pkg.release("scratch", ["ci-0123456789ab-x86_64"])
+        stable = pkg.release("v1", ["stable", "v1"])
+        self.assertFalse(pkg.family(old_scratch) & pkg.deleted(keep=0, channels=("stable",), now=NOW))
+        deleted = pkg.deleted(keep=5, channels=("stable",), now=LATER)
+        self.assertEqual(deleted, pkg.family(old_scratch))
+        self.assertFalse(pkg.family(stable) & deleted)
+
+    def test_a_refresh_orphan_is_pruned(self):
+        # A refresh re-pushed :v1: the old index (and members only it referenced) are
+        # untagged now.
+        pkg = Package()
+        orphan = pkg.release("v1-before-refresh", [])
+        v1 = pkg.release("v1", ["stable", "v1"])
+        deleted = pkg.deleted(keep=5, channels=("stable",), served=("v1",))
+        self.assertEqual(deleted, pkg.family(orphan))
+        self.assertFalse(pkg.family(v1) & deleted)
 
     def test_keep_zero_keeps_only_protected(self):
         pkg = Package()
@@ -152,7 +194,7 @@ class PlanTest(unittest.TestCase):
         pkg.release("old", ["2026.1.1"])
         latest = pkg.release("new", ["latest"])
         asked = []
-        cleanup.plan(pkg.versions, 0, {"latest"}, lambda d: asked.append(d) or [])
+        cleanup.plan(pkg.versions, 0, {"latest"}, set(), lambda d: asked.append(d) or [], NOW)
         self.assertEqual(asked, [latest])
 
     def test_refuses_to_delete_everything(self):
@@ -208,14 +250,18 @@ class FakeGitHub:
         if url == "https://ghcr.io/token?service=ghcr.io&scope=repository:me/img:pull":
             return self.reply({"token": "registry-token"})
         prefix = "https://ghcr.io/v2/me/img/manifests/"
-        if url.startswith(prefix) and url[len(prefix):] in self.pkg.children:
-            digest = url[len(prefix):]
+        ref = url[len(prefix):] if url.startswith(prefix) else None
+        if ref and not ref.startswith("sha256:"):  # a tag: resolve it to its list
+            ref = next((v["name"] for v in self.pkg.versions if ref in cleanup.tags(v)), None)
+        if ref in self.pkg.children:
+            digest = ref
             accepted = request.get_header("Accept", "").split(",")
             if (request.get_header("Authorization") != "Bearer registry-token"
                     or self.media[digest] not in accepted):
                 raise self.error(url, 404)
-            return self.reply({"mediaType": self.media[digest], "manifests": [
-                {"digest": m} for m in self.pkg.children[digest]]})
+            return self.reply({"mediaType": self.media[digest],
+                               "annotations": self.pkg.annotations.get(digest, {}),
+                               "manifests": [{"digest": m} for m in self.pkg.children[digest]]})
         raise self.error(url, 404)
 
     @staticmethod
@@ -226,10 +272,10 @@ class FakeGitHub:
 class MainTest(unittest.TestCase):
     """`main()` end to end against `FakeGitHub`, with the caller's env shut out."""
 
-    def run_main(self, github, **env):
+    def run_main(self, github, channels=("latest",), **env):
         """Run `main()`; returns `(exit code, stdout)` (code None when it returns)."""
         env = {"GH_TOKEN": "gh-token", "GITHUB_REPOSITORY": "Me/repo", **env}
-        info = {"name": "img", "channels": ["latest"]}
+        info = {"name": "img", "channels": list(channels)}
         out = io.StringIO()
         with mock.patch.dict(os.environ, env, clear=True), \
                 mock.patch.object(cleanup, "project_info", lambda: info), \
@@ -306,6 +352,16 @@ class MainTest(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as caught:
             self.run_main(github)
         self.assertEqual(caught.exception.code, 500)
+
+    def test_reads_what_each_channel_serves(self):
+        pkg, old = self.big_package()
+        # `stable` is a lagging copy of the oldest release: that release must survive.
+        pkg.release("stable-copy", ["stable"], release="2026.1.0")
+        github = FakeGitHub(pkg)
+        code, out = self.run_main(github, channels=("latest", "stable"))
+        self.assertIsNone(code, out)
+        self.assertIn("channels serve 2026.1.0", out)
+        self.assertFalse(self.ids(pkg, [old[0]]) & set(github.deleted))
 
     def test_empty_package_is_nothing_to_do(self):
         github = FakeGitHub(Package())
