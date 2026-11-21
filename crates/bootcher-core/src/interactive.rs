@@ -215,6 +215,13 @@ impl Equivalent {
 		self
 	}
 
+	/// Append several positional arguments.
+	#[must_use]
+	pub(crate) fn args<S: Into<String>>(mut self, args: impl IntoIterator<Item = S>) -> Self {
+		self.0.extend(args.into_iter().map(Into::into));
+		self
+	}
+
 	/// Append `flag` when `on`.
 	#[must_use]
 	pub(crate) fn flag_if(self, on: bool, flag: &str) -> Self {

@@ -1,5 +1,5 @@
 //! End-to-end takeover test: boot a **stock Debian 13 (trixie) generic cloud
-//! image**, run `bootcher takeover` against it, and prove it reboots into a bootc
+//! image**, run `bootcher device takeover` against it, and prove it reboots into a bootc
 //! system with the provisioned admin key — the one pass that exercises the whole
 //! `takeover` chain (host pre-flight over SSH → image transfer → `bootc install
 //! to-existing-root` → staged-`/etc` secret injection → reboot → verify) against a
@@ -8,10 +8,12 @@
 //! Like the other VM e2es it is **opt-in** (gated by the `e2e` Cargo feature; plain
 //! `cargo test` compiles but `#[ignore]`s it) and probes its prerequisites.
 //!
-//! Scope: the **LAN** backend, which is self-contained — `takeover` ships the image
-//! to the guest over the same `-R`-tunnelled loopback registry `upgrade` uses, so no
-//! external registry is needed. amd64 only for now (matches the host's build arch);
-//! aarch64 is left for later.
+//! Scope: both modes. `--direct` (UEFI and legacy BIOS) is self-contained — the image
+//! is built here and shipped to the guest over the same `-R`-tunnelled loopback
+//! registry `device deploy` uses. `--channel` (UEFI) stands up a throwaway
+//! `registry:2`, publishes and promotes a release, and the stock host pulls the
+//! channel itself (nothing is pushed by the takeover). amd64 only for now (matches the
+//! host's build arch); aarch64 is left for later.
 //!
 //! ## The guest
 //!
@@ -49,9 +51,16 @@ use bootcher_core::qemu::{self, Vm, VmConfig};
 
 mod common;
 use common::{
-	ADMIN_KEYS, Agent, Prereqs, SENTINEL_PATH, SSH_TIMEOUT, Ssh, StoreGuard, VM_USER, keygen,
-	read_pub_key,
+	ADMIN_KEYS, Agent, Prereqs, RegistryGuard, SENTINEL_PATH, SSH_TIMEOUT, Ssh, StoreGuard,
+	VM_USER, host_primary_ip, insecure_registries_conf, keygen, read_pub_key,
 };
+
+/// Which mode a takeover run converts the host into.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+	Direct,
+	Channel,
+}
 
 /// Stock cloud login on the Debian generic image — takeover's *initial* connection
 /// (before the image's `admin` user, [`VM_USER`], replaces it).
@@ -72,30 +81,39 @@ const CACHE_DIR: &str = "/var/tmp/bootcher-e2e-takeover-cache";
 /// teardown unless `BOOTCHER_E2E_KEEP_STORE` is set.
 const UEFI_STORE_DIR: &str = "/var/tmp/bootcher-e2e-takeover-store";
 const BIOS_STORE_DIR: &str = "/var/tmp/bootcher-e2e-takeover-bios-store";
+const CHANNEL_STORE_DIR: &str = "/var/tmp/bootcher-e2e-takeover-chan-store";
 
 #[test]
 #[cfg_attr(not(feature = "e2e"), ignore = "slow VM e2e; opt in with --features=e2e")]
-fn lan_takeover_converts_a_stock_debian_host() {
+fn direct_takeover_converts_a_stock_debian_host() {
 	let env = Prereqs::probe().expect("prerequisites not satisfied by the current environment");
 	// Boot OVMF (UEFI); `Prereqs` already located the host-arch firmware.
-	run_takeover(Some(env.firmware.clone()), UEFI_STORE_DIR);
+	run_takeover(Some(env.firmware.clone()), UEFI_STORE_DIR, Mode::Direct);
 }
 
 #[test]
 #[cfg_attr(not(feature = "e2e"), ignore = "slow VM e2e; opt in with --features=e2e")]
-fn lan_takeover_converts_a_legacy_bios_debian_host() {
+fn channel_takeover_converts_a_stock_debian_host() {
+	let env = Prereqs::probe().expect("prerequisites not satisfied by the current environment");
+	run_takeover(Some(env.firmware.clone()), CHANNEL_STORE_DIR, Mode::Channel);
+}
+
+#[test]
+#[cfg_attr(not(feature = "e2e"), ignore = "slow VM e2e; opt in with --features=e2e")]
+fn direct_takeover_converts_a_legacy_bios_debian_host() {
 	Prereqs::probe().expect("prerequisites not satisfied by the current environment");
 	// No firmware blob: qemu boots its default `SeaBIOS`, so the guest has no
 	// `/sys/firmware/efi` — the legacy-BIOS path through the whole takeover.
-	run_takeover(None, BIOS_STORE_DIR);
+	run_takeover(None, BIOS_STORE_DIR, Mode::Direct);
 }
 
 /// The shared takeover scenario, booting the guest on `firmware` (`None` = legacy
-/// BIOS) with its own podman store at `store_dir`.
-fn run_takeover(firmware: Option<PathBuf>, store_dir: &'static str) {
+/// BIOS) with its own podman store at `store_dir`, converting it into `mode`.
+#[allow(clippy::too_many_lines)]
+fn run_takeover(firmware: Option<PathBuf>, store_dir: &'static str, mode: Mode) {
 	let scope = Scope::standalone();
 
-	let h = Harness::setup(firmware, store_dir);
+	let h = Harness::setup(firmware, store_dir, mode);
 	let _vm = h.boot(&scope);
 
 	// 1. Reachable as the stock `debian` user with our admin key, and cloud-init done
@@ -124,11 +142,35 @@ fn run_takeover(firmware: Option<PathBuf>, store_dir: &'static str) {
 	let seed = lines.join("\n") + "\n";
 	std::fs::write(&h.known_hosts, seed).unwrap();
 
-	// 2. Take it over: build the bootc image and convert the live host in place. `-y`
-	//    skips the destructive confirmation (non-TTY); the remote's `takeover_login`
-	//    supplies the stock login.
+	// 2. Take it over. `--remote` names the host (required off a TTY), `-y` skips the
+	//    destructive confirmation (non-TTY); the remote's `takeover_login` supplies the
+	//    stock login. A channel takeover first needs the channel published, and the stock
+	//    host told the throwaway registry is plain HTTP (test-only setup).
+	let key = h.admin_key.to_str().unwrap().to_owned();
+	let remote = format!("ssh://{VM_USER}@127.0.0.1:{}", h.port);
+	let mode_args: Vec<&str> = match mode {
+		Mode::Direct => vec!["--direct"],
+		Mode::Channel => {
+			h.bootcher(&["release", "publish", "v1"]).assert().success();
+			h.bootcher(&["channel", "promote", "v1", "stable", "-y", "--skip-remotes"])
+				.assert()
+				.success();
+			let conf = insecure_registries_conf(h.reg_addr.as_deref().unwrap());
+			h.ssh_out(
+				STOCK_USER,
+				&format!(
+					"printf '%b' '{}' | sudo tee /etc/containers/registries.conf.d/10-bootcher-e2e.conf",
+					conf.replace('\n', "\\n")
+				),
+			)
+			.expect("marking the registry insecure on the stock host");
+			vec!["--channel", "stable", "--anonymous"]
+		}
+	};
 	eprintln!("e2e/takeover: converting the live Debian host (slow: build + install + reboot)");
-	h.bootcher(&["takeover", "--ssh-key", h.admin_key.to_str().unwrap(), "-y"]).assert().success();
+	let mut args = vec!["device", "takeover", "--remote", &remote, "--ssh-key", &key, "-y"];
+	args.extend(mode_args);
+	h.bootcher(&args).assert().success();
 
 	// 3. It rebooted into bootc as `admin@`. `takeover` already waited + checked
 	//    `bootc status` internally; re-assert independently that the host is bootc and
@@ -140,6 +182,18 @@ fn run_takeover(firmware: Option<PathBuf>, store_dir: &'static str) {
 		status.contains("localhost/") || status.to_lowercase().contains("booted"),
 		"host does not look like a booted bootc system:\n{status}"
 	);
+	match mode {
+		Mode::Direct => h
+			.bootcher(&["device", "status", "--format", "{{ .Class }}"])
+			.assert()
+			.success()
+			.stdout("direct\n"),
+		Mode::Channel => h
+			.bootcher(&["device", "status", "--format", "{{ .Class }} {{ .Channel }}"])
+			.assert()
+			.success()
+			.stdout("channel stable\n"),
+	};
 	let keys = h.ssh_out(VM_USER, &format!("cat {ADMIN_KEYS}")).expect("read injected admin keys");
 	assert!(keys.contains(&read_pub_key(&h.admin_key)), "injected admin key missing from host");
 	// Both firmwares leave bootupd managing the ESP (BIOS via `--generic-image`), so
@@ -174,8 +228,18 @@ fn run_takeover(firmware: Option<PathBuf>, store_dir: &'static str) {
 	let boot = h.ssh_out(VM_USER, "findmnt -no FSTYPE /boot").expect("inspect /boot");
 	assert!(!boot.contains("autofs"), "an automount sits on /boot after takeover:\n{boot}");
 	common::set_sentinel(&h.proj, "after-takeover");
-	// `deploy` itself fails if the device didn't boot the staged deployment.
-	h.bootcher(&["deploy"]).assert().success();
+	// The device step itself fails if the device didn't boot the staged deployment.
+	match mode {
+		Mode::Direct => {
+			h.bootcher(&["device", "deploy", "-y"]).assert().success();
+		}
+		Mode::Channel => {
+			h.commit("after takeover");
+			h.bootcher(&["release", "publish", "v2", "--promote", "stable", "-y"])
+				.assert()
+				.success();
+		}
+	}
 	h.wait_for_ssh(VM_USER, &scope, "host never came back after the post-takeover deploy");
 	let sentinel = h.ssh_out(VM_USER, &format!("cat {SENTINEL_PATH}")).unwrap_or_default();
 	assert_eq!(sentinel.trim(), "after-takeover", "host did not boot the deployed image");
@@ -186,12 +250,12 @@ fn run_takeover(firmware: Option<PathBuf>, store_dir: &'static str) {
 	assert!(status.contains("staged: null"), "a deployment is still staged:\n{status}");
 	assert!(!status.contains("rollback: null"), "no rollback deployment:\n{status}");
 
-	// 6. Deploying the same image again is a no-op: already stored and booted, so no
-	//    transfer and no reboot.
-	h.bootcher(&["deploy", "--skip-build"])
-		.assert()
-		.success()
-		.stderr(predicates::str::contains("nothing to do"));
+	// 6. Updating to the same image again is a no-op: already booted, so no reboot.
+	let again: &[&str] = match mode {
+		Mode::Direct => &["device", "deploy", "--skip-build", "-y"],
+		Mode::Channel => &["channel", "promote", "v2", "stable", "-y"],
+	};
+	h.bootcher(again).assert().success().stderr(predicates::str::contains("nothing to do"));
 
 	eprintln!("e2e/takeover: passed");
 }
@@ -213,11 +277,15 @@ struct Harness {
 	admin_key: PathBuf,
 	overlay: PathBuf,
 	serial_log: PathBuf,
+	/// `<ip>:<port>` of the throwaway registry (channel mode).
+	reg_addr: Option<String>,
+	_reg: Option<RegistryGuard>,
 	_store: StoreGuard,
 }
 
 impl Harness {
-	fn setup(firmware: Option<PathBuf>, store_dir: &'static str) -> Self {
+	#[allow(clippy::too_many_lines)]
+	fn setup(firmware: Option<PathBuf>, store_dir: &'static str, mode: Mode) -> Self {
 		let home = common::run_dir("bootcher-e2e-takeover-");
 		let store = StoreGuard::new(store_dir);
 		let hp = home.path();
@@ -256,7 +324,43 @@ impl Harness {
 		)
 		.unwrap();
 
+		// Channel mode: a throwaway registry both sides reach by the host's IP, declared
+		// plain-HTTP to the build host and (baked) to the converted system, a
+		// `[registry]` table, and a git repo (releases are built from clean commits).
+		let (reg, reg_addr) = if mode == Mode::Channel {
+			let reg_port = qemu::free_port().expect("free registry port");
+			let addr = format!("{}:{reg_port}", host_primary_ip());
+			let reg = RegistryGuard::start("bootcher-e2e-takeover-reg", reg_port);
+			common::write_host_insecure_registry(hp, &addr);
+			common::write_sysroot(
+				&proj,
+				"etc/containers/registries.conf.d/10-bootcher-e2e.conf",
+				&insecure_registries_conf(&addr),
+			);
+			let m = std::fs::read_to_string(&manifest_path).unwrap();
+			std::fs::write(
+				&manifest_path,
+				format!("{m}\n[registry]\nurl = \"{addr}/proj\"\nchannels = [\"stable\"]\n"),
+			)
+			.unwrap();
+			(Some(reg), Some(addr))
+		} else {
+			(None, None)
+		};
+		for args in [
+			&["init", "-q", "-b", "main"][..],
+			&["config", "user.email", "e2e@example.com"],
+			&["config", "user.name", "e2e"],
+			&["config", "commit.gpgsign", "false"],
+			&["add", "-A"],
+			&["commit", "-qm", "init"],
+		] {
+			duct::cmd("git", args).dir(&proj).run().expect("git setup");
+		}
+
 		Self {
+			reg_addr,
+			_reg: reg,
 			firmware,
 			store_dir,
 			proj,
@@ -329,6 +433,12 @@ impl Harness {
 			"takeover",
 			what,
 		);
+	}
+
+	/// Commit everything in the project.
+	fn commit(&self, msg: &str) {
+		duct::cmd!("git", "add", "-A").dir(&self.proj).run().expect("git add");
+		duct::cmd!("git", "commit", "-qm", msg).dir(&self.proj).run().expect("git commit");
 	}
 
 	/// A `bootcher` command rooted at the project, with the throwaway `$HOME`, the

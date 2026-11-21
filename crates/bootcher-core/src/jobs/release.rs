@@ -826,6 +826,94 @@ pub fn refresh(manifest: &Manifest, name: &str, force: bool, skip_build: bool) -
 	Ok(())
 }
 
+// ------------------------------------------------------------------ list
+
+/// One `release list` row (also its JSON; template fields match
+/// case-insensitively).
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ListRow {
+	pub(crate) release: String,
+	pub(crate) digest: String,
+	pub(crate) commit: Option<String>,
+	pub(crate) stale: bool,
+	/// `base current` / `x86_64: base stale (…)` per arch, for the table.
+	pub(crate) base: String,
+	/// The channels serving this release (by digest).
+	pub(crate) channels: Vec<String>,
+	pub(crate) arches: Vec<crate::jobs::channel::ArchRow>,
+}
+
+/// `bootcher release list`: the tags whose index carries `bootcher.release`, with
+/// their source commit, per-arch base status and the channels serving each.
+/// Read-only.
+///
+/// # Errors
+///
+/// Returns an error if the registry can't be read or the format is invalid.
+pub fn list(manifest: &Manifest, format: Option<&str>) -> Result<()> {
+	manifest.require_registry("`release list`")?;
+	let mut checks = Checks::default();
+	checks.bin("skopeo", oci::SKOPEO_HINT);
+	checks.finish()?;
+	let repo = manifest.repo().context("a registry")?;
+	let channel_digests: Vec<(String, String)> = manifest
+		.channels()
+		.iter()
+		.filter_map(|c| {
+			oci::fetch(&format!("{repo}:{c}")).ok().flatten().map(|f| (c.clone(), f.digest))
+		})
+		.collect();
+	let mut cache = BaseCache::default();
+	let mut rows = Vec::new();
+	for (tag, _) in releases(manifest)? {
+		let Some(p) = read(manifest, &tag)? else { continue };
+		let arches: Vec<crate::jobs::channel::ArchRow> = p
+			.bases(&mut cache)
+			.into_iter()
+			.zip(&p.members)
+			.map(|((arch, base), m)| crate::jobs::channel::ArchRow {
+				arch: arch.to_string(),
+				digest: m.digest.clone(),
+				base,
+			})
+			.collect();
+		let stale = arches.iter().any(|a| a.base.is_stale());
+		let base = if stale {
+			arches
+				.iter()
+				.filter(|a| a.base.is_stale())
+				.map(|a| format!("{}: {}", a.arch, a.base.describe()))
+				.collect::<Vec<_>>()
+				.join("; ")
+		} else {
+			"base current".to_owned()
+		};
+		rows.push(ListRow {
+			channels: channel_digests
+				.iter()
+				.filter(|(_, d)| *d == p.index.digest)
+				.map(|(c, _)| c.clone())
+				.collect(),
+			commit: p.source().ok().flatten(),
+			digest: p.index.digest.clone(),
+			release: tag,
+			stale,
+			base,
+			arches,
+		});
+	}
+	println!(
+		"{}",
+		crate::jobs::device::render_rows(
+			&rows,
+			format,
+			&["release", "commit", "channels", "base"]
+		)?
+	);
+	Ok(())
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
