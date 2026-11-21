@@ -22,6 +22,7 @@ pub mod exec;
 pub mod fedora;
 pub mod fetch;
 pub(crate) mod fleet;
+pub(crate) mod git;
 pub(crate) mod hooks;
 pub(crate) mod interactive;
 pub mod jobs;

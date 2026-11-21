@@ -907,6 +907,11 @@ pub(crate) fn channel_rollout(
 	let trust = TrustFiles::for_manifest(manifest)?.map(|t| t.install_script(false));
 	let mut meta = HookMetadata::new(manifest, Phase::Upgrade, channel_ref.clone());
 	meta.channel = Some(channel.to_owned());
+	// The commit the release was built from (`bootcher.source`), best effort: a
+	// release that can't be read just reports none.
+	meta.revision = release.as_deref().and_then(|x| {
+		crate::jobs::release::read(manifest, x).ok().flatten()?.source().ok().flatten()
+	});
 	meta.release = release;
 	meta.remotes = Some(targets.iter().map(|s| s.host().to_owned()).collect());
 	let hooks = manifest.hooks();
@@ -923,6 +928,45 @@ pub(crate) fn channel_rollout(
 	)?
 	.with(unreachable);
 	crate::hooks::run_post(&mut meta, hooks.upgrade.post.as_deref(), &report, job)
+}
+
+/// Probe the remotes (`--remote` restricts), keep the channel devices on any of
+/// `channels`, and log the rest as skipped. The device-step selection of `channel
+/// promote|refresh`, `release publish --promote` and `signing`: devices on the
+/// moved channel(s), never moving a device. Returns `(channel, device)` pairs and the
+/// unreachable outcomes.
+pub(crate) fn channel_devices(
+	manifest: &Manifest,
+	channels: &[String],
+	remotes: &[String],
+) -> Result<ChannelDevices> {
+	if manifest.remotes().is_empty() {
+		return Ok(ChannelDevices::default());
+	}
+	let picked = candidates(manifest, remotes)?;
+	let (devices, unreachable) = probe(manifest, &picked);
+	let mut out = Vec::new();
+	for d in devices {
+		match &d.class {
+			Class::Channel(ch) if channels.contains(ch) => out.push((ch.clone(), d)),
+			_ => eprintln!("{}: {}, skipped", d.name(), d.describe()),
+		}
+	}
+	if out.is_empty() {
+		eprintln!(
+			"no device follows {}",
+			channels.iter().map(|c| format!(":{c}")).collect::<Vec<_>>().join(", ")
+		);
+	}
+	Ok(ChannelDevices { devices: out, unreachable })
+}
+
+/// The channel devices a device step targets, and the unreachable remotes.
+#[derive(Default)]
+pub(crate) struct ChannelDevices {
+	/// `(channel, device)` pairs.
+	pub(crate) devices: Vec<(String, Device)>,
+	pub(crate) unreachable: Vec<Outcome>,
 }
 
 // ------------------------------------------------------------------ switch
