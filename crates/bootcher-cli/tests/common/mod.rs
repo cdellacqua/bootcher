@@ -1,12 +1,11 @@
-//! Shared scaffolding for the VM end-to-end tests — the LAN lifecycle
-//! (`e2e_vm.rs`), the registry-mode signing path (`e2e_registry_sign.rs`), the
-//! plain registry lifecycle + signing enrollment (`e2e_registry.rs`), the
-//! LAN→registry origin switch (`e2e_lan_to_registry.rs`), release channels
-//! (`e2e_channels.rs`), the live-host takeover (`e2e_takeover.rs`), and the
-//! cross-arch builder (`e2e_cross_arch.rs`). Holds the environment
-//! probe, the ssh-agent wrapper, keypair generation, the throwaway-registry guard,
-//! and the small filesystem/process helpers the harnesses share; each test keeps
-//! its own `Harness` (the flows differ).
+//! Shared scaffolding for the VM end-to-end tests — the direct-device lifecycle
+//! (`e2e_vm.rs`), the channel lifecycle (`e2e_registry.rs`), signing
+//! (`e2e_registry_sign.rs`), a mixed fleet (`e2e_channels.rs`), `device switch` in
+//! both directions (`e2e_switch.rs`), the live-host takeover (`e2e_takeover.rs`), and
+//! the cross-arch builder (`e2e_cross_arch.rs`) — plus the registry-level tests
+//! (`registry.rs`). Holds the environment probe, the ssh-agent wrapper, keypair
+//! generation, the throwaway-registry guard, the shared [`Lab`] harness the device
+//! suites boot their VMs from, and the small filesystem/process helpers.
 //!
 //! Not a test binary itself — it's a module each test file pulls in with
 //! `mod common;`. `dead_code` is allowed because not every helper is used by every
@@ -695,10 +694,10 @@ impl RegistryClient<'_> {
 		(!hex.is_empty()).then(|| format!("sha256:{hex}"))
 	}
 
-	/// Push the locally-built `localhost/<name>:latest` list to `<ns>/<name>:latest`
-	/// **without** signing — the tamper case the signing/enrollment e2es assert is rejected.
-	pub(crate) fn push_unsigned(&self) {
-		let reg_ref = format!("{}/{}:latest", self.ns, self.name);
+	/// Push the locally-built `localhost/<name>:latest` list to `<ns>/<name>:<tag>`
+	/// **without** signing — the tamper case the signing e2es assert is rejected.
+	pub(crate) fn push_unsigned(&self, tag: &str) {
+		let reg_ref = format!("{}/{}:{tag}", self.ns, self.name);
 		let list = format!("localhost/{}:latest", self.name);
 		self.podman(&["manifest", "push", "--all", &list, &reg_ref])
 			.run()
@@ -713,4 +712,244 @@ pub(crate) fn write_host_insecure_registry(hp: &Path, reg_addr: &str) {
 	let conf_dir = hp.join(".config/containers");
 	std::fs::create_dir_all(&conf_dir).unwrap();
 	std::fs::write(conf_dir.join("registries.conf"), insecure_registries_conf(reg_addr)).unwrap();
+}
+
+// ----------------------------------------------------------------- lab
+
+/// Dummy pull credential the registry e2es carry (the throwaway registry is
+/// anonymous, so the pair only exercises the `auth.json` plumbing).
+pub(crate) const PULL_USER: &str = "e2e-puser";
+pub(crate) const PULL_TOKEN: &str = "e2e-ptoken";
+/// Signing passphrase the e2es use (env-driven, no TTY).
+pub(crate) const SIGN_PASS: &str = "e2e-signing-pass";
+
+/// One throwaway e2e world shared by the device suites: a scaffolded project in a git
+/// repo (releases are built from clean commits), its own `$HOME`, podman store and
+/// ssh-agent with an admin key, and — for the registry suites — a `registry:2` both the
+/// build host and the guests reach under one reference string (the host's primary IP),
+/// declared plain-HTTP to both. Any number of VMs boot from it ([`Lab::boot`]).
+pub(crate) struct Lab {
+	pub arch: Arch,
+	pub firmware: PathBuf,
+	pub proj: PathBuf,
+	pub name: String,
+	pub agent: Agent,
+	pub admin_key: PathBuf,
+	pub store: &'static str,
+	/// `<ip>:<port>/proj` — the registry namespace, when there is a registry.
+	pub ns: Option<String>,
+	/// `<ip>:<port>`.
+	pub reg_addr: Option<String>,
+	// Torn down in this order: the registry, then the store, then the run dir.
+	_reg: Option<RegistryGuard>,
+	_store: StoreGuard,
+	pub home: tempfile::TempDir,
+}
+
+/// One device a [`Lab`] booted: its forwarded ssh port and files.
+pub(crate) struct LabVm {
+	pub port: u16,
+	pub serial_log: PathBuf,
+	pub vm: qemu::Vm,
+}
+
+impl Lab {
+	/// A lab named `name` (also the image name and the e2e tag), with a registry
+	/// container `registry` (`None` for a direct-only suite).
+	pub(crate) fn new(
+		env: &Prereqs,
+		name: &str,
+		store: &'static str,
+		registry: Option<&str>,
+	) -> Self {
+		let home = run_dir(&format!("bootcher-e2e-{name}-"));
+		let st = StoreGuard::new(store);
+		let hp = home.path();
+		let keydir = hp.join(".ssh");
+		std::fs::create_dir_all(&keydir).unwrap();
+		let admin_key = keygen(&keydir, "admin");
+		let agent = Agent::start(hp);
+		agent.add(&admin_key);
+		let (reg, ns, reg_addr) = match registry {
+			Some(container) => {
+				let port = qemu::free_port().expect("free registry port");
+				let addr = format!("{}:{port}", host_primary_ip());
+				let reg = RegistryGuard::start(container, port);
+				write_host_insecure_registry(hp, &addr);
+				(Some(reg), Some(format!("{addr}/proj")), Some(addr))
+			}
+			None => (None, None, None),
+		};
+		let proj = scaffold_project(hp, name);
+		let lab = Self {
+			arch: env.arch,
+			firmware: env.firmware.clone(),
+			proj,
+			name: name.to_owned(),
+			agent,
+			admin_key,
+			store,
+			ns,
+			reg_addr,
+			_reg: reg,
+			_store: st,
+			home,
+		};
+		if let Some(addr) = &lab.reg_addr {
+			// The guest's insecure-registry drop-in: the one image-level config a
+			// plain-HTTP registry needs (a real TLS registry needs none).
+			write_sysroot(
+				&lab.proj,
+				"etc/containers/registries.conf.d/10-bootcher-e2e.conf",
+				&insecure_registries_conf(addr),
+			);
+		}
+		set_sentinel(&lab.proj, "sentinel-v1");
+		lab.git(&["init", "-q", "-b", "main"]);
+		lab.git(&["config", "user.email", "e2e@example.com"]);
+		lab.git(&["config", "user.name", "e2e"]);
+		lab.git(&["config", "commit.gpgsign", "false"]);
+		lab.git(&["config", "tag.gpgsign", "false"]);
+		lab
+	}
+
+	/// Write `bootcher.toml`: the remotes on `ports` (loopback `ssh://` URLs with a
+	/// throwaway known-hosts file), plus `[registry]` with `channels` when the lab has a
+	/// registry, plus `extra` verbatim (e.g. a `key`).
+	pub(crate) fn write_manifest(&self, ports: &[u16], channels: &[&str], registry_extra: &str) {
+		let remotes: Vec<String> = ports
+			.iter()
+			.map(|p| {
+				format!(
+					"{{ remote = \"ssh://{VM_USER}@127.0.0.1:{p}\", ssh_opts = [\"-o\", \
+					 \"UserKnownHostsFile=/dev/null\"] }}"
+				)
+			})
+			.collect();
+		let registry = match &self.ns {
+			Some(ns) => {
+				let ch: Vec<String> = channels.iter().map(|c| format!("\"{c}\"")).collect();
+				format!(
+					"\n[registry]\nurl = \"{ns}\"\nchannels = [{}]\n{registry_extra}",
+					ch.join(", ")
+				)
+			}
+			None => String::new(),
+		};
+		std::fs::write(
+			self.proj.join("bootcher.toml"),
+			format!(
+				"remotes = [{}]\n\n[general]\nname = \"{}\"\n\n[targets]\n{} = \"qcow2\"\n\n\
+				 [builder]\nbuild = \"local\"\nimage = \"local\"\n{registry}",
+				remotes.join(", "),
+				self.name,
+				self.arch
+			),
+		)
+		.unwrap();
+	}
+
+	/// `git <args>` in the project.
+	pub(crate) fn git(&self, args: &[&str]) -> String {
+		duct::cmd("git", args).dir(&self.proj).env("HOME", self.home.path()).read().expect("git")
+	}
+
+	/// Commit everything (a release is built from a clean commit); returns HEAD.
+	pub(crate) fn commit(&self, msg: &str) -> String {
+		self.git(&["add", "-A"]);
+		self.git(&["commit", "-qm", msg, "--allow-empty"]);
+		self.git(&["rev-parse", "HEAD"])
+	}
+
+	/// Bake `value` as the sentinel.
+	pub(crate) fn set_sentinel(&self, value: &str) {
+		set_sentinel(&self.proj, value);
+	}
+
+	/// A `bootcher` command in the project with the lab's env: `$HOME`, store, agent,
+	/// signing passphrase and the dummy pull credential.
+	pub(crate) fn bootcher(&self, args: &[&str]) -> AssertCommand {
+		let mut c = bootcher_cmd(&self.proj, self.home.path(), self.store, Some(self.agent.sock()));
+		c.args(args)
+			.env("BOOTCHER_SIGN_PASSPHRASE", SIGN_PASS)
+			.env("BOOTCHER_PULL_USER", PULL_USER)
+			.env("BOOTCHER_PULL_TOKEN", PULL_TOKEN);
+		c
+	}
+
+	/// Copy the disk the last `device provision` built to `name` in the run dir (a
+	/// later provision overwrites `output/`), returning its path.
+	pub(crate) fn keep_disk(&self, name: &str) -> PathBuf {
+		let dest = self.home.path().join(format!("{name}.qcow2"));
+		std::fs::copy(built_disk(&self.proj), &dest).expect("copying the built disk");
+		dest
+	}
+
+	/// Boot a copy-on-write overlay of `disk` on forwarded port `port`, and wait for ssh.
+	pub(crate) fn boot(&self, disk: &Path, port: u16, tag: &str, scope: &Scope) -> LabVm {
+		let overlay = self.home.path().join(format!("{tag}-overlay.qcow2"));
+		let serial_log = self.home.path().join(format!("{tag}-serial.log"));
+		make_overlay(disk, &overlay, None);
+		let vm = qemu::Vm::spawn(
+			&qemu::VmConfig {
+				arch: self.arch,
+				disk: &overlay,
+				seed: None,
+				firmware: Some(&self.firmware),
+				port,
+				log: &serial_log,
+				accel: "kvm",
+				mem_mib: "2048",
+				smp: "2",
+			},
+			scope,
+		)
+		.expect("spawning qemu");
+		wait_for_ssh(
+			VM_USER,
+			port,
+			&self.admin_key,
+			SSH_TIMEOUT,
+			scope,
+			&serial_log,
+			tag,
+			"VM never answered ssh as admin",
+		);
+		LabVm { port, serial_log, vm }
+	}
+
+	/// An ssh view to the guest on `port` as admin (only `-i admin`, no agent).
+	pub(crate) fn ssh(&self, port: u16) -> Ssh<'_> {
+		Ssh { home: self.home.path(), user: VM_USER, port, key: &self.admin_key, agent_sock: None }
+	}
+
+	/// The sentinel the guest on `port` booted.
+	pub(crate) fn sentinel(&self, port: u16) -> String {
+		self.ssh(port)
+			.out(&format!("cat {SENTINEL_PATH}"))
+			.expect("read sentinel")
+			.trim()
+			.to_owned()
+	}
+
+	/// `sudo bootc status` on the guest on `port`.
+	pub(crate) fn bootc_status(&self, port: u16) -> String {
+		self.ssh(port).out("sudo bootc status").unwrap_or_default()
+	}
+
+	/// The registry as the build host addresses it.
+	pub(crate) fn registry(&self) -> RegistryClient<'_> {
+		RegistryClient {
+			proj: &self.proj,
+			home: self.home.path(),
+			store: self.store,
+			ns: self.ns.as_deref().expect("a registry lab"),
+			name: &self.name,
+		}
+	}
+
+	/// `<ns>/<name>:<tag>`.
+	pub(crate) fn tag_ref(&self, tag: &str) -> String {
+		format!("{}/{}:{tag}", self.ns.as_deref().expect("a registry lab"), self.name)
+	}
 }

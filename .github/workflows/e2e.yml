@@ -23,7 +23,7 @@ on:
           - all
           - e2e_vm
           - e2e_registry
-          - e2e_lan_to_registry
+          - e2e_switch
           - e2e_registry_sign
           - e2e_channels
           - e2e_takeover
@@ -46,7 +46,7 @@ jobs:
         suite:
           - e2e_vm
           - e2e_registry
-          - e2e_lan_to_registry
+          - e2e_switch
           - e2e_registry_sign
           - e2e_channels
           - e2e_takeover

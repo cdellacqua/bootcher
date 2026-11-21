@@ -451,3 +451,144 @@ fn enroll_on_a_running_fleet_signs_what_the_channels_serve() {
 		.failure()
 		.stderr(stderr_has("signing rotate"));
 }
+
+// ------------------------------------------------------------------ status, list, refresh
+
+#[test]
+fn status_and_list_report_release_commit_staleness_and_channels() {
+	let w = World::new(5978);
+	let head = w.git(&["rev-parse", "HEAD"]);
+	w.bootcher(&["release", "publish", "v1"]).assert().success();
+	w.bootcher(&["channel", "promote", "v1", "stable", "-y"]).assert().success();
+
+	let out = w
+		.bootcher(&["channel", "status", "--format", "json"])
+		.assert()
+		.success()
+		.get_output()
+		.stdout
+		.clone();
+	let rows: Value = serde_json::from_slice(&out).unwrap();
+	let stable = rows.as_array().unwrap().iter().find(|r| r["channel"] == "stable").unwrap();
+	assert_eq!(stable["release"], "v1");
+	assert_eq!(stable["commit"], head.as_str());
+	assert_eq!((stable["stale"].as_bool(), stable["lags"].as_bool()), (Some(false), Some(false)));
+	let next = rows.as_array().unwrap().iter().find(|r| r["channel"] == "next").unwrap();
+	assert_eq!(next["published"], false);
+
+	// The single-channel template CI gates on.
+	w.bootcher(&["channel", "status", "stable", "--format", "{{ .Release }} {{ .Stale }}"])
+		.assert()
+		.success()
+		.stdout("v1 false\n");
+	w.bootcher(&["channel", "status", "--format", "{{ .Stale }}"])
+		.assert()
+		.failure()
+		.stderr(stderr_has("exactly one channel"));
+
+	w.push_base("base v2");
+	w.bootcher(&["channel", "status", "stable", "--format", "{{ .Stale }}"])
+		.assert()
+		.success()
+		.stdout("true\n");
+
+	let out = w
+		.bootcher(&["release", "list", "--format", "json"])
+		.assert()
+		.success()
+		.get_output()
+		.stdout
+		.clone();
+	let rows: Value = serde_json::from_slice(&out).unwrap();
+	let v1 = &rows.as_array().unwrap()[0];
+	assert_eq!(v1["release"], "v1");
+	assert_eq!(v1["channels"], serde_json::json!(["stable"]));
+	assert_eq!(v1["stale"], true);
+	// The channel tags themselves aren't listed as releases.
+	assert_eq!(rows.as_array().unwrap().len(), 1);
+	w.bootcher(&["release", "list", "--format", "{{ .Release }}={{ .Commit }}"])
+		.assert()
+		.success()
+		.stdout(format!("v1={head}\n"));
+}
+
+#[test]
+fn channel_refresh_rebuilds_repoints_and_honours_exclude() {
+	let w = World::new(5979);
+	w.bootcher(&["release", "publish", "v1"]).assert().success();
+	w.bootcher(&["channel", "promote", "v1", "stable", "-y"]).assert().success();
+	w.bootcher(&["channel", "promote", "v1", "next", "-y"]).assert().success();
+	let d1 = w.digest("v1");
+	w.bootcher(&["build"]).assert().success();
+	let latest = format!("localhost/app:latest-{}", Arch::host().unwrap_or(Arch::X86_64));
+	let latest_id = w.local_image_id(&latest).unwrap();
+
+	// Nothing stale: nothing happens.
+	w.bootcher(&["channel", "refresh", "-y", "--skip-remotes"]).assert().success();
+	assert_eq!(w.digest("v1"), d1);
+
+	// Moving a channel needs -y even with --skip-remotes.
+	w.push_base("base v2");
+	w.bootcher(&["channel", "refresh", "--skip-remotes"])
+		.assert()
+		.failure()
+		.stderr(stderr_has("-y"));
+
+	// HEAD moves on (unreleased work): the refresh rebuilds v1's own commit.
+	let commit = w.source("v1");
+	w.write("app.txt", "unreleased\n");
+	w.commit("unreleased");
+	w.bootcher(&["channel", "refresh", "-y", "--skip-remotes", "--exclude", "next"])
+		.assert()
+		.success();
+	let d2 = w.digest("v1");
+	assert_ne!(d2, d1);
+	assert_eq!(w.source("v1"), commit);
+	assert_eq!(w.digest("stable"), d2, "stable re-pointed at the refreshed v1");
+	assert_eq!(w.digest("next"), d1, "--exclude leaves next alone");
+	assert_eq!(w.local_image_id(&latest).unwrap(), latest_id, "latest-<arch> untouched");
+	w.bootcher(&["channel", "status", "stable", "--format", "{{ .Stale }} {{ .Lags }}"])
+		.assert()
+		.success()
+		.stdout("false false\n");
+	// next now lags its (refreshed) release: a refresh re-copies it without a rebuild.
+	w.bootcher(&["channel", "status", "next", "--format", "{{ .Lags }}"])
+		.assert()
+		.success()
+		.stdout("true\n");
+	w.bootcher(&["channel", "refresh", "next", "-y", "--skip-remotes"]).assert().success();
+	assert_eq!(w.digest("next"), d2);
+}
+
+#[test]
+fn channel_refresh_skip_build_needs_one_release_built_from_its_commit() {
+	let w = World::new(5969);
+	w.bootcher(&["release", "publish", "v1"]).assert().success();
+	w.bootcher(&["channel", "promote", "v1", "stable", "-y"]).assert().success();
+	w.write("app.txt", "app v2\n");
+	w.commit("v2");
+	w.bootcher(&["release", "publish", "v2"]).assert().success();
+	w.bootcher(&["channel", "promote", "v2", "next", "-y"]).assert().success();
+	w.push_base("base v2");
+
+	// Two releases served: --skip-build can't take local images for both.
+	w.bootcher(&["channel", "refresh", "-y", "--skip-remotes", "--skip-build"])
+		.assert()
+		.failure()
+		.stderr(stderr_has("serve v1, v2"));
+	// The local image is v2's commit, not v1's: refused.
+	w.bootcher(&["build"]).assert().success();
+	w.bootcher(&["channel", "refresh", "stable", "-y", "--skip-remotes", "--skip-build"])
+		.assert()
+		.failure()
+		.stderr(stderr_has("rebuild, or check out"));
+	// The right commit's local image: published without a build here.
+	w.bootcher(&["channel", "refresh", "next", "-y", "--skip-remotes", "--skip-build"])
+		.assert()
+		.success();
+	assert_eq!(w.digest("next"), w.digest("v2"));
+	w.bootcher(&["channel", "status", "next", "--format", "{{ .Stale }}"])
+		.assert()
+		.success()
+		.stdout("false\n");
+}

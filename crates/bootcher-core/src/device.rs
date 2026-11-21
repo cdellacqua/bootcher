@@ -35,6 +35,17 @@ impl ImageSpec {
 	pub(crate) fn is_registry(&self) -> bool {
 		self.transport == "registry"
 	}
+
+	/// The imgref ostree-ext stores this origin's image under in the device's ostree
+	/// repo (`docker://<image>` for the registry transport, `<transport>:<image>`
+	/// otherwise) — what `ostree container image metadata` takes (S6).
+	pub(crate) fn ostree_imgref(&self) -> String {
+		if self.is_registry() {
+			format!("docker://{}", self.image)
+		} else {
+			format!("{}:{}", self.transport, self.image)
+		}
+	}
 }
 
 impl fmt::Display for ImageSpec {
@@ -450,6 +461,20 @@ mod tests {
 		assert_eq!(s.booted.unwrap().version.as_deref(), Some("44.20261120.0"));
 		assert!(s.staged.is_none());
 		assert!(parse_probe("arch=x86_64\n").is_err());
+	}
+
+	#[test]
+	fn ostree_imgrefs_spell_the_registry_transport_docker() {
+		let spec = |image: &str, transport: &str| ImageSpec {
+			image: image.into(),
+			transport: transport.into(),
+			signature: None,
+		};
+		assert_eq!(spec("q.io/a/b:c", "registry").ostree_imgref(), "docker://q.io/a/b:c");
+		assert_eq!(
+			spec("localhost/kiosk:latest", "containers-storage").ostree_imgref(),
+			"containers-storage:localhost/kiosk:latest"
+		);
 	}
 
 	#[test]
