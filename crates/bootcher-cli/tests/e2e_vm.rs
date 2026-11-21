@@ -1,27 +1,28 @@
-//! End-to-end VM test: build a *real* bootc disk from `bootcher provision`, boot it
-//! under qemu/KVM, and exercise the live, ssh-driven operations against it — the
-//! one pass that proves the whole chain (image-builder build → bootable disk → provisioned
-//! admin key → on-device credential rotation → upgrade) rather than any single
-//! seam. Slow and heavy by nature, so it is **opt-in**:
+//! End-to-end VM test of the **direct-only** lifecycle (no registry): build a *real*
+//! bootc disk with `bootcher device provision`, boot it under qemu/KVM, and exercise
+//! the live, ssh-driven operations against it — the one pass that proves the whole
+//! chain (image-builder build → bootable disk → provisioned admin key → `device
+//! status` → on-device credential rotation → `device deploy` → `device refresh`)
+//! rather than any single seam. Slow and heavy by nature, so it is **opt-in**:
 //!
 //! - gated by Cargo feature e2e (plain `cargo test` skips it, `cargo test --features=e2e` runs it)
 //! - it probes its prerequisites (podman, qemu, KVM, UEFI firmware, and
 //!   passwordless `sudo sh` — bootcher's privileged image-builder step runs `sudo sh`.
 //!
-//! Scope: the **LAN** lifecycle, which is self-contained — `bootcher deploy`
-//! ships the image to the device over the same ssh channel (an `-R`-tunnelled
-//! mini-registry), so no external registry is needed. It covers a provisioned
-//! admin key + a sentinel baked into the image, then `rotate key` (the happy path
-//! *and* the lockout-safe rollback path), then an upgrade round-trip. Registry-mode
-//! `rotate pull-token` (which needs a registry the guest can pull from) lives in
-//! its own harness, `e2e_registry.rs` — not covered here.
+//! Without a `[registry]` every device is direct: `device deploy` ships the image to
+//! the device over the ssh channel (an `-R`-tunnelled mini-registry), so no external
+//! registry is needed. It covers a provisioned admin key + a sentinel baked into the
+//! image, the device's class, `device rotate ssh-key` (the happy path *and* the
+//! lockout-safe rollback path), a deploy round-trip, and `device refresh` — a clean
+//! deploy is rebuilt from its own commit and shipped back, while a dirty one is
+//! skipped with a hint.
 //!
 //! The connection model is all native, no config file: the manifest remote is the
 //! `ssh://admin@127.0.0.1:<port>` URL (the forwarded loopback port rides in the URL,
 //! no `-p` flag), with per-remote `ssh_opts` pinning `UserKnownHostsFile=/dev/null`
 //! so the VM's fresh, throwaway host key (auto-accepted by bootcher's `accept-new`
 //! base) isn't written anywhere. The key(s) ride an **ssh-agent** —
-//! deliberately *not* a config `IdentityFile` — so that `rotate key`'s validation
+//! deliberately *not* a config `IdentityFile` — so that the rotation's validation
 //! probe (which disables the agent and offers only the new key) is cleanly isolated
 //! and a wrong new key can't be "validated" by the old key.
 
@@ -46,7 +47,7 @@ const STORE_DIR: &str = "/var/tmp/bootcher-e2e-store";
 
 #[test]
 #[cfg_attr(not(feature = "e2e"), ignore = "slow VM e2e; opt in with --feature=e2e")]
-fn lan_lifecycle_build_boot_rotate_upgrade() {
+fn direct_lifecycle_build_boot_rotate_deploy_refresh() {
 	let env = Prereqs::probe_disk_build()
 		.expect("prerequisites not satisfied by the current environment");
 	let scope = Scope::standalone();
@@ -59,9 +60,11 @@ fn lan_lifecycle_build_boot_rotate_upgrade() {
 	h.wait_for_ssh(&h.old_key, &scope, "VM never answered ssh as admin");
 
 	phase_provisioned(&h);
+	phase_status(&h);
 	phase_rotate_key_happy(&h);
 	phase_rotate_key_rollback(&h);
 	phase_upgrade_round_trip(&h, &scope);
+	phase_refresh(&h);
 
 	eprintln!("e2e: all phases passed");
 }
@@ -78,10 +81,21 @@ fn phase_provisioned(h: &Harness) {
 	assert!(keys.contains(&h.old_pub()), "provisioned admin key not on device");
 }
 
-/// `rotate key` happy path: the new key logs in, the old key is retired.
+/// `device status` classifies the freshly provisioned device as direct.
+fn phase_status(h: &Harness) {
+	eprintln!("e2e/phase: device status");
+	h.bootcher(&["device", "status", "--format", "{{ .Class }}"])
+		.assert()
+		.success()
+		.stdout(predicates::str::contains("direct"));
+}
+
+/// `device rotate ssh-key` happy path: the new key logs in, the old key is retired.
 fn phase_rotate_key_happy(h: &Harness) {
 	eprintln!("e2e/phase: rotate key (happy)");
-	h.bootcher(&["rotate", "ssh-key", "--path", h.new_key.to_str().unwrap()]).assert().success();
+	h.bootcher(&["device", "rotate", "ssh-key", "--ssh-key", h.new_key.to_str().unwrap(), "-y"])
+		.assert()
+		.success();
 
 	// New key authenticates; old key is rejected; the file holds only the new key.
 	assert!(h.reachable_with(&h.new_key), "new key should log in after rotation");
@@ -101,7 +115,9 @@ fn phase_rotate_key_rollback(h: &Harness) {
 	eprintln!("e2e/phase: rotate key (rollback)");
 	// decoy.pub contains a different key's public half (set up in Harness::setup),
 	// so the sibling `decoy` private key won't authenticate → validate fails → rollback.
-	h.bootcher(&["rotate", "ssh-key", "--path", h.decoy.to_str().unwrap()]).assert().failure();
+	h.bootcher(&["device", "rotate", "ssh-key", "--ssh-key", h.decoy.to_str().unwrap(), "-y"])
+		.assert()
+		.failure();
 
 	// The device is untouched: still on the key it had before the failed rotation.
 	assert!(h.reachable_with(&h.new_key), "device must remain reachable on the prior key");
@@ -110,22 +126,52 @@ fn phase_rotate_key_rollback(h: &Harness) {
 	assert!(!keys.contains(&h.decoy_pub_contents()), "decoy key must not be left behind");
 }
 
-/// Bump the sentinel, `bootcher deploy` (build the new container + ship it to the
-/// device over the LAN ssh tunnel + `bootc switch`), reboot, and confirm the device
-/// booted the new revision. `deploy` is build-then-ship; `upgrade` alone assumes an
-/// already-built container, like `image` does.
+/// Bump the sentinel (uncommitted: deploy is the inner loop), `bootcher device
+/// deploy` (build + ship over the ssh tunnel + `bootc switch` + reboot), and confirm
+/// the device booted the new revision.
 fn phase_upgrade_round_trip(h: &Harness, scope: &Scope) {
-	eprintln!("e2e/phase: upgrade round-trip");
+	eprintln!("e2e/phase: deploy round-trip");
 	h.set_sentinel("sentinel-v2");
 
-	h.bootcher(&["deploy"]).assert().success();
-
-	// `bootc` applies the staged image on the next boot.
-	let _ = h.ssh_out(&h.new_key, "sudo systemctl reboot"); // connection drops; ignore
-	h.wait_for_ssh(&h.new_key, scope, "VM never came back after upgrade reboot");
+	h.bootcher(&["device", "deploy", "-y"]).assert().success();
+	h.wait_for_ssh(&h.new_key, scope, "VM never came back after the deploy reboot");
 
 	let sentinel = h.ssh_out(&h.new_key, &format!("cat {SENTINEL_PATH}")).expect("read sentinel");
 	assert_eq!(sentinel.trim(), "sentinel-v2", "device did not pick up the upgrade");
+}
+
+/// `device refresh`: a deploy from a clean commit records it, so a forced refresh
+/// rebuilds that commit (here unchanged content, rebuilt `--no-cache`) and ships it
+/// back — even with HEAD moved on and the tree dirty, since nothing is built from it.
+/// A device deployed from a dirty tree records no commit and is skipped with a hint.
+fn phase_refresh(h: &Harness) {
+	eprintln!("e2e/phase: device refresh");
+	h.set_sentinel("sentinel-v3");
+	h.commit("v3");
+	h.bootcher(&["device", "deploy", "-y"]).assert().success();
+	assert_eq!(
+		h.ssh_out(&h.new_key, &format!("cat {SENTINEL_PATH}")).unwrap().trim(),
+		"sentinel-v3"
+	);
+	let before = h.ssh_out(&h.new_key, "sudo bootc status --format json").unwrap();
+
+	// Unreleased work in the checkout: not shipped by a refresh.
+	h.set_sentinel("sentinel-unreleased");
+	h.bootcher(&["device", "refresh", "--force", "-y"]).assert().success();
+	assert_eq!(
+		h.ssh_out(&h.new_key, &format!("cat {SENTINEL_PATH}")).unwrap().trim(),
+		"sentinel-v3",
+		"a refresh rebuilds the device's own commit, never the checkout"
+	);
+	let after = h.ssh_out(&h.new_key, "sudo bootc status --format json").unwrap();
+	assert_ne!(before, after, "the forced refresh should have deployed a rebuilt image");
+
+	// A dirty deploy records no source: refresh skips it, pointing at `device deploy`.
+	h.bootcher(&["device", "deploy", "-y"]).assert().success();
+	h.bootcher(&["device", "refresh", "--force", "-y"])
+		.assert()
+		.success()
+		.stderr(predicates::str::contains("re-run `bootcher device deploy`"));
 }
 
 // ----------------------------------------------------------------- harness
@@ -170,8 +216,17 @@ impl Harness {
 		let agent = Agent::start(hp);
 		agent.add(&old_key);
 
-		// Throwaway project scaffolded with `bootcher init -y`, then pointed at the VM.
+		// Throwaway project scaffolded with `bootcher init -y` in a git repo (a refresh
+		// rebuilds a recorded commit), then pointed at the VM.
 		let proj = common::scaffold_project(hp, "e2e");
+		for args in [
+			&["init", "-q", "-b", "main"][..],
+			&["config", "user.email", "e2e@example.com"],
+			&["config", "user.name", "e2e"],
+			&["config", "commit.gpgsign", "false"],
+		] {
+			duct::cmd("git", args).dir(&proj).run().expect("git setup");
+		}
 
 		// Native, no config file and no PATH shim: the remote is an `ssh://` URL that
 		// carries the forwarded port, and the object form's `ssh_opts` pins known-hosts
@@ -209,18 +264,23 @@ impl Harness {
 		h
 	}
 
+	/// Commit everything in the project.
+	fn commit(&self, msg: &str) {
+		duct::cmd!("git", "add", "-A").dir(&self.proj).run().expect("git add");
+		duct::cmd!("git", "commit", "-qm", msg).dir(&self.proj).run().expect("git commit");
+	}
+
 	/// Write the image-baked sentinel into the project's sysroot overlay.
 	fn set_sentinel(&self, value: &str) {
 		common::set_sentinel(&self.proj, value);
 	}
 
-	/// `bootcher provision --key <old>` → builds the container *and* its bootc
-	/// disk (with the admin key + sentinel baked in). `image` alone only runs image-builder on
-	/// an already-built container; `provision` is the build-then-image front door.
-	/// `expect` names the sentinel value for log readability.
+	/// `bootcher device provision --ssh-key <old>` → builds the container *and* its
+	/// bootc disk (with the admin key + sentinel baked in); `--direct` is implied
+	/// without a registry. `expect` names the sentinel value for log readability.
 	fn provision(&self, expect: &str) {
 		eprintln!("e2e: provisioning disk ({expect}) — this is the slow part");
-		self.bootcher(&["provision", "--ssh-key", self.old_key.to_str().unwrap()])
+		self.bootcher(&["device", "provision", "--ssh-key", self.old_key.to_str().unwrap()])
 			.assert()
 			.success();
 	}

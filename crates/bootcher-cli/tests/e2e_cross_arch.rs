@@ -17,7 +17,7 @@
 //! - plain `cargo test` and `--features e2e` both skip it (`#[ignore]`),
 //! - `--features e2e_cross` un-ignores it (`cargo xtask e2e-cross`).
 //!
-//! Scope is deliberately just provision → boot → verify: a LAN `deploy` round-trip
+//! Scope is deliberately just provision → boot → verify: a `device deploy` round-trip
 //! would mean a *second* cross-arch build + a foreign pull and roughly double an
 //! already-very-long run, for little added signal over "the cross-built disk boots
 //! and carries its provisioned secrets". The build/deploy round-trip is covered
@@ -131,14 +131,14 @@ impl Harness {
 		h
 	}
 
-	/// `bootcher provision` for the cross arch: the container builds locally under
+	/// `bootcher device provision` for the cross arch (direct, no registry): the container builds locally under
 	/// qemu-user, the disk image builds inside the foreign builder VM (`image =
-	/// "vm"`). LAN mode, so only the admin key is collected.
+	/// "vm"`). A direct device, so only the admin key is collected.
 	fn provision(&self, expect: &str) {
 		eprintln!(
 			"e2e/cross: provisioning ({expect}) — boots a foreign builder VM under TCG, very slow"
 		);
-		self.bootcher(&["provision", "--ssh-key", self.admin_key.to_str().unwrap()])
+		self.bootcher(&["device", "provision", "--ssh-key", self.admin_key.to_str().unwrap()])
 			.assert()
 			.success();
 	}
@@ -181,8 +181,8 @@ impl Harness {
 	}
 
 	fn bootcher(&self, args: &[&str]) -> AssertCommand {
-		// No agent socket: cross-arch provision is LAN mode but bootcher's ssh isn't
-		// exercised here (provision only builds), and the e2e uses raw `-i key` ssh.
+		// No agent socket: a direct provision only collects the admin key, bootcher's ssh
+		// isn't exercised here (provision only builds), and the e2e uses raw `-i key` ssh.
 		let mut c = common::bootcher_cmd(&self.proj, self.home.path(), STORE_DIR, None);
 		c.args(args)
 			// Persist the builder VM's cloud-image download + prepared overlay across
@@ -218,7 +218,10 @@ impl Harness {
 /// recommended cross-arch config), and a LAN remote at the guest's forwarded port.
 fn manifest(cross: Arch, ssh_port: u16) -> String {
 	format!(
-		"[general]\n\
+		"remotes = [{{ remote = \"ssh://{VM_USER}@127.0.0.1:{ssh_port}\", \
+		 ssh_opts = [\"-o\", \"UserKnownHostsFile=/dev/null\"] }}]\n\
+		 \n\
+		 [general]\n\
 		 name = \"e2ecross\"\n\
 		 \n\
 		 [targets]\n\
@@ -226,10 +229,6 @@ fn manifest(cross: Arch, ssh_port: u16) -> String {
 		 \n\
 		 [builder]\n\
 		 build = \"local\"\n\
-		 image = \"vm\"\n\
-		 \n\
-		 [deploy]\n\
-		 remotes = [{{ remote = \"ssh://{VM_USER}@127.0.0.1:{ssh_port}\", \
-		 ssh_opts = [\"-o\", \"UserKnownHostsFile=/dev/null\"] }}]\n"
+		 image = \"vm\"\n"
 	)
 }

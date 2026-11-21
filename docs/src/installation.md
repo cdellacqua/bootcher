@@ -6,15 +6,17 @@ bootcher is **Linux-only** as a native binary (Podman is a native Linux tool). m
 
 | Dependency | Required for | Notes |
 |---|---|---|
-| **podman** | All operations | Builds the container image (`bootcher build`), runs image-builder (`bootcher provision`), and pushes to registries (`bootcher deploy`). Version ≥ 4 recommended. |
-| **ssh / ssh-keygen** | `bootcher provision`, `bootcher deploy`, `bootcher takeover` | Key generation at provision time; SSH tunnel and remote commands for deploy/takeover. Usually provided by `openssh-clients`. |
-| **sudo** | `bootcher provision` | image-builder must run as root; bootcher invokes it via `sudo`. Passwordless `sudo sh` is required for unattended runs. |
+| **podman** | All operations | Builds the container image, runs image-builder (`bootcher device provision`), serves images to direct devices, and pushes releases. Version ≥ 5 recommended (releases annotate their index with `podman manifest annotate --index`). |
+| **skopeo** | `release …`, `channel …`, `signing …`, `device provision/takeover/switch --channel`, `device refresh`, `device status` (channel devices) | Reads and copies registry images (promote, staleness checks, signature checks). Not needed for a direct-only project. |
+| **git** | `release publish`, the refreshes | Records the commit a release is built from, and checks out a release's commit for a refresh. |
+| **ssh / ssh-keygen** | every `device …` command, the device steps of `channel` and `signing` | The SSH tunnel and remote commands. Usually provided by `openssh-clients`. |
+| **sudo** | `bootcher device provision` | image-builder must run as root; bootcher invokes it via `sudo`. Passwordless `sudo sh` is required for unattended runs. |
 | **qemu** (`qemu-system-<arch>`, `qemu-img`) + UEFI firmware | `[builder] = "vm"` | Only when a build step is routed to a throwaway local VM (e.g. for cross-arch builds). Firmware is OVMF (x86_64) / AAVMF (aarch64). Not needed for the default in-process `local` builder. |
 | **qemu-user** (binfmt_misc handler, e.g. `qemu-user-static`) | Cross-arch in-process builds | Only when building a foreign-arch image with the default `local` builder; not needed if that arch's steps are routed to a `vm`. |
 
 image-builder itself is pulled as a pinned container image by Podman — you do not need to install it separately.
 
-Each subcommand checks the tools it actually needs **before doing any work** and, if any are missing, fails immediately with a single message naming them and how to install them — so you never get a bare spawn error partway through a long build. The table above lists the full set; a given run only requires the rows matching its `[builder]` / `[deploy]` configuration.
+Each subcommand checks the tools it actually needs **before doing any work** and, if any are missing, fails immediately with a single message naming them and how to install them — so you never get a bare spawn error partway through a long build. The table above lists the full set; a given run only requires the rows matching what it does and its `[builder]` configuration.
 
 ## Binaries
 

@@ -1,72 +1,68 @@
-# Signing key enroll / rotation
+# Signing key: enroll, rotate, retire
 
-Writes the image-signing config to each device (`/etc/pki/containers/<name>.pub`, `/etc/containers/policy.json`, and the `registries.d` sigstore-attachment drop-in) without reprovisioning. Use this when:
+The signing key's lifecycle is three commands, each of which reaches the reachable
+**channel** devices (direct devices don't verify signatures; see
+[Image signing](../../concepts/signing.md#scope)). Each asks for confirmation on a TTY and
+needs `-y` off one; `--remote` restricts the device part. The device part fires
+[`[hooks.rotate]`](../../reference/bootcher-toml.md#hooksphase) with `credential =
+"sign-key"`; the re-signing of releases fires `[hooks.publish]`.
 
-- **Enrolling signing** on a fleet provisioned before signing was enabled — run this, then `bootcher deploy` to switch the bootc origin to the verifying transport.
-- **Rotating the signing key** when the cosign key has leaked or is expiring.
-
-*Registry mode with signing configured only.*
-
-## Command
-
-```sh
-bootcher rotate sign-key
-```
-
-By default, reads the public key from `[deploy] registry` in `bootcher.toml` (the `.pub` sibling of the `key` field). Pass `--pubkey` to rotate to a different key:
+## Enroll
 
 ```sh
-bootcher rotate sign-key --pubkey new-cosign.pub
+bootcher signing enroll [prefix]      # default prefix: cosign
+git add cosign.pub bootcher.toml sysroot && git commit -m "sign releases"
 ```
 
-### Flags
+Writes `<prefix>.key` (private, 0600, git-ignored) and `<prefix>.pub`. On a running fleet
+it then signs every release a channel serves **in place** (the digest doesn't change) and
+runs the channel device step on the reachable channel devices: trust files, then `bootc
+switch --enforce-container-sigpolicy`, upgrade, reboot (an unreachable device is a
+warning). Only then does it set `[registry] key` and bake
+`sysroot/usr/lib/bootc/install/30-bootcher-signing.toml`, so a failed run can simply be
+re-run: it reuses the keypair. On a fresh project (nothing published yet) there is
+nothing to sign and no device to reach, so it needs no `-y`. Refuses when a key is
+already configured — that's `rotate`.
 
-| Flag | Purpose |
-|---|---|
-| `--pubkey <path>` | New signing public key; defaults to the key from `[deploy] registry` in `bootcher.toml` |
+Devices outside `remotes` keep an unverified origin until they're re-provisioned or
+moved with `device switch --channel`.
 
-## Enrolling signing on a running fleet
+## Rotate
 
-Use this when devices were provisioned before signing was enabled (no `key` in `[deploy] registry`).
-
-```
-1. Generate a keypair and update bootcher.toml
-   bootcher sign enroll                 # writes cosign.key / cosign.pub, patches [deploy] registry
-
-2. Push the signing config to every device
-   bootcher rotate sign-key             # writes pubkey + policy.json + registries.d
-
-3. Push a signed image and flip the bootc origin
-   bootcher deploy                      # --enforce-container-sigpolicy applied per device
-```
-
-After step 3, each device's bootc origin is `ostree-image-signed` and every subsequent upgrade verifies the signature.
-
-During the window between steps 2 and 3, devices' `bootc upgrade` behaviour is unchanged (the origin is still unverified and the registry image is still unsigned). SSH access is unaffected throughout.
-
-## Full rotation workflow
-
-Use this when the cosign signing key has leaked or is expiring.
-
-```
-1. Generate a new keypair and update bootcher.toml
-   bootcher sign enroll --force        # overwrites cosign.key / cosign.pub, patches [deploy] registry
-   # or with a new prefix:
-   bootcher sign enroll --prefix cosign-new   # writes cosign-new.key / cosign-new.pub, patches [deploy] registry
-
-2. Push the new public key to every device
-   bootcher rotate sign-key            # reads cosign-new.pub from [deploy] registry
-
-3. Next deploy re-signs with the new key
-   bootcher deploy
+```sh
+bootcher signing rotate [prefix]      # default prefix: cosign-<fingerprint>
+git add cosign-*.pub bootcher.toml && git commit -m "rotate signing key"
 ```
 
-## What happens during the interim (steps 2 → 3, rotation only)
+1. Generate a new keypair.
+2. Add a new-key signature to every release a channel serves (no rebuild, digests
+   unchanged).
+3. Install the old **and** new keys on the channel devices (no reboot: the origin already
+   verifies; `policy.json` lists both).
+4. Point `[registry] key` at the new key — last, so a failure part-way leaves the config
+   on the old key. Re-run `bootcher signing rotate <prefix>` with the prefix the failure
+   names to resume with the same keypair.
 
-After `rotate sign-key` and before the next `deploy`:
+There is no window in which any device — listed or not — rejects what its channel
+serves: the served releases carry both signatures. From now on releases are signed with
+the new key.
 
-- **`bootc upgrade` on devices will fail** — the registry still carries the image signed with the old key, but the device's policy now requires a signature from the new key.
-- **Devices keep running their current image** — a failed upgrade leaves the running system untouched.
-- **SSH access is unaffected** — admin key rotation is independent of signing key rotation.
+## Retire
 
-The fleet is always recoverable: once `bootcher deploy` runs, the image is signed with the new key and devices accept it on the next upgrade attempt.
+```sh
+bootcher signing retire
+```
+
+Makes the channel devices trust only the current key and deletes the other key files.
+It refuses while anything a channel serves doesn't verify under the current key.
+**Run it only once every device, including ones not in `remotes`, has the new key** — a
+device that still only trusts the old one rejects every update from then on, and
+`signing retire` can't reach a device it doesn't know about.
+
+Releases no channel serves keep only their old signature. `channel promote` refuses
+them; `release refresh X --force` rebuilds and re-signs one with the current key.
+
+## A leaked key
+
+Rotate first (devices then trust both keys), and retire as soon as every device has the
+new one: until you retire, a device still accepts an image signed with the leaked key.

@@ -37,6 +37,7 @@ pub(crate) use local::LocalBuilder;
 pub(crate) use remote::RemoteBuilder;
 
 use crate::context::{Arch, BuilderSpec, DiskTarget, ImageRef};
+use crate::interactive::Prompted;
 use crate::progress::Scope;
 use crate::ssh::Ssh;
 use anyhow::Result;
@@ -99,7 +100,7 @@ pub(crate) trait Builder {
 	///
 	/// `config` is an optional blueprint file (TOML contents) passed via
 	/// `--blueprint`; bootcher uses it to inject provision-time files (the admin
-	/// SSH key, and the registry pull secret in registry mode) into the image's
+	/// SSH key, and the registry pull secret for a channel device) into the image's
 	/// `/etc` as `customizations.files`. The builder writes it wherever
 	/// `image-builder` will run (a local tempfile, or uploaded to the remote).
 	///
@@ -277,13 +278,15 @@ pub(crate) fn prompt_spec(question: &str, role: BuilderRole, cross_arch: bool) -
 	let chosen = inquire::Select::new(question, choices)
 		.with_starting_cursor(start)
 		.with_help_message(help)
-		.prompt()?;
+		.prompt()
+		.prompted()?;
 	Ok(match chosen {
 		BuilderChoice::Local => "local".to_owned(),
 		BuilderChoice::Vm => "vm".to_owned(),
 		BuilderChoice::Remote => {
 			inquire::Text::new("Remote SSH destination ([user@]host or ssh://[user@]host[:port]):")
-				.prompt()?
+				.prompt()
+				.prompted()?
 		}
 	})
 }

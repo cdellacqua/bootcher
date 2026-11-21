@@ -14,10 +14,16 @@
 //! `BOOTCHER_SIGN_PASSPHRASE` or a TTY prompt, mirroring the registry pull token
 //! ([`crate::jobs::secrets`]).
 
-use crate::context::SigningConfig;
+use crate::context::Manifest;
 use crate::exec::run_argv;
-use crate::jobs::secrets::render_policy_json;
+use crate::hooks::{Credential, HookMetadata, Phase, Stage};
+use crate::interactive::Prompted as _;
+use crate::jobs::device::ChannelDevices;
+use crate::jobs::secrets::{TrustFiles, TrustKey, fingerprint, render_policy_json};
+use crate::oci;
+use crate::preflight::Checks;
 use crate::progress::Scope;
+use crate::ssh::Ssh;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use crypto_secretbox::aead::Aead;
@@ -65,8 +71,12 @@ pub fn enroll(key_path: &Path, pub_path: &Path, force: bool) -> Result<()> {
 		);
 	}
 
-	let passphrase = collect_passphrase(true)?;
+	generate(key_path, pub_path, &collect_passphrase(true)?)
+}
 
+/// Write a fresh sigstore-format keypair encrypted with `passphrase` to `key_path`
+/// (private, 0600) and `pub_path` (public), overwriting nothing checked here.
+fn generate(key_path: &Path, pub_path: &Path, passphrase: &str) -> Result<()> {
 	// A fresh P-256 key. cosign/containers/image encrypt the PKCS#8 *DER* (the
 	// `x509.MarshalPKCS8PrivateKey` bytes), so the envelope wraps the DER, not PEM.
 	let secret = SecretKey::try_generate().context("generating the private key")?;
@@ -85,14 +95,15 @@ pub fn enroll(key_path: &Path, pub_path: &Path, force: bool) -> Result<()> {
 }
 
 /// The bootc install drop-in [`enable_signing`] bakes into the project's `sysroot/`
-/// overlay, so a freshly provisioned device enforces the signature policy from its
-/// very first boot — not only after the first `deploy` switches the origin. See
-/// `bootc-install-config(5)`.
+/// overlay, so every install of the image records a signature-enforcing origin from
+/// its very first boot. See `bootc-install-config(5)`. A direct device installs and
+/// boots fine with it and no trust files (S1); its first `device deploy` re-pins it
+/// to an unverified `containers-storage` origin.
 const ENFORCE_SIGPOLICY_CONFIG: &str = "\
-# Enforce the container signature policy (written by `bootcher sign enroll`). Makes
-# bootc record a verifying origin and reject an image whose signature doesn't
-# satisfy /etc/containers/policy.json. Remove this (and change `[deploy] registry`
-# back to a plain URL string) to go back to unsigned images.
+# Enforce the container signature policy (written by `bootcher signing enroll`).
+# Makes bootc record a verifying origin and reject an image whose signature doesn't
+# satisfy /etc/containers/policy.json. Remove this (and `key` from [registry]) to go
+# back to unsigned images.
 [install]
 enforce-container-sigpolicy = true
 ";
@@ -101,47 +112,60 @@ enforce-container-sigpolicy = true
 /// `sysroot/` overlay (copied to `/` by the scaffold Containerfile's `COPY sysroot/ /`).
 pub const ENFORCE_SIGPOLICY_PATH: &str = "sysroot/usr/lib/bootc/install/30-bootcher-signing.toml";
 
-/// Outcome of [`enable_signing`]: the relative key/pub filenames it wrote, plus
-/// whether `[deploy] registry` was actually patched (false ⇒ LAN mode, no registry
-/// to wire — the caller should error).
+/// Outcome of [`enable_signing`]: the relative key/pub filenames it wrote.
 pub struct Enrolled {
 	/// The private-key filename, e.g. `cosign.key` (relative to the project root).
 	pub key: String,
 	/// The public-key filename, e.g. `cosign.pub`.
 	pub public: String,
-	/// `false` if `bootcher.toml` had no `[deploy] registry` entry to patch.
-	pub registry_patched: bool,
 }
 
 /// Fully enable image signing for the bootcher project rooted at `root`: generate a
-/// `<prefix>.key`/`<prefix>.pub` keypair, patch `[deploy] registry` to the signing
-/// inline-table form, and (when a registry is configured) bake the
-/// `enforce-container-sigpolicy` bootc install drop-in into `sysroot/`. This is the
-/// single source of truth for the signing wiring, shared by `bootcher sign enroll`
-/// (`root` = cwd) and `bootcher init` (`root` = the freshly scaffolded project dir),
-/// so the two can't drift.
+/// `<prefix>.key`/`<prefix>.pub` keypair, set `[registry] key`, and bake the
+/// `enforce-container-sigpolicy` bootc install drop-in into `sysroot/`. The local
+/// half of `bootcher signing enroll`, shared with `bootcher init` (`root` = the
+/// freshly scaffolded project dir), so the two can't drift.
 ///
-/// The sigpolicy drop-in is written only when absent, so a key rotation
-/// (`enroll <newprefix>`) refreshes the keypair without clobbering a drop-in the
-/// user may have edited.
+/// The sigpolicy drop-in is written only when absent, so a user-edited one is left
+/// alone.
 ///
 /// # Errors
 ///
-/// Returns an error if the key already exists (without `force`), passphrase
-/// collection or key generation fails, or any file can't be read/written.
-pub fn enable_signing(root: &Path, prefix: &str, force: bool) -> Result<Enrolled> {
+/// Returns an error if the manifest has no `[registry]`, the key already exists,
+/// passphrase collection or key generation fails, or any file can't be read/written.
+pub fn enable_signing(root: &Path, prefix: &str) -> Result<Enrolled> {
+	let manifest = root.join(crate::context::MANIFEST);
+	if !has_registry_table(&manifest)? {
+		bail!(
+			"signing protects registry pulls, but bootcher.toml has no `[registry]` — add one \
+			 (with `url` and `channels`) first"
+		);
+	}
+	enable_signing_with(root, prefix, &collect_passphrase(true)?)
+}
+
+/// [`enable_signing`] with an already-collected passphrase.
+fn enable_signing_with(root: &Path, prefix: &str, passphrase: &str) -> Result<Enrolled> {
 	let key = format!("{prefix}.key");
 	let public = format!("{prefix}.pub");
-	enroll(&root.join(&key), &root.join(&public), force)?;
-
-	let registry_patched = patch_registry_key(&root.join(crate::context::MANIFEST), &key)?;
-
-	// The drop-in only matters alongside a configured registry; in LAN mode (no
-	// registry to patch) skip it and let the caller report the missing registry.
-	if registry_patched {
-		write_enforce_sigpolicy(root)?;
+	let manifest = root.join(crate::context::MANIFEST);
+	if root.join(&key).exists() {
+		bail!("{} already exists — refusing to overwrite a signing key", root.join(&key).display());
 	}
-	Ok(Enrolled { key, public, registry_patched })
+	generate(&root.join(&key), &root.join(&public), passphrase)?;
+	patch_registry_key(&manifest, &key)?;
+	write_enforce_sigpolicy(root)?;
+	Ok(Enrolled { key, public })
+}
+
+/// Whether the manifest at `path` has a `[registry]` table.
+fn has_registry_table(path: &Path) -> Result<bool> {
+	let content =
+		fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+	let doc = content
+		.parse::<toml_edit::DocumentMut>()
+		.with_context(|| format!("parsing {}", path.display()))?;
+	Ok(doc.get("registry").is_some_and(toml_edit::Item::is_table_like))
 }
 
 /// Write [`ENFORCE_SIGPOLICY_CONFIG`] into `root`'s `sysroot/` overlay (creating
@@ -159,16 +183,11 @@ fn write_enforce_sigpolicy(root: &Path) -> Result<()> {
 		.with_context(|| format!("writing {}", path.display()))
 }
 
-/// Patch the `[deploy] registry` entry in `bootcher.toml` so it includes
-/// `key = <key_path>`, preserving all existing comments and formatting.
+/// Set `key = <key_path>` in the `[registry]` table of the manifest at
+/// `manifest_path`, preserving all existing comments and formatting (a `[registry]`
+/// table or an inline `registry = { … }` both work).
 ///
-/// Handles three shapes:
-/// - `registry = "url"` → replaced with `registry = { url = "url", key = "<key_path>" }`
-/// - `registry = { url = "...", ... }` → `key` field added or updated in-place
-/// - `[deploy.registry]` dotted table → `key` field added or updated in-place
-///
-/// Returns `true` if the file was updated, `false` if `[deploy] registry` is
-/// absent (file exists but registry not yet configured — caller should error).
+/// Returns `true` if the file was updated, `false` if there is no `[registry]`.
 ///
 /// # Errors
 ///
@@ -187,26 +206,13 @@ pub fn patch_registry_key(manifest_path: &Path, key_path: &str) -> Result<bool> 
 		.parse::<toml_edit::DocumentMut>()
 		.with_context(|| format!("parsing {}", manifest_path.display()))?;
 
-	let registry = &mut doc["deploy"]["registry"];
-	if registry.is_none() {
-		return Ok(false);
-	}
-
-	if let Some(url) = registry.as_str().map(str::to_owned) {
-		let mut t = toml_edit::InlineTable::new();
-		t.insert("url", url.into());
-		t.insert("key", key_path.into());
-		*registry = toml_edit::Item::Value(toml_edit::Value::InlineTable(t));
-	} else if let Some(t) = registry.as_inline_table_mut() {
+	let Some(registry) = doc.get_mut("registry") else { return Ok(false) };
+	if let Some(t) = registry.as_inline_table_mut() {
 		t.insert("key", key_path.into());
 	} else if let Some(t) = registry.as_table_mut() {
 		t.insert("key", toml_edit::value(key_path));
 	} else {
-		bail!(
-			"unexpected `[deploy] registry` shape in {} — expected a string, inline table, or \
-			 dotted table",
-			manifest_path.display()
-		);
+		bail!("unexpected `registry` shape in {} — expected a table", manifest_path.display());
 	}
 
 	fs::write(manifest_path, doc.to_string())
@@ -216,7 +222,7 @@ pub fn patch_registry_key(manifest_path: &Path, key_path: &str) -> Result<bool> 
 
 /// Check the external tools [`verify`] needs: just `podman` (the pull that
 /// performs the signature check). Unlike the other jobs' `preflight`, it takes no
-/// manifest — `sign verify` can run outside a project when `--pubkey` is passed.
+/// manifest — `signing verify` can run outside a project when `--pubkey` is passed.
 ///
 /// # Errors
 ///
@@ -234,16 +240,17 @@ pub fn preflight_verify() -> Result<()> {
 /// signature from `pubkey_path`. Wraps `podman pull --signature-policy` with a
 /// throwaway policy requiring sigstoreSigned from the given key — the same
 /// verification path the device uses on `bootc upgrade`. Exits with an error if
-/// the signature is missing or invalid.
+/// the signature is missing or invalid. A plain-HTTP registry (a local test one) is
+/// declared the usual way, `insecure = true` in `registries.conf`.
 ///
 /// # Errors
 ///
 /// Returns an error if the signature is missing or invalid, or a `podman` command fails.
-pub fn verify(image_ref: &str, pubkey_path: &Path, tls_verify: bool, job: &Scope) -> Result<()> {
+pub fn verify(image_ref: &str, pubkey_path: &Path, job: &Scope) -> Result<()> {
 	let ns = registry_namespace(image_ref);
 
 	// Ensure the build host's registries.d enables sigstore-attachment lookups
-	// for this namespace (same as deploy does on push).
+	// for this namespace (same as a publish does on push).
 	ensure_push_attachments(ns, job)?;
 
 	let tmp = tempfile::tempdir().context("temp dir for verify policy")?;
@@ -260,13 +267,10 @@ pub fn verify(image_ref: &str, pubkey_path: &Path, tls_verify: bool, job: &Scope
 		.context("writing verify policy.json")?;
 	let policy_str = tmp_policy.to_str().context("policy path is not valid UTF-8")?;
 
-	let tls = if tls_verify { "--tls-verify=true" } else { "--tls-verify=false" };
-
 	let argv: Vec<std::ffi::OsString> = vec![
 		"podman".into(),
 		"pull".into(),
 		"--quiet".into(),
-		tls.into(),
 		"--signature-policy".into(),
 		policy_str.into(),
 		format!("docker://{image_ref}").into(),
@@ -316,7 +320,7 @@ pub(crate) fn collect_passphrase(confirm: bool) -> Result<String> {
 		} else {
 			prompt.without_confirmation()
 		};
-		Ok(prompt.prompt()?)
+		prompt.prompt().prompted()
 	} else {
 		bail!(
 			"no signing passphrase available: set {ENV_SIGN_PASSPHRASE} (or run on a TTY to be \
@@ -342,24 +346,17 @@ impl SignArgs {
 	}
 }
 
-/// Build the `podman` signing flags for `signing`: resolve the private key path
-/// (relative to the project root / cwd) and write the collected passphrase to a
-/// temp 0600 file podman reads via `--sign-passphrase-file` (so it never hits the
-/// argv or the process list). Used by the registry deploy push ([`crate::jobs::upgrade`]).
-///
-/// # Errors
-///
-/// Returns an error if the signing key is missing, passphrase collection fails, or
-/// the temp passphrase file can't be created or written.
-pub(crate) fn sign_args(signing: &SigningConfig) -> Result<SignArgs> {
-	let key = &signing.key;
+/// Build the signing flags (`podman` and `skopeo` spell them the same) for the
+/// private key at `key` with `passphrase`: the passphrase goes to a temp 0600 file
+/// read via `--sign-passphrase-file`, so it never hits the argv or the process list.
+/// Used by every signed push and in-place re-sign.
+pub(crate) fn sign_args_with(key: &str, passphrase: &str) -> Result<SignArgs> {
 	if !Path::new(key).is_file() {
 		bail!(
-			"signing key {key} not found — generate one with `bootcher sign enroll` and set \
-			 `key` in `[deploy] registry`"
+			"signing key {key} not found — generate one with `bootcher signing enroll` (it sets \
+			 `key` in `[registry]`)"
 		);
 	}
-	let passphrase = collect_passphrase(false)?;
 	let mut pass_file =
 		tempfile::NamedTempFile::new().context("creating a temp passphrase file")?;
 	// 0600 before writing the secret.
@@ -382,8 +379,9 @@ pub(crate) fn sign_args(signing: &SigningConfig) -> Result<SignArgs> {
 /// (off by default → "writing sigstore attachments is disabled by configuration"),
 /// and podman has no per-push override, so bootcher writes a scoped drop-in into
 /// the invoking user's `~/.config/containers/registries.d`. Idempotent — the same
-/// content every run, written once. The device gets the equivalent config via
-/// provision (see [`crate::jobs::secrets`]); this is its build-host counterpart.
+/// content every run, written once. A channel device gets the equivalent config
+/// with its trust files (see [`crate::jobs::secrets`]); this is the build-host
+/// counterpart, which skopeo reads too.
 ///
 /// # Errors
 ///
@@ -409,6 +407,409 @@ pub(crate) fn ensure_push_attachments(ns: &str, job: &Scope) -> Result<()> {
 			"signing: enabled sigstore attachments for pushes to {ns} ({})",
 			file.display()
 		));
+	}
+	Ok(())
+}
+
+// --------------------------------------------------------------- the fleet commands
+
+/// A release a channel serves, to (re-)sign: its ref, and which channels serve it.
+#[derive(Debug)]
+struct Served {
+	/// The ref to sign in place: the release `:X`, or the channel itself when it
+	/// lags its release (its digest isn't `:X`'s).
+	tag: String,
+	channels: Vec<String>,
+}
+
+/// What the declared channels serve: one entry per distinct ref to sign.
+fn served(manifest: &Manifest) -> Result<Vec<Served>> {
+	let repo = manifest.repo().context("signing needs `[registry]`")?;
+	let mut out: Vec<Served> = Vec::new();
+	for ch in manifest.channels() {
+		let Some(chan) = oci::fetch(&format!("{repo}:{ch}"))? else { continue };
+		let release = chan.manifest.release().map(str::to_owned);
+		let tag = match &release {
+			Some(x)
+				if oci::fetch(&format!("{repo}:{x}"))?.is_some_and(|r| r.digest == chan.digest) =>
+			{
+				x.clone()
+			}
+			_ => ch.clone(),
+		};
+		match out.iter_mut().find(|s| s.tag == tag) {
+			Some(s) => s.channels.push(ch.clone()),
+			None => out.push(Served { tag, channels: vec![ch.clone()] }),
+		}
+	}
+	Ok(out)
+}
+
+/// Sign every `served` ref in place with the private key at `key` (digests
+/// unchanged, S4), each bracketed by `[hooks.publish]`.
+fn sign_served(
+	manifest: &Manifest,
+	served: &[Served],
+	key: &str,
+	passphrase: &str,
+	job: &mut Scope,
+) -> Result<()> {
+	let reg = manifest.require_registry("signing")?;
+	ensure_push_attachments(&reg.url, job)?;
+	for s in served {
+		let r = manifest.tag_ref(&s.tag).context("a release ref")?;
+		let mut meta = HookMetadata::new(manifest, Phase::Publish, r.clone());
+		meta.release = Some(s.tag.clone());
+		let hooks = manifest.hooks();
+		crate::hooks::run(&meta, hooks.publish.pre.as_deref(), job)?;
+		let sign = sign_args_with(key, passphrase)?;
+		crate::oci::copy(&r, &r, false, Some(&sign), job)?;
+		job.println(format!("signed {r} (served by {})", s.channels.join(", ")));
+		meta.stage = Stage::Post;
+		crate::hooks::run(&meta, hooks.publish.post.as_deref(), job)?;
+	}
+	Ok(())
+}
+
+/// Run `per_device` on every channel device (on any declared channel, `--remote`
+/// restricts), bracketed by `[hooks.rotate]` with `credential = "sign-key"`.
+fn on_channel_devices(
+	manifest: &Manifest,
+	targets: &ChannelDevices,
+	task: &str,
+	per_device: &(dyn Fn(&str, &Ssh, &mut Scope) -> Result<()> + Sync),
+	job: &mut Scope,
+) -> Result<()> {
+	if targets.devices.is_empty() && targets.unreachable.is_empty() {
+		return Ok(());
+	}
+	let ssh: Vec<Ssh> = targets.devices.iter().map(|(_, d)| d.ssh.clone()).collect();
+	crate::jobs::rotate::with_hooks(manifest, Credential::SignKey, &ssh, job, |job| {
+		let report = crate::fleet::for_each_host(
+			&targets.devices,
+			task,
+			|(_, d)| d.name().to_owned(),
+			manifest.concurrency().upgrade,
+			job,
+			|(ch, d), scope| per_device(ch, &d.ssh, scope),
+		)?;
+		Ok(report.with(targets.unreachable.clone()))
+	})
+}
+
+/// The confirmation every signing command shows before it reaches the fleet.
+fn confirm_fleet(
+	what: &str,
+	served: &[Served],
+	targets: &ChannelDevices,
+	yes: bool,
+	lines: Vec<String>,
+) -> Result<()> {
+	let mut all = lines;
+	all.extend(
+		served.iter().map(|s| format!("  sign {} (served by {})", s.tag, s.channels.join(", "))),
+	);
+	all.extend(targets.devices.iter().map(|(ch, d)| format!("  update {} (on :{ch})", d.name())));
+	if served.is_empty() && targets.devices.is_empty() && targets.unreachable.is_empty() {
+		return Ok(());
+	}
+	crate::interactive::confirm(yes, what, &all, "Proceed?", true)
+}
+
+/// `bootcher signing enroll [prefix]`: turn signing on. Writes the keypair; then, on
+/// a running fleet, signs each release a channel serves in place (digests unchanged)
+/// and runs the channel device step — trust files, then
+/// `--enforce-container-sigpolicy` — on the reachable channel devices; and only then
+/// sets `[registry] key` and bakes the install drop-in, so a run that fails part-way
+/// can simply be re-run (it reuses the keypair it wrote). Devices are only probed
+/// when a channel serves something; an unreachable one is a warning, not a failure
+/// (enforcement is baked into the image, and the device gets its trust files with its
+/// next channel device step). Devices outside `remotes` keep an unverified origin
+/// until they are re-provisioned or switched.
+///
+/// # Errors
+///
+/// Returns an error if a key is already configured, there is no registry, the user
+/// declines, or a signing/device step fails.
+pub fn enroll_fleet(
+	manifest: &Manifest,
+	prefix: &str,
+	remotes: &[String],
+	yes: bool,
+) -> Result<Enrolled> {
+	let reg = manifest.require_registry("`signing enroll`")?;
+	if manifest.signing().is_some() {
+		bail!(
+			"a signing key is already configured (`[registry] key`) — use `bootcher signing rotate`"
+		);
+	}
+	let root = manifest.root();
+	let (key, public) = (format!("{prefix}.key"), format!("{prefix}.pub"));
+	let (key_path, pub_path) = (root.join(&key), root.join(&public));
+	// A keypair left by an earlier run that failed before `[registry] key` was set.
+	let resume = key_path.exists();
+	if resume && !pub_path.exists() {
+		bail!("{key} exists without {public} — pick another prefix");
+	}
+	let mut checks = Checks::default();
+	checks.bin("skopeo", crate::oci::SKOPEO_HINT);
+	checks.finish()?;
+	let served = served(manifest)?;
+	// A device can only follow a channel that serves something, so a fresh project
+	// (nothing published yet) has no device to reach.
+	let mut targets = if served.is_empty() {
+		ChannelDevices::default()
+	} else {
+		if !manifest.remotes().is_empty() {
+			let mut checks = Checks::default();
+			checks.bin("ssh", "reach the devices over SSH");
+			checks.finish()?;
+		}
+		crate::jobs::device::channel_devices(manifest, manifest.channels(), remotes)?
+	};
+	let unreachable = std::mem::take(&mut targets.unreachable);
+	for o in &unreachable {
+		eprintln!(
+			"warning: {} is unreachable; it gets the trust files with its next channel device \
+			 step (`channel promote`, `channel refresh` or `device switch`)",
+			o.host
+		);
+	}
+	confirm_fleet(
+		"`signing enroll` signs served releases and updates devices",
+		&served,
+		&targets,
+		yes,
+		vec!["signing enroll will:".to_owned()],
+	)?;
+	let passphrase = collect_passphrase(!resume)?;
+	if resume {
+		check_passphrase(&key_path, &passphrase)?;
+		eprintln!("signing: reusing {key} / {public} from an earlier run");
+	} else {
+		generate(&key_path, &pub_path, &passphrase)?;
+	}
+	let mut job = Scope::standalone();
+	sign_served(manifest, &served, &key_path.to_string_lossy(), &passphrase, &mut job)?;
+	if !targets.devices.is_empty() {
+		let name = &manifest.general.name;
+		let pem = fs::read_to_string(&pub_path)
+			.with_context(|| format!("reading {}", pub_path.display()))?;
+		let trust = TrustFiles {
+			name: name.clone(),
+			repo: manifest.repo().context("a repo")?,
+			ns: reg.url.clone(),
+			keys: vec![TrustKey::new(name, pem)?],
+		}
+		.install_script(false);
+		on_channel_devices(
+			manifest,
+			&targets,
+			"enforce signatures",
+			&|ch, ssh, scope| {
+				let r = manifest.tag_ref(ch).context("a channel ref")?;
+				crate::jobs::upgrade::apply_channel(&r, Some(&trust), ssh, scope)
+			},
+			&mut job,
+		)?;
+	}
+	// Last, so a failure above leaves the project unsigned and the run re-runnable.
+	patch_registry_key(&root.join(&manifest.manifest_path), &key)?;
+	write_enforce_sigpolicy(root)?;
+	eprintln!(
+		"signing: wrote {key} (private — keep it secret; the scaffold .gitignore covers *.key), \
+		 {public}, set `[registry] key`, and wrote {ENFORCE_SIGPOLICY_PATH}."
+	);
+	Ok(Enrolled { key, public })
+}
+
+/// What the signing fleet commands act on: the served refs and the channel devices.
+fn fleet_state(manifest: &Manifest, remotes: &[String]) -> Result<(Vec<Served>, ChannelDevices)> {
+	let mut checks = Checks::default();
+	checks.bin("skopeo", crate::oci::SKOPEO_HINT);
+	if !manifest.remotes().is_empty() {
+		checks.bin("ssh", "reach the devices over SSH");
+	}
+	checks.finish()?;
+	let served = served(manifest)?;
+	let targets = crate::jobs::device::channel_devices(manifest, manifest.channels(), remotes)?;
+	Ok((served, targets))
+}
+
+/// `bootcher signing rotate [prefix]`: (1) generate a new keypair, (2) add a
+/// new-key signature to every release a channel serves, (3) install old + new keys
+/// on the channel devices, (4) point `[registry] key` at the new key — last, so a
+/// failure part-way leaves the config on the old key. No rebuild, no channel move,
+/// and no window in which any device, listed or not, rejects what its channel
+/// serves.
+///
+/// # Errors
+///
+/// Returns an error if no key is configured, the user declines, or a step fails.
+pub fn rotate(
+	manifest: &Manifest,
+	prefix: Option<&str>,
+	remotes: &[String],
+	yes: bool,
+) -> Result<Enrolled> {
+	let reg = manifest.require_registry("`signing rotate`")?;
+	let current = manifest
+		.signing()
+		.context("no signing key is configured — use `bootcher signing enroll`")?;
+	let root = manifest.root();
+	let name = &manifest.general.name;
+	let old = TrustKey::read(name, &root.join(current.public_key_path()).to_string_lossy())?;
+	let (served, targets) = fleet_state(manifest, remotes)?;
+	confirm_fleet(
+		"`signing rotate` signs served releases and updates devices",
+		&served,
+		&targets,
+		yes,
+		vec!["signing rotate will add a new key and:".to_owned()],
+	)?;
+
+	// 1. The new keypair, named `<prefix>` or `cosign-<fp8>` — or, when `<prefix>` names
+	//    a keypair an earlier, failed rotate wrote (not yet the configured key), that
+	//    one, so a re-run resumes instead of adding yet another key.
+	let resume = prefix.filter(|p| root.join(format!("{p}.key")).exists());
+	if let Some(p) = resume
+		&& format!("{p}.key") == current.key
+	{
+		bail!("{p}.key is already the configured key — pick another prefix");
+	}
+	let passphrase = collect_passphrase(resume.is_none())?;
+	let (key, public, pem) = if let Some(p) = resume {
+		let (key, public) = (format!("{p}.key"), format!("{p}.pub"));
+		check_passphrase(&root.join(&key), &passphrase)?;
+		let pem = fs::read_to_string(root.join(&public))
+			.with_context(|| format!("reading {public} (the public half of {key})"))?;
+		eprintln!("signing: resuming with {key} / {public} from an earlier run");
+		(key, public, pem)
+	} else {
+		let tmp = format!(".bootcher-new-{}", std::process::id());
+		generate(&root.join(format!("{tmp}.key")), &root.join(format!("{tmp}.pub")), &passphrase)?;
+		let pem = fs::read_to_string(root.join(format!("{tmp}.pub")))?;
+		let prefix = prefix.map_or_else(
+			|| format!("cosign-{}", &fingerprint(&pem).unwrap_or_default()[..8]),
+			str::to_owned,
+		);
+		let (key, public) = (format!("{prefix}.key"), format!("{prefix}.pub"));
+		if root.join(&key).exists() {
+			let _ = fs::remove_file(root.join(format!("{tmp}.key")));
+			let _ = fs::remove_file(root.join(format!("{tmp}.pub")));
+			bail!("{key} already exists — pick another prefix");
+		}
+		fs::rename(root.join(format!("{tmp}.key")), root.join(&key))?;
+		fs::rename(root.join(format!("{tmp}.pub")), root.join(&public))?;
+		eprintln!("signing: wrote the new keypair {key} / {public}");
+		(key, public, pem)
+	};
+	let stem = key.trim_end_matches(".key").to_owned();
+	let resume_hint = || {
+		format!(
+			"`[registry] key` still points at the old key; re-run `bootcher signing rotate {stem}` \
+			 to resume with {key}"
+		)
+	};
+
+	// 2. A new-key signature on every served release.
+	let mut job = Scope::standalone();
+	sign_served(manifest, &served, &root.join(&key).to_string_lossy(), &passphrase, &mut job)
+		.with_context(resume_hint)?;
+
+	// 3. Trust old + new on the channel devices (no reboot: the origin already verifies).
+	let new = TrustKey::new(name, pem)?;
+	let trust = TrustFiles {
+		name: name.clone(),
+		repo: manifest.repo().context("a repo")?,
+		ns: reg.url.clone(),
+		keys: vec![old, new],
+	};
+	let script = trust.install_script(false);
+	on_channel_devices(
+		manifest,
+		&targets,
+		"trust the new signing key",
+		&|_, ssh, scope| ssh.run_sh(scope, "install trust files", &[], script.clone()),
+		&mut job,
+	)
+	.with_context(resume_hint)?;
+
+	// 4. Repoint the config last.
+	patch_registry_key(&root.join(&manifest.manifest_path), &key)?;
+	eprintln!(
+		"signing: `[registry] key` now points at {key}. Once every device — including any not \
+		 in `remotes` — trusts it, run `bootcher signing retire` to drop the old key."
+	);
+	Ok(Enrolled { key, public })
+}
+
+/// `bootcher signing retire`: trust only the current key on the channel devices and
+/// delete the other key files. Run it only once every device, including ones not in
+/// `remotes`, has the new key: a device that doesn't would reject every update.
+///
+/// # Errors
+///
+/// Returns an error if no key is configured, the user declines, or a device fails.
+pub fn retire(manifest: &Manifest, remotes: &[String], yes: bool) -> Result<()> {
+	manifest.require_registry("`signing retire`")?;
+	let trust = TrustFiles::for_manifest(manifest)?.context("no signing key is configured")?;
+	let mut checks = Checks::default();
+	checks.bin("skopeo", crate::oci::SKOPEO_HINT);
+	checks.bin("ssh", "reach the devices over SSH");
+	checks.finish()?;
+	check_served_signed(manifest)?;
+	let targets = crate::jobs::device::channel_devices(manifest, manifest.channels(), remotes)?;
+	let mut lines = vec!["signing retire will trust only the current key on:".to_owned()];
+	lines.extend(targets.devices.iter().map(|(ch, d)| format!("  {} (on :{ch})", d.name())));
+	lines.push(
+		"  (devices not in `remotes` that lack the current key would reject every update)"
+			.to_owned(),
+	);
+	if targets.devices.is_empty() && targets.unreachable.is_empty() {
+		eprintln!("no channel devices to retire keys on");
+		return Ok(());
+	}
+	crate::interactive::confirm(
+		yes,
+		"`signing retire` changes devices",
+		&lines,
+		"Proceed?",
+		false,
+	)?;
+	let script = trust.install_script(true);
+	on_channel_devices(
+		manifest,
+		&targets,
+		"retire old signing keys",
+		&|_, ssh, scope| ssh.run_sh(scope, "retire old keys", &[], script.clone()),
+		&mut Scope::standalone(),
+	)
+}
+
+/// `signing retire`'s guard: every ref a channel serves must verify under the current
+/// key, or pruning the other keys would leave devices unable to verify it.
+fn check_served_signed(manifest: &Manifest) -> Result<()> {
+	let signing = manifest.signing().context("no signing key is configured")?;
+	let repo = manifest.repo().context("a registry")?;
+	let pub_path = manifest.root().join(signing.public_key_path());
+	let pem = fs::read_to_string(&pub_path)
+		.with_context(|| format!("reading the signing public key {}", pub_path.display()))?;
+	let mut bad = Vec::new();
+	for s in served(manifest)? {
+		let r = format!("{repo}:{}", s.tag);
+		let Some(index) = oci::fetch(&r)? else { continue };
+		if !oci::unsigned_digests(&repo, &index, &pem)?.is_empty() {
+			bad.push(format!(":{} (served by {})", s.tag, s.channels.join(", ")));
+		}
+	}
+	if !bad.is_empty() {
+		bail!(
+			"not signed by the current key ({}): {} — finish `bootcher signing rotate` first (a \
+			 re-run signs what the channels serve), then retire",
+			signing.public_key_path(),
+			bad.join(", ")
+		);
 	}
 	Ok(())
 }
@@ -481,6 +882,48 @@ fn encrypt_sigstore_key(plaintext: &[u8], passphrase: &[u8]) -> Result<String> {
 	let json = serde_json::to_vec(&envelope).expect("the envelope is a fixed, serializable shape");
 	pem_rfc7468::encode_string(PEM_TYPE, LineEnding::LF, &json)
 		.map_err(|e| anyhow::anyhow!("PEM encoding the envelope: {e}"))
+}
+
+/// Check that `passphrase` opens the sigstore private key at `key_path` (a keypair an
+/// earlier, failed run left behind is reused only with its own passphrase).
+///
+/// # Errors
+///
+/// Returns an error if the key can't be read or parsed, or the passphrase is wrong.
+fn check_passphrase(key_path: &Path, passphrase: &str) -> Result<()> {
+	let b64 = base64::engine::general_purpose::STANDARD;
+	let shown = key_path.display();
+	let pem = fs::read_to_string(key_path).with_context(|| format!("reading {shown}"))?;
+	let (label, json) = pem_rfc7468::decode_vec(pem.as_bytes())
+		.map_err(|e| anyhow::anyhow!("{shown} isn't a PEM file: {e}"))?;
+	if label != PEM_TYPE {
+		bail!("{shown} isn't an {PEM_TYPE}");
+	}
+	let env: serde_json::Value =
+		serde_json::from_slice(&json).with_context(|| format!("parsing {shown}"))?;
+	let field = |v: &serde_json::Value| -> Result<Vec<u8>> {
+		let s = v.as_str().with_context(|| format!("malformed {shown}"))?;
+		b64.decode(s).with_context(|| format!("malformed {shown}"))
+	};
+	let params = &env["kdf"]["params"];
+	let num = |k: &str| params[k].as_u64().with_context(|| format!("malformed {shown}"));
+	let log_n = u8::try_from(num("N")?.trailing_zeros()).unwrap_or(u8::MAX);
+	let scrypt_params = scrypt::Params::new(
+		log_n,
+		u32::try_from(num("r")?).unwrap_or(u32::MAX),
+		u32::try_from(num("p")?).unwrap_or(u32::MAX),
+		32,
+	)
+	.map_err(|e| anyhow::anyhow!("invalid scrypt parameters in {shown}: {e}"))?;
+	let mut key = [0u8; 32];
+	scrypt::scrypt(passphrase.as_bytes(), &field(&env["kdf"]["salt"])?, &scrypt_params, &mut key)
+		.map_err(|e| anyhow::anyhow!("deriving the key: {e}"))?;
+	let nonce = field(&env["cipher"]["nonce"])?;
+	let nonce: [u8; 24] = nonce.try_into().map_err(|_| anyhow::anyhow!("malformed {shown}"))?;
+	XSalsa20Poly1305::new((&key).into())
+		.decrypt((&nonce).into(), field(&env["ciphertext"])?.as_slice())
+		.map_err(|_| anyhow::anyhow!("the signing passphrase doesn't open {shown}"))?;
+	Ok(())
 }
 
 // --------------------------------------------------------------- file modes
@@ -560,12 +1003,35 @@ mod tests {
 				assert!(std::time::Instant::now() < deadline, "registry did not start within 10s");
 				std::thread::sleep(std::time::Duration::from_millis(100));
 			}
+			// Declare the plain-HTTP loopback registry insecure the one way both podman
+			// and skopeo honour: a user `registries.conf.d` drop-in (removed on drop).
+			if let Some(conf) = insecure_dropin(host_port) {
+				let _ = std::fs::create_dir_all(conf.parent().unwrap());
+				let _ = std::fs::write(
+					&conf,
+					format!(
+						"[[registry]]\nlocation = \"localhost:{host_port}\"\ninsecure = true\n"
+					),
+				);
+			}
 			Self { name, host_port }
 		}
 	}
 
+	/// The per-user `registries.conf.d` drop-in marking `localhost:<port>` insecure.
+	fn insecure_dropin(port: u16) -> Option<std::path::PathBuf> {
+		let home = std::env::var_os("HOME")?;
+		Some(
+			Path::new(&home)
+				.join(format!(".config/containers/registries.conf.d/bootcher-test-{port}.conf")),
+		)
+	}
+
 	impl Drop for TestRegistry {
 		fn drop(&mut self) {
+			if let Some(conf) = insecure_dropin(self.host_port) {
+				let _ = std::fs::remove_file(conf);
+			}
 			// Reap the container and its anonymous blob volume.
 			crate::podman::reap_container(self.name);
 			// These tests tag/build/pull images under `localhost:<port>/…` into the
@@ -655,6 +1121,18 @@ mod tests {
 		assert!(v["ciphertext"].as_str().is_some());
 	}
 
+	/// A keypair left by a failed enroll/rotate is reused only with its passphrase.
+	#[test]
+	fn check_passphrase_opens_only_with_the_right_passphrase() {
+		let dir = tempfile::tempdir().unwrap();
+		let (key, public) = (dir.path().join("k.key"), dir.path().join("k.pub"));
+		generate(&key, &public, "right").unwrap();
+		check_passphrase(&key, "right").unwrap();
+		let err = check_passphrase(&key, "wrong").unwrap_err();
+		assert!(err.to_string().contains("doesn't open"), "{err:#}");
+		assert!(check_passphrase(&public, "right").is_err(), "a public key isn't a private key");
+	}
+
 	/// The real proof the enroll format is right: a key produced by [`enroll`] must
 	/// be accepted by `podman --sign-by-sigstore-private-key`, and the resulting
 	/// signature must verify under a policy that pins our public key. Needs podman
@@ -682,8 +1160,7 @@ mod tests {
 		duct::cmd!("podman", "tag", "docker.io/library/busybox:latest", reg_ref).run().unwrap();
 
 		// Sign-push using our generated key via the same flags the deploy path uses.
-		let cfg = SigningConfig { key: key.to_str().unwrap().into() };
-		let args = sign_args(&cfg).unwrap();
+		let args = sign_args_with(key.to_str().unwrap(), "test-pass").unwrap();
 		let mut cmd_args: Vec<std::ffi::OsString> =
 			vec!["push".into(), "--tls-verify=false".into()];
 		cmd_args.extend_from_slice(args.flags());
@@ -754,8 +1231,7 @@ mod tests {
 		ensure_push_attachments(NS, &scope).unwrap();
 
 		// Signed push.
-		let cfg = SigningConfig { key: key.to_str().unwrap().into() };
-		let args = sign_args(&cfg).unwrap();
+		let args = sign_args_with(key.to_str().unwrap(), "verify-pass").unwrap();
 		let mut cmd_args: Vec<std::ffi::OsString> =
 			vec!["push".into(), "--tls-verify=false".into()];
 		cmd_args.extend_from_slice(args.flags());
@@ -767,8 +1243,8 @@ mod tests {
 			.run()
 			.expect("unsigned push failed");
 
-		let signed = verify(SIGNED, &pubk, false, &scope);
-		let unsigned = verify(UNSIGNED, &pubk, false, &scope);
+		let signed = verify(SIGNED, &pubk, &scope);
+		let unsigned = verify(UNSIGNED, &pubk, &scope);
 
 		assert!(signed.is_ok(), "verify rejected a validly signed image: {signed:?}");
 		assert!(unsigned.is_err(), "verify accepted an unsigned image");

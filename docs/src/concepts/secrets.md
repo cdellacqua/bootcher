@@ -1,39 +1,62 @@
 # Secrets
 
-bootcher manages two per-deployment secrets. Neither is stored in the manifest, in the container image, or anywhere on the builder's filesystem beyond the provisioning session.
+bootcher manages two per-device secrets. Neither is stored in the manifest, in the
+container image, or anywhere on the builder's filesystem beyond the provisioning session.
 
 ## The two secrets
 
-**Admin SSH authorized key** *(registry and LAN mode)*
+**Admin SSH authorized key** *(every device)*
 
-The public key placed in `/etc/ssh/authorized_keys.d/admin` on the device. This is the key you use to SSH in and run `bootcher deploy` / `bootcher rotate` commands against the device.
+The public key placed in `/etc/ssh/authorized_keys.d/admin` on the device. It's the key
+bootcher (and you) log in with for every device step: `device deploy`, `device status`,
+the channel device step, `device rotate`.
 
-**Registry pull token** *(registry mode only)*
+**Registry pull token** *(channel devices of a private registry)*
 
-Stored in `/etc/ostree/auth.json` on the device. Used by `bootc upgrade` to pull the project image from the registry. It should be a least-privilege, read-only credential, separate from the push auth managed on the builder.
+Stored in `/etc/ostree/auth.json` on the device. Used by `bootc upgrade` to pull the
+channel from the registry. It should be a least-privilege, read-only credential, separate
+from the push auth on your workstation or CI. Direct devices carry none.
 
-This token is the one secret that necessarily lives on every device you ship, which makes physical access to any one of them equivalent to holding it: the file is `0600`, but root on the device — or the disk in someone else's hands — reads it. Scope it read-only so that what leaks is the ability to *pull* your image and nothing more, and treat a device that leaves your control as a token to replace with [`bootcher rotate pull-token`](../workflows/rotate/pull-token.md).
+This token is the one secret that necessarily lives on every channel device you ship,
+which makes physical access to any one of them equivalent to holding it: the file is
+`0600`, but root on the device — or the disk in someone else's hands — reads it. Scope it
+read-only so that what leaks is the ability to *pull* your image and nothing more, and
+treat a device that leaves your control as a token to replace with
+[`bootcher device rotate pull-token`](../workflows/rotate/pull-token.md).
 
 ## When and how they are collected
 
-Both secrets are collected by `bootcher provision` (and `bootcher takeover`) before anything is built. Collection order:
+`bootcher device provision` and `bootcher device takeover` collect them before anything is
+built:
 
-1. **Admin SSH key** — prompted on a TTY from available `~/.ssh/` keys, or supplied via `--key <path>` (private key; the `<path>.pub` sibling is read). In non-interactive mode, the sole available key is picked automatically; multiple candidates without `--key` is an error.
+1. **Admin SSH key** — `--ssh-key <path>` (a private key; the `<path>.pub` sibling is
+   read), or picked from `~/.ssh/` on a TTY.
+2. **Registry pull token** *(`--channel` only)* — read from `BOOTCHER_PULL_USER` /
+   `BOOTCHER_PULL_TOKEN` if set, else prompted on a TTY, and checked against the registry
+   from this machine unless `--skip-pull-check`. For a **public** registry pass
+   `--anonymous` (or leave the username blank at the prompt): no `auth.json` is baked and
+   the device pulls anonymously.
 
-2. **Registry pull token** *(if registry is configured)* — read from `BOOTCHER_PULL_USER` / `BOOTCHER_PULL_TOKEN` if set, else prompted on a TTY for username + token. bootcher pre-validates the token against the registry before building, unless `--skip-pull-check` is passed. If the registry is public, leave the username blank at the prompt (or pass `--anonymous` non-interactively) to provision without a pull token at all — no `auth.json` is baked and the device pulls anonymously.
+`device switch --channel` collects one pull token for the run when the devices it moves
+have none, and installs it on each after the device proves it works.
 
 ## How they reach the device
 
-The collected secrets are passed to image-builder in a blueprint as `customizations.files` entries, which inject them directly into the device image's persistent `/etc` at disk-build time.
+For a disk, the collected files go to image-builder as blueprint `customizations.files`,
+written straight into the disk's persistent `/etc`; a takeover writes the same files into
+the staged deployment's `/etc` over SSH:
 
 ```
-/etc/ssh/authorized_keys.d/admin   ← admin public key (mode 0644)
-/etc/ostree/auth.json              ← pull token JSON (mode 0600, registry mode only)
-/etc/containers/policy.json        ← signing policy (mode 0644, signing mode only)
+/etc/ssh/authorized_keys.d/admin              ← admin public key (0644)
+/etc/ostree/auth.json                          ← pull token (0600, channel installs)
+/etc/pki/containers/<name>-<fp8>.pub           ← signing public key (channel installs, signing on)
+/etc/containers/policy.json                    ← signature policy (channel installs, signing on)
+/etc/containers/registries.d/bootcher-signing.yaml
 ```
 
 The ostree `/etc` 3-way merge preserves these files across `bootc upgrade` cycles.
 
 ## Rotating secrets after provisioning
 
-Secrets can be changed on running devices without reprovisioning. See [Credential rotation](../workflows/rotate/index.md).
+Secrets can be changed on running devices without reprovisioning. See
+[Credential rotation](../workflows/rotate/index.md).
