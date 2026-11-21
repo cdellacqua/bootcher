@@ -1,9 +1,11 @@
 pub mod build;
+pub mod device;
 pub(crate) mod disk;
 pub mod info;
 pub mod init;
-pub mod rotate;
+pub mod release;
+pub(crate) mod rotate;
 pub mod secrets;
 pub mod signing;
-pub mod takeover;
+pub(crate) mod takeover;
 pub(crate) mod upgrade;

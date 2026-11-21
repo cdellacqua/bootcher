@@ -45,6 +45,14 @@ pub(crate) struct Outcome {
 	pub error: Option<String>,
 }
 
+impl Outcome {
+	/// A failed outcome for `host` (e.g. an unreachable device that was never
+	/// attempted).
+	pub(crate) fn failed(host: impl Into<String>, error: impl Into<String>) -> Self {
+		Self { host: host.into(), ok: false, error: Some(error.into()) }
+	}
+}
+
 /// Every item's [`Outcome`] from one fan-out, in input order, plus what's needed
 /// to phrase the summary. Turned into the fan-out's verdict by [`Self::finish`].
 #[derive(Debug)]
@@ -59,6 +67,14 @@ impl Report {
 	/// registry push with no remotes to switch).
 	pub(crate) fn empty(task: &str, unit: &str) -> Self {
 		Self { task: task.to_owned(), unit: unit.to_owned(), outcomes: Vec::new() }
+	}
+
+	/// This report plus `extra` outcomes appended — e.g. the devices a step
+	/// couldn't reach at all, so the run still lists them and fails afterwards.
+	#[must_use]
+	pub(crate) fn with(mut self, extra: Vec<Outcome>) -> Self {
+		self.outcomes.extend(extra);
+		self
 	}
 
 	/// The per-item outcomes, in input order.

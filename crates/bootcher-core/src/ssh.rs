@@ -112,6 +112,12 @@ impl Ssh {
 		self.expr(&[], "sh").stdin_bytes(script.to_owned())
 	}
 
+	/// [`Self::sh_expr`] with extra ssh options `pre` (e.g. a short `ConnectTimeout`
+	/// for a probe that should fail fast).
+	pub(crate) fn sh_expr_with(&self, pre: &[&str], script: &str) -> duct::Expression {
+		self.expr(pre, "sh").stdin_bytes(script.to_owned())
+	}
+
 	/// Run `script` on the device under `sh` — the script rides stdin, so the login
 	/// shell (fish, per the scaffold) never parses it — under a `label`led spinner.
 	/// `pre` carries call-specific ssh flags (usually none; `-R <forward>` for the

@@ -49,7 +49,8 @@ fn serves_a_local_image_that_podman_can_pull() {
 		arch,
 		rootfs: Rootfs::Ext4,
 		build_ctx: ctx.path().to_path_buf(),
-		registry: None,
+		tag_prefix: "latest".into(),
+		no_cache: false,
 		provenance_args: Vec::new(),
 	};
 	let tag = image.tag();

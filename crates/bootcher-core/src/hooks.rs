@@ -1,7 +1,7 @@
 //! Lifecycle hooks: user-supplied shell commands run before and after bootcher's
-//! phases (the container build, the image step, the deploy upgrade, the in-place
-//! takeover, and the credential rotation),
-//! configured in the manifest's `[hooks.<phase>]` tables (see
+//! phases (the container build, the disk-image step, publishing a release, moving
+//! a channel, the device rollout, the in-place takeover, and the credential
+//! rotation), configured in the manifest's `[hooks.<phase>]` tables (see
 //! [`crate::context::Hooks`]).
 //!
 //! Hooks are bootcher's extension point: anything project-specific that bootcher
@@ -10,8 +10,9 @@
 //! the main build, …) lives in a script the manifest points at, instead of in
 //! this binary.
 //!
-//! A hook is a command string run with `sh -c` from the project root (bootcher's
-//! working directory, where `bootcher.toml` and the build context live), with the
+//! A hook is a command string run with `sh -c` from the project root (where
+//! `bootcher.toml` and the build context live — for a refresh build, the temporary
+//! worktree of the release's commit, whose own hooks run), with the
 //! progress UI suspended and stdio inherited — so the hook owns the terminal for
 //! its duration and may print freely, prompt, or `sudo`. A non-zero exit aborts
 //! the surrounding step.
@@ -41,15 +42,16 @@
 //!   | while read -r img; do embed_pi_firmware "$img"; done
 //! ```
 
-use crate::context::{Arch, DiskType};
+use crate::context::{Arch, DiskType, Manifest};
 use crate::fleet::{Outcome, Report};
 use crate::progress::Scope;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Which lifecycle phase a hook brackets. Serializes lowercase (`build` / `disk`
-/// / `upgrade` / `takeover` / `rotate`) into [`HookMetadata::phase`].
+/// / `publish` / `promote` / `upgrade` / `takeover` / `rotate`) into
+/// [`HookMetadata::phase`].
 #[derive(Clone, Copy, Debug, Serialize, strum::Display, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
@@ -71,18 +73,16 @@ pub(crate) enum Stage {
 	Post,
 }
 
-/// Which device credential a `rotate` run replaces — one per `bootcher rotate`
-/// subcommand, serialized as its name into [`HookMetadata::credential`] so a
+/// Which device credential a `rotate` run replaces — one per `bootcher device
+/// rotate` subcommand plus the `signing` device steps, serialized as its name into [`HookMetadata::credential`] so a
 /// shared `[hooks.rotate]` script can branch on it.
 #[derive(Clone, Copy, Debug, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum Credential {
-	/// The registry pull token (`rotate pull-token`).
+	/// The registry pull token (`device rotate pull-token`).
 	PullToken,
-	/// The admin SSH authorized key (`rotate ssh-key`).
+	/// The admin SSH authorized key (`device rotate ssh-key`).
 	SshKey,
-	/// The image-signing public key + policy (`rotate sign-key`).
-	SignKey,
 }
 
 /// One disk artifact in the `disk` phase's [`HookMetadata::targets`] matrix: the
@@ -118,16 +118,19 @@ pub(crate) struct HookMetadata {
 	pub image_name: String,
 	/// The target arches being built/deployed (`[targets]` keys).
 	pub arches: Vec<Arch>,
-	/// The suffix-free image ref this phase concerns: the local manifest-list ref
-	/// at `build`, the bootc-origin source ref at `disk`, the pushed/served list ref
-	/// at `upgrade` and `takeover`, the devices' bootc-origin ref at `rotate`.
-	/// Deterministic from the manifest, so it's valid even at `pre`.
+	/// The image ref this phase concerns: the local manifest-list ref at `build`,
+	/// the bootc-origin source ref at `disk`, the pushed release ref at `publish`, the
+	/// channel ref at `promote`, the served list or channel ref at `upgrade` and
+	/// `takeover`, the registry namespace (or local list) at `rotate`. For commands
+	/// that build nothing it's the channel ref. Deterministic, so it's valid even at
+	/// `pre`.
 	pub image_ref: String,
 	/// The git commit the image was built from (`org.opencontainers.image.revision`),
 	/// `-dirty`-suffixed for an uncommitted tree. Mirrors the OCI label stamped on the
 	/// container, so a hook and the device's `bootc status` agree. Omitted when the
-	/// project isn't a git work tree (see [`crate::context::GitProvenance`]), and at
-	/// `rotate`, which builds nothing.
+	/// project isn't a git work tree (see [`crate::context::GitProvenance`]). For
+	/// commands that build nothing it's the release's recorded source commit
+	/// (`bootcher.source`), when known.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub revision: Option<String>,
 	/// A human description of the build (`org.opencontainers.image.version` —
@@ -135,6 +138,17 @@ pub(crate) struct HookMetadata {
 	/// outside a git work tree and at `rotate`. See [`crate::context::GitProvenance`].
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub version: Option<String>,
+	/// The release (`:X`) this phase publishes or promotes — `publish`, `promote`, and
+	/// the device rollout a promote triggers.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub release: Option<String>,
+	/// The channel being moved or rolled out — `promote` and a channel rollout.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub channel: Option<String>,
+	/// The release the channel served before a `promote` (the rollback target), when
+	/// it had one.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub previous_release: Option<String>,
 	/// The base output dir (relative to the project root) — `disk` phase only.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub output_dir: Option<PathBuf>,
@@ -156,9 +170,37 @@ pub(crate) struct HookMetadata {
 	/// registry-mode `upgrade` with no remotes, which only pushes).
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub results: Option<Vec<Outcome>>,
+	/// The directory the hook runs in (the project root). Not part of the payload.
+	#[serde(skip)]
+	#[schemars(skip)]
+	pub cwd: PathBuf,
 }
 
 impl HookMetadata {
+	/// Metadata for `phase` of `manifest`'s project concerning `image_ref`, with the
+	/// project's arches and root filled in and every phase-specific field empty, for
+	/// the caller to fill.
+	pub(crate) fn new(manifest: &Manifest, phase: Phase, image_ref: impl Into<String>) -> Self {
+		Self {
+			phase,
+			stage: Stage::Pre,
+			image_name: manifest.general.name.clone(),
+			arches: manifest.targets.arches(),
+			image_ref: image_ref.into(),
+			revision: None,
+			version: None,
+			release: None,
+			channel: None,
+			previous_release: None,
+			output_dir: None,
+			targets: None,
+			remotes: None,
+			credential: None,
+			results: None,
+			cwd: manifest.root().to_path_buf(),
+		}
+	}
+
 	/// `phase.stage`, e.g. `disk.post` — the label printed and used in errors.
 	fn label(&self) -> String {
 		format!("{}.{}", self.phase, self.stage)
@@ -204,6 +246,7 @@ pub(crate) fn run(meta: &HookMetadata, command: Option<&str>, job: &Scope) -> Re
 	let metadata = serde_json::to_string(meta).context("serializing hook metadata")?;
 	let out = job.suspend(|| {
 		duct::cmd!("sh", "-c", command)
+			.dir(cwd(&meta.cwd))
 			.env("BOOTCHER_METADATA", metadata)
 			.unchecked()
 			.run()
@@ -213,6 +256,11 @@ pub(crate) fn run(meta: &HookMetadata, command: Option<&str>, job: &Scope) -> Re
 		bail!("{label} hook failed ({}): {command}", out.status);
 	}
 	Ok(())
+}
+
+/// The hook's working directory: `.` when unset.
+fn cwd(dir: &Path) -> &Path {
+	if dir.as_os_str().is_empty() { Path::new(".") } else { dir }
 }
 
 /// Close a device-fleet phase: flip `meta` to `post`, attach `report`'s
@@ -259,6 +307,9 @@ mod tests {
 			image_ref: "registry.example.com/org/kiosk:latest".into(),
 			revision: None,
 			version: None,
+			release: None,
+			channel: None,
+			previous_release: None,
 			output_dir: Some(PathBuf::from("output")),
 			targets: Some(vec![
 				DiskTargetMeta {
@@ -277,6 +328,7 @@ mod tests {
 			remotes: None,
 			credential: None,
 			results: None,
+			cwd: PathBuf::new(),
 		};
 		assert_eq!(
 			json_of(&meta),
@@ -306,11 +358,15 @@ mod tests {
 			image_ref: "localhost/kiosk:latest".into(),
 			revision: None,
 			version: None,
+			release: None,
+			channel: None,
+			previous_release: None,
 			output_dir: None,
 			targets: None,
 			remotes: None,
 			credential: None,
 			results: None,
+			cwd: PathBuf::new(),
 		};
 		let v = json_of(&meta);
 		assert_eq!(v["phase"], "build");
@@ -335,11 +391,15 @@ mod tests {
 			image_ref: "localhost/kiosk:latest".into(),
 			revision: Some("abc123-dirty".into()),
 			version: Some("v1.2.3-4-gabc123-dirty".into()),
+			release: None,
+			channel: None,
+			previous_release: None,
 			output_dir: None,
 			targets: None,
 			remotes: None,
 			credential: None,
 			results: None,
+			cwd: PathBuf::new(),
 		};
 		let v = json_of(&meta);
 		assert_eq!(v["revision"], "abc123-dirty");
@@ -356,11 +416,15 @@ mod tests {
 			image_ref: "registry.example.com/org/kiosk:latest".into(),
 			revision: None,
 			version: None,
+			release: None,
+			channel: None,
+			previous_release: None,
 			output_dir: None,
 			targets: None,
 			remotes: Some(vec!["root@10.0.0.2".into()]),
 			credential: None,
 			results: None,
+			cwd: PathBuf::new(),
 		};
 		let v = json_of(&meta);
 		assert_eq!(v["remotes"], json!(["root@10.0.0.2"]));
@@ -377,11 +441,15 @@ mod tests {
 			image_ref: "localhost/kiosk:latest".into(),
 			revision: None,
 			version: None,
+			release: None,
+			channel: None,
+			previous_release: None,
 			output_dir: None,
 			targets: None,
 			remotes: Some(vec!["admin@vps.example.com".into()]),
 			credential: None,
 			results: None,
+			cwd: PathBuf::new(),
 		};
 		let v = json_of(&meta);
 		assert_eq!(v["phase"], "takeover");
@@ -399,11 +467,15 @@ mod tests {
 			image_ref: "registry.example.com/org/kiosk:latest".into(),
 			revision: None,
 			version: None,
+			release: None,
+			channel: None,
+			previous_release: None,
 			output_dir: None,
 			targets: None,
 			remotes: Some(vec!["admin@10.0.0.2".into()]),
 			credential: Some(Credential::PullToken),
 			results: None,
+			cwd: PathBuf::new(),
 		};
 		let v = json_of(&meta);
 		assert_eq!(v["phase"], "rotate");
@@ -422,6 +494,9 @@ mod tests {
 			image_ref: "registry.example.com/org/kiosk:latest".into(),
 			revision: None,
 			version: None,
+			release: None,
+			channel: None,
+			previous_release: None,
 			output_dir: None,
 			targets: None,
 			remotes: Some(vec!["admin@a".into(), "admin@b".into()]),
@@ -430,6 +505,7 @@ mod tests {
 				Outcome { host: "admin@a".into(), ok: true, error: None },
 				Outcome { host: "admin@b".into(), ok: false, error: Some("ssh: timed out".into()) },
 			]),
+			cwd: PathBuf::new(),
 		};
 		assert_eq!(
 			json_of(&meta)["results"],

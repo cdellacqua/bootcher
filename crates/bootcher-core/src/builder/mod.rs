@@ -37,6 +37,7 @@ pub(crate) use local::LocalBuilder;
 pub(crate) use remote::RemoteBuilder;
 
 use crate::context::{Arch, BuilderSpec, DiskTarget, ImageRef};
+use crate::interactive::Prompted;
 use crate::progress::Scope;
 use crate::ssh::Ssh;
 use anyhow::Result;
@@ -277,13 +278,15 @@ pub(crate) fn prompt_spec(question: &str, role: BuilderRole, cross_arch: bool) -
 	let chosen = inquire::Select::new(question, choices)
 		.with_starting_cursor(start)
 		.with_help_message(help)
-		.prompt()?;
+		.prompt()
+		.prompted()?;
 	Ok(match chosen {
 		BuilderChoice::Local => "local".to_owned(),
 		BuilderChoice::Vm => "vm".to_owned(),
 		BuilderChoice::Remote => {
 			inquire::Text::new("Remote SSH destination ([user@]host or ssh://[user@]host[:port]):")
-				.prompt()?
+				.prompt()
+				.prompted()?
 		}
 	})
 }

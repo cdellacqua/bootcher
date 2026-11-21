@@ -81,12 +81,15 @@ impl Builder for RemoteBuilder {
 		//    is a no-op rather than emulation — the whole point of relocating).
 		//    `FROM localhost/base:…` resolves because the caller built base first.
 		let build = format!(
-			"sudo podman build{opts}{provenance} --os linux --arch {arch} -t {tag} -f {ctx_dir}/Containerfile {ctx_dir}",
+			"sudo podman build{opts} --pull=newer{no_cache}{provenance} --os linux --arch {arch} -t {tag} -f {ctx_dir}/Containerfile {ctx_dir}",
 			opts = crate::podman::opts_shell(&self.podman_opts),
 			// Provenance `--label`s + `--annotation`s, sh-quoted like `podman_opts` so the
 			// same tokens the in-process build splices as argv land here identically.
 			provenance = crate::podman::opts_shell(&image.provenance_args),
 			arch = image.arch.oci_arch(),
+			// A user-facing build never reuses a cached base (`--pull=newer`); a forced
+			// refresh drops the layer cache too.
+			no_cache = if image.no_cache { " --no-cache" } else { "" },
 		);
 		let argv = self.ssh.argv(&[], &build);
 		exec::run_argv_labeled(job, &argv, "podman build")?;
@@ -274,12 +277,14 @@ impl RemoteBuilder {
 	}
 
 	/// Stream the built container out of the remote's root storage into local
-	/// rootless storage: `ssh remote sudo podman save <tag>` piped through this
-	/// process (bytes bar) into a local `podman load`.
+	/// rootless storage: `ssh remote sudo podman save --format oci-archive <tag>` piped
+	/// through this process (bytes bar) into a local `podman load`. `oci-archive`
+	/// rather than the default `docker-archive`, which drops the manifest
+	/// annotations (the `base.digest` the staleness checks read).
 	fn load_home(&self, image: &ImageRef, job: &Scope) -> Result<()> {
 		let tag = image.tag();
 
-		let send = self.ssh.argv(&[], &format!("sudo podman save {tag}"));
+		let send = self.ssh.argv(&[], &format!("sudo podman save --format oci-archive {tag}"));
 		let (program, rest) = send.split_first().expect("non-empty argv");
 		let reader = Arc::new(duct::cmd(program, rest).stderr_null().reader()?);
 		let _kill = signals::kill_on_signal({
