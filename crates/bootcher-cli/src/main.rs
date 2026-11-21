@@ -609,36 +609,72 @@ fn run_device(cmd: DeviceCmd, manifest: &Manifest) -> Result<()> {
 }
 
 fn run_release(cmd: ReleaseCmd, manifest: &Manifest) -> Result<()> {
-	let _ = (cmd, manifest);
-	anyhow::bail!("the `release` commands are not implemented yet")
+	use jobs::release;
+	match cmd {
+		ReleaseCmd::Publish { name, skip_build, rebuild, git_tag, promote, remotes } => {
+			release::publish(
+				manifest,
+				&release::PublishArgs {
+					name,
+					skip_build,
+					rebuild,
+					git_tag: git_tag.map(|g| match g {
+						GitTag::Push => release::GitTag::Push,
+						GitTag::Local => release::GitTag::Local,
+						GitTag::No => release::GitTag::No,
+					}),
+					promote,
+					remotes: remotes.remote,
+					skip_remotes: remotes.skip_remotes,
+					yes: remotes.yes,
+				},
+			)
+		}
+		ReleaseCmd::Refresh { name, force, skip_build } => {
+			release::refresh(manifest, &name, force, skip_build)
+		}
+		ReleaseCmd::List { format } => {
+			let _ = format;
+			anyhow::bail!("`release list` is not implemented yet")
+		}
+	}
 }
 
 fn run_channel(cmd: ChannelCmd, manifest: &Manifest) -> Result<()> {
-	let _ = (cmd, manifest);
-	anyhow::bail!("the `channel` commands are not implemented yet")
+	use jobs::channel;
+	match cmd {
+		ChannelCmd::Promote { release, channel, allow_stale_base, remotes, skip_remotes, yes } => {
+			channel::promote(
+				manifest,
+				&channel::PromoteArgs {
+					release,
+					channel,
+					allow_stale_base,
+					remotes: remotes.remote,
+					skip_remotes: skip_remotes.skip_remotes,
+					yes: yes.yes,
+				},
+			)
+		}
+		ChannelCmd::Status { .. } | ChannelCmd::Refresh { .. } => {
+			anyhow::bail!("`channel status` and `channel refresh` are not implemented yet")
+		}
+	}
 }
 
 fn run_signing(cmd: SigningCmd, manifest_path: &str) -> Result<()> {
 	match cmd {
 		SigningCmd::Enroll { prefix, remotes, yes } => {
-			let _ = (remotes, yes);
 			let manifest = Manifest::load(manifest_path)?;
-			if manifest.signing().is_some() {
-				anyhow::bail!(
-					"a signing key is already configured (`[registry] key`) — use `bootcher signing rotate`"
-				);
-			}
-			let jobs::signing::Enrolled { key, public } =
-				jobs::signing::enable_signing(manifest.root(), &prefix)?;
-			eprintln!(
-				"signing: wrote {key} (private — keep it secret; the scaffold .gitignore covers \
-				 *.key), {public}, set `[registry] key`, and wrote {}.",
-				jobs::signing::ENFORCE_SIGPOLICY_PATH
-			);
-			Ok(())
+			jobs::signing::enroll_fleet(&manifest, &prefix, &remotes.remote, yes.yes).map(drop)
 		}
-		SigningCmd::Rotate { .. } | SigningCmd::Retire { .. } => {
-			anyhow::bail!("`signing rotate` and `signing retire` are not implemented yet")
+		SigningCmd::Rotate { prefix, remotes, yes } => {
+			let manifest = Manifest::load(manifest_path)?;
+			jobs::signing::rotate(&manifest, prefix.as_deref(), &remotes.remote, yes.yes).map(drop)
+		}
+		SigningCmd::Retire { remotes, yes } => {
+			let manifest = Manifest::load(manifest_path)?;
+			jobs::signing::retire(&manifest, &remotes.remote, yes.yes)
 		}
 		SigningCmd::Verify { image, pubkey } => {
 			jobs::signing::preflight_verify()?;

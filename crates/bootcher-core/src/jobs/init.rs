@@ -335,6 +335,7 @@ impl Target {
 			// instead (an empty table would read as "configured but blank").
 			hooks: Hooks::default(),
 			root: PathBuf::new(),
+			manifest_path: PathBuf::new(),
 		};
 		let rendered =
 			annotate_values(&toml::to_string(&manifest).context("serialising the manifest")?);

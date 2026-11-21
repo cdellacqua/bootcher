@@ -58,6 +58,8 @@ use std::path::{Path, PathBuf};
 pub(crate) enum Phase {
 	Build,
 	Disk,
+	Publish,
+	Promote,
 	Upgrade,
 	Takeover,
 	Rotate,
@@ -83,6 +85,8 @@ pub(crate) enum Credential {
 	PullToken,
 	/// The admin SSH authorized key (`device rotate ssh-key`).
 	SshKey,
+	/// The trusted image-signing public key(s) + policy (`signing enroll|rotate|retire`).
+	SignKey,
 }
 
 /// One disk artifact in the `disk` phase's [`HookMetadata::targets`] matrix: the
