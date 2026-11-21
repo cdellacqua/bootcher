@@ -1,0 +1,265 @@
+# bootcher CI — GitHub Actions REFRESH workflow: base-image patches for channels.
+#
+# Recipe docs: https://github.com/cdellacqua/bootcher/tree/main/recipes/ci
+# Copy to `.github/workflows/bootcher-refresh.yml`.
+#
+#   schedule, one per channel → `channel status <ch>`; if its base moved: rebuild the
+#     commit the channel serves (each arch, natively) on today's base → `channel refresh
+#     <ch> --skip-build` re-pushes the release and re-copies the channel
+#   manual, with a `release`  → rebuild that release's commit → `release refresh <release>
+#     --skip-build` (no channel moves: the rollback path is refresh, then promote)
+#
+# A refresh builds the release's own commit — never what the default branch has moved on
+# to — under that commit's own `bootcher.ci.toml` (the build jobs check it out; hence the
+# full clone). Publishing (registry, signing key) stays with the default branch's config,
+# where the refresh job runs. The channel's devices pick the patch up on their next
+# auto-update; `--skip-remotes` because CI can't reach them.
+#
+# Pause a channel's refresh by dropping its line from `schedule:` and SCHEDULES. Every
+# run (a manual one too) checks the two still match, and names the line to fix. A
+# release with no recorded source commit (published before this change) can't be
+# refreshed: publish a new release instead.
+
+name: bootcher refresh
+
+on:
+  # One staggered refresh per channel, mirrored in the `plan` job's SCHEDULES: the canary
+  # channel runs a new base for a few days before production does.
+  schedule:
+    - cron: "17 3 * * 6" # Saturday: next
+    - cron: "17 3 * * 2" # Tuesday: stable
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Release to rebuild on the current base (moves no channel)
+        required: true
+        type: string
+      force:
+        description: Rebuild every arch even if its base hasn't moved
+        type: boolean
+        default: false
+
+concurrency:
+  group: bootcher-registry
+  cancel-in-progress: false
+
+env:
+  KEEP_PREVIOUS: "5"
+  # A native runner per `[targets]` arch (see release.yml).
+  RUNNERS: '{"x86_64": "ubuntu-24.04", "aarch64": "ubuntu-24.04-arm"}'
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    container:
+      image: ghcr.io/cdellacqua/bootcher:latest
+    outputs:
+      channel: ${{ steps.plan.outputs.channel }}
+      release: ${{ steps.plan.outputs.release }}
+      commit: ${{ steps.plan.outputs.commit }}
+      build: ${{ steps.plan.outputs.build }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Decide what to rebuild
+        id: plan
+        run: |
+          set -euo pipefail
+          echo "$GITHUB_TOKEN" | skopeo login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          b() { bootcher --manifest bootcher.ci.toml "$@"; }
+          # Each `schedule:` cron (double-quoted, as below) and each SCHEDULES line must
+          # match, naming a declared channel. Checked on every run, manual ones too, so a
+          # mismatch shows up before the cron that hits it fires.
+          workflow="${GITHUB_WORKFLOW_REF#"$GITHUB_REPOSITORY/"}"; workflow="${workflow%%@*}"
+          channels="$(b info --format '{{ json .Channels }}' | jq -r '.[]')"
+          crons="$(grep -oE 'cron: *"[^"]+"' "$workflow" | cut -d'"' -f2)"
+          listed="$(while read -r ch cron; do echo "$cron"; done <<< "$SCHEDULES")"
+          bad=0
+          while read -r ch cron; do
+            [ -n "$ch" ] || continue
+            if ! grep -qxF -- "$ch" <<< "$channels"; then
+              echo "::error::SCHEDULES line '$ch $cron': '$ch' isn't in [registry] channels $(b info --format '{{ .Channels }}')"; bad=1
+            fi
+            if ! grep -qxF -- "$cron" <<< "$crons"; then
+              echo "::error::SCHEDULES line '$ch $cron': no such cron under schedule: — add it there, or drop the line"; bad=1
+            fi
+          done <<< "$SCHEDULES"
+          while read -r cron; do
+            if [ -n "$cron" ] && ! grep -qxF -- "$cron" <<< "$listed"; then
+              echo "::error::schedule: cron \"$cron\" has no SCHEDULES line — add \"<channel> $cron\" to SCHEDULES in $workflow"; bad=1
+            fi
+          done <<< "$crons"
+          test "$bad" = 0
+          # One build job per `[targets]` arch, on its native runner.
+          b info --format '{{ json .Arches }}' \
+            | jq -c --argjson r "$RUNNERS" \
+                '{include: map({arch: ., runner: ($r[.] // error("no runner for \(.) in RUNNERS"))})}' \
+            | sed 's/^/matrix=/' >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_EVENT_NAME" = schedule ]; then
+            channel=''
+            while read -r ch cron; do
+              if [ "$cron" = "$SCHEDULE" ]; then channel="$ch"; fi
+            done <<< "$SCHEDULES"
+            test -n "$channel" # the check above guarantees it
+            read -r stale lags commit <<< "$(b channel status "$channel" --format '{{ .Stale }} {{ .Lags }} {{ .Commit }}')"
+            echo "channel=$channel" >> "$GITHUB_OUTPUT"
+            echo ":$channel: stale=$stale lags=$lags commit=$commit"
+            if [ "$stale" = true ] && [ -n "$commit" ]; then
+              echo "build=true" >> "$GITHUB_OUTPUT"
+            elif [ "$lags" = true ]; then
+              echo "build=none" >> "$GITHUB_OUTPUT" # re-copy only
+            else
+              echo "build=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            commit="$(b release list --format '{{ .Release }} {{ .Commit }}' | awk -v r="$RELEASE" '$1 == r { print $2 }')"
+            test -n "$commit" || { echo "::error::$RELEASE isn't published, or records no source commit"; exit 1; }
+            echo "release=$RELEASE" >> "$GITHUB_OUTPUT"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "commit=${commit:-}" >> "$GITHUB_OUTPUT"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SCHEDULE: ${{ github.event.schedule }}
+          RELEASE: ${{ inputs.release }}
+          SCHEDULES: |
+            next 17 3 * * 6
+            stable 17 3 * * 2
+
+  # Is the pinned Fedora release still supported? Its tag stops moving at end of life,
+  # and from then on no channel is ever stale again. Fails once the pin is two releases
+  # behind, warns at one; gates nothing — the failure is the alert.
+  release-check:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check the pinned Fedora release
+        run: python3 ci/release_check.py
+        env:
+          WARNING_PREFIX: "::warning::"
+          BEHIND_EXIT_CODE: "0"
+
+  build:
+    needs: [plan]
+    if: needs.plan.outputs.build == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    container:
+      image: ghcr.io/cdellacqua/bootcher:latest
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.commit }} # the release's own commit and config
+          fetch-depth: 0
+      - name: Own the checkout
+        run: chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
+      - name: Prepare container store
+        run: |
+          set -eu
+          if [ "$(stat -f -c %T / 2>/dev/null)" = "overlayfs" ]; then
+            : "${BOOTCHER_STORE_SIZE:=20G}"
+            truncate -s "$BOOTCHER_STORE_SIZE" /bootcher-store.img
+            mkfs.ext4 -q -F /bootcher-store.img
+            mkdir -p /var/lib/containers/storage
+            mount -o loop /bootcher-store.img /var/lib/containers/storage
+          fi
+      - name: Build ${{ matrix.arch }} on the current base
+        run: |
+          set -eu
+          b() { bootcher --manifest bootcher.ci.toml "$@"; }
+          b build --target "${{ matrix.arch }}"
+          echo "$GITHUB_TOKEN" | podman login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          scratch="$(b info --format '{{ .Image }}'):ci-$(printf %.12s "$COMMIT")-${{ matrix.arch }}"
+          podman tag "localhost/$(b info --format '{{ .Name }}'):latest-${{ matrix.arch }}" "$scratch"
+          podman push "$scratch"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMIT: ${{ needs.plan.outputs.commit }}
+
+  refresh:
+    needs: [plan, build]
+    # Runs after a build, or with no build when a channel only lags its release.
+    if: >-
+      always() && needs.plan.result == 'success'
+      && (needs.build.result == 'success' || needs.plan.outputs.build == 'none')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    container:
+      image: ghcr.io/cdellacqua/bootcher:latest
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v7 # the default branch: it owns publishing
+      - name: Own the checkout
+        run: chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
+      - name: Pull the rebuilt members
+        if: needs.plan.outputs.build == 'true'
+        run: |
+          set -eu
+          echo "$GITHUB_TOKEN" | podman login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          image="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')"
+          name="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Name }}')"
+          for arch in $(bootcher --manifest bootcher.ci.toml info --format '{{ json .Arches }}' | jq -r '.[]'); do
+            scratch="$image:ci-$(printf %.12s "$COMMIT")-$arch"
+            podman pull "$scratch"
+            podman tag "$scratch" "localhost/$name:latest-$arch"
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMIT: ${{ needs.plan.outputs.commit }}
+      # Signing on? Restore the key to `[registry] key` (see release.yml).
+      - name: Restore the signing key
+        run: |
+          set -eu
+          key="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Key }}')"
+          if [ -z "$key" ]; then echo "signing off: nothing to restore"; exit 0; fi
+          test -n "$SIGN_KEY" || { echo "::error::signing is on ([registry] key = $key) but the SIGN_KEY secret is empty"; exit 1; }
+          printf '%s' "$SIGN_KEY" > "$key"
+        env:
+          SIGN_KEY: ${{ secrets.SIGN_KEY }}
+      - name: Refresh
+        run: |
+          set -eu
+          echo "$GITHUB_TOKEN" | skopeo login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          if [ -n "$CHANNEL" ]; then
+            bootcher --manifest bootcher.ci.toml channel refresh "$CHANNEL" -y --skip-remotes --skip-build
+          else
+            set -- release refresh "$RELEASE" --skip-build
+            if [ "$FORCE" = true ]; then set -- "$@" --force; fi
+            bootcher --manifest bootcher.ci.toml "$@"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHANNEL: ${{ needs.plan.outputs.channel }}
+          RELEASE: ${{ needs.plan.outputs.release }}
+          FORCE: ${{ inputs.force }}
+          BOOTCHER_SIGN_PASSPHRASE: ${{ secrets.SIGN_PASSPHRASE }}
+
+  cleanup:
+    needs: [refresh]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    container:
+      image: ghcr.io/cdellacqua/bootcher:latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Prune old image versions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DRY_RUN: "false"
+        run: python3 ci/ghcr_cleanup.py

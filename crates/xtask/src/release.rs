@@ -2,8 +2,10 @@
 //!
 //! The version lives in exactly one place — `[workspace.package].version` in the
 //! workspace `Cargo.toml` — and is edited in place with `toml_edit` so the
-//! manifest's formatting and comments survive. Everything else is plain git, so
-//! this depends on no `cargo-edit`/`cargo-release` tooling.
+//! manifest's formatting and comments survive. The release commit also pins the
+//! CI recipes' bootcher image to the version being released (see [`pin_recipes`]).
+//! Everything else is plain git, so this depends on no `cargo-edit`/`cargo-release`
+//! tooling.
 
 use anyhow::{Context, Result, bail};
 use semver::Version;
@@ -107,6 +109,7 @@ pub(crate) fn release(sh: &Shell, bump: &str, level: Option<&str>) -> Result<()>
 /// commit `tag` with `tag_message`.
 fn commit_and_tag(sh: &Shell, version: &Version, tag: &str, tag_message: &str) -> Result<()> {
 	write(version)?;
+	pin_recipes(&format!("v{version}"))?;
 	// Restore Cargo.lock too: bumping the version dirties the workspace members'
 	// lock entries. Offline and best-effort — a failure here only means the lock
 	// keeps the old version strings, which the commit below picks up anyway.
@@ -235,6 +238,56 @@ fn bumped(mut v: Version, kind: &str) -> Result<Version> {
 	Ok(v)
 }
 
+/// The bootcher image the CI recipes run in, up to its tag.
+const RECIPE_IMAGE: &str = "ghcr.io/cdellacqua/bootcher:";
+
+/// The CI recipe files whose bootcher image [`pin_recipes`] pins.
+const RECIPES: &[&str] = &[
+	"recipes/ci/gitlab-ci.yml",
+	"recipes/ci/github-actions/promote.yml",
+	"recipes/ci/github-actions/provision.yml",
+	"recipes/ci/github-actions/refresh.yml",
+	"recipes/ci/github-actions/release.yml",
+];
+
+/// Point every [`RECIPE_IMAGE`] reference in the [`RECIPES`] at `tag`, the release
+/// being cut, so a recipe copied from a release runs the CLI it was written for.
+/// The release workflow publishes that image tag (snapshots and rcs included).
+fn pin_recipes(tag: &str) -> Result<()> {
+	for rel in RECIPES {
+		let path = workspace_root().join(rel);
+		let text =
+			fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+		let (pinned, n) = pin_image(&text, tag);
+		if n == 0 {
+			bail!("{rel} doesn't reference {RECIPE_IMAGE}<tag> — update RECIPES");
+		}
+		fs::write(&path, pinned).with_context(|| format!("writing {}", path.display()))?;
+	}
+	Ok(())
+}
+
+/// `text` with the tag of every [`RECIPE_IMAGE`] reference replaced by `tag`, and
+/// how many it replaced. A tag runs until the first character an OCI tag can't hold.
+fn pin_image(text: &str, tag: &str) -> (String, usize) {
+	let mut out = String::with_capacity(text.len());
+	let mut rest = text;
+	let mut n = 0;
+	while let Some(at) = rest.find(RECIPE_IMAGE) {
+		let after = &rest[at + RECIPE_IMAGE.len()..];
+		let end = after
+			.find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
+			.unwrap_or(after.len());
+		out.push_str(&rest[..at]);
+		out.push_str(RECIPE_IMAGE);
+		out.push_str(tag);
+		rest = &after[end..];
+		n += 1;
+	}
+	out.push_str(rest);
+	(out, n)
+}
+
 /// Read and parse `[workspace.package].version` from the manifest.
 fn current() -> Result<Version> {
 	let doc = read()?;
@@ -313,6 +366,28 @@ mod tests {
 		);
 		// All digits with a leading zero: invalid as a bare numeric identifier.
 		assert_eq!(snap_version(v("1.2.3"), "patch", "0123456").unwrap(), v("1.2.4-snap.g0123456"));
+	}
+
+	#[test]
+	fn pins_every_recipe_image_tag() {
+		let text = "image: ghcr.io/cdellacqua/bootcher:latest\n  name: ghcr.io/cdellacqua/bootcher:v0.2.7 # x\n";
+		assert_eq!(
+			pin_image(text, "v1.0.0-rc.1"),
+			(
+				"image: ghcr.io/cdellacqua/bootcher:v1.0.0-rc.1\n  name: ghcr.io/cdellacqua/bootcher:v1.0.0-rc.1 # x\n"
+					.to_owned(),
+				2
+			)
+		);
+		assert_eq!(pin_image("ghcr.io/other/bootcher:latest", "v1").1, 0);
+	}
+
+	#[test]
+	fn the_recipes_all_reference_the_image() {
+		for rel in RECIPES {
+			let text = fs::read_to_string(workspace_root().join(rel)).unwrap();
+			assert!(pin_image(&text, "v0").1 > 0, "{rel} has no {RECIPE_IMAGE} reference");
+		}
 	}
 
 	#[test]

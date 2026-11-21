@@ -1,0 +1,196 @@
+# bootcher CI — GitHub Actions RELEASE workflow: a `v*` git tag publishes a release.
+#
+# Recipe docs: https://github.com/cdellacqua/bootcher/tree/main/recipes/ci
+# Copy to `.github/workflows/bootcher-release.yml`, with its siblings (promote.yml,
+# refresh.yml, provision.yml), `bootcher.ci.toml` and the `ci/` scripts.
+#
+#   git tag v1.4 && git push --tags
+#     → plan (the `[targets]` arches → runners) → build (one job per arch, native
+#     runners) → publish `<registry>/<name>:v1.4` → cleanup (prune old package versions)
+#
+# By default nothing here moves a channel: a release reaches devices only when you
+# promote it (promote.yml, a manual job). Set PROMOTE_TO to a channel to promote every
+# release there as soon as it's published (`release publish --promote`) — e.g. the
+# canary channel, or the only one. That promote skips promote.yml's `environment:` gate:
+# anyone who can push a `v*` tag moves the channel. Branch pushes run nothing — direct
+# devices are updated from a workstation with `bootcher device deploy`.
+#
+# THE HAND-OFF. Each build job pushes its member under a scratch tag keyed by the
+# commit, `<image>:ci-<sha12>-<arch>`, and publish pulls both back as the local
+# `localhost/<name>:latest-<arch>` members `release publish --skip-build` takes. A full
+# OS-image member easily exceeds the run-artifact limits; through the registry it costs
+# ~nothing (the layers are shared with the release) and needs only the automatic
+# GITHUB_TOKEN. ghcr_cleanup.py prunes old scratch tags.
+#
+# THE ARCHES come from `[targets]` (`bootcher info`), so a single-arch project copies
+# this unchanged. RUNNERS maps each arch to a native runner: edit it for self-hosted or
+# larger runners.
+#
+# GitHub sends no push event when more than three tags are pushed at once
+# (`git push --tags` of a backlog): push release tags one at a time, or dispatch this
+# workflow by hand on the tag.
+
+name: bootcher release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: # re-run a release by hand on a `v*` tag
+
+# Publishing and moving channels never overlap for one image (refresh.yml and
+# promote.yml share this group).
+concurrency:
+  group: bootcher-registry
+  cancel-in-progress: false
+
+env:
+  # cleanup keeps the channels, the releases they serve, in-flight scratch tags and this
+  # many other releases.
+  KEEP_PREVIOUS: "5"
+  # A channel to promote each release to once it's published; empty: never (promote by
+  # hand with promote.yml).
+  PROMOTE_TO: ""
+  # A native runner per arch: no emulation.
+  RUNNERS: '{"x86_64": "ubuntu-24.04", "aarch64": "ubuntu-24.04-arm"}'
+
+jobs:
+  plan:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    container:
+      image: ghcr.io/cdellacqua/bootcher:latest
+    outputs:
+      matrix: ${{ steps.arches.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Map the target arches to runners
+        id: arches
+        run: |
+          set -euo pipefail
+          bootcher --manifest bootcher.ci.toml info --format '{{ json .Arches }}' \
+            | jq -c --argjson r "$RUNNERS" \
+                '{include: map({arch: ., runner: ($r[.] // error("no runner for \(.) in RUNNERS"))})}' \
+            | sed 's/^/matrix=/' >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: [plan]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write # push the scratch member
+    container:
+      image: ghcr.io/cdellacqua/bootcher:latest
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-tags: true # so `git describe` names the release in the version label
+      # The runner creates the workspace as its own user but this job runs as root: hand
+      # it the checkout, or git refuses it ("dubious ownership") and the build records no
+      # source — and `release publish` refuses a member without one.
+      - name: Own the checkout
+        run: chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
+      # Real-fs container store: a loopback ext4, so podman does one kernel overlay
+      # instead of fuse-overlayfs on overlay. Self-skips on a real fs.
+      - name: Prepare container store
+        run: |
+          set -eu
+          if [ "$(stat -f -c %T / 2>/dev/null)" = "overlayfs" ]; then
+            : "${BOOTCHER_STORE_SIZE:=20G}"
+            truncate -s "$BOOTCHER_STORE_SIZE" /bootcher-store.img
+            mkfs.ext4 -q -F /bootcher-store.img
+            mkdir -p /var/lib/containers/storage
+            mount -o loop /bootcher-store.img /var/lib/containers/storage
+          fi
+          podman info --format 'podman store: {{.Store.GraphDriverName}} @ {{.Store.GraphRoot}}'
+      - name: Resolve image ref
+        run: |
+          set -eu
+          image="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')"
+          test -n "$image" || { echo "no [registry] in bootcher.toml — releases need one"; exit 1; }
+          echo "IMAGE=$image" >> "$GITHUB_ENV"
+          echo "NAME=$(bootcher --manifest bootcher.ci.toml info --format '{{ .Name }}')" >> "$GITHUB_ENV"
+      - name: Build ${{ matrix.arch }}
+        run: bootcher --manifest bootcher.ci.toml build --target "${{ matrix.arch }}"
+      - name: Push the member to its scratch tag
+        run: |
+          set -eu
+          echo "$GITHUB_TOKEN" | podman login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          scratch="$IMAGE:ci-$(printf %.12s "$GITHUB_SHA")-${{ matrix.arch }}"
+          podman tag "localhost/$NAME:latest-${{ matrix.arch }}" "$scratch"
+          podman push "$scratch"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish:
+    needs: [build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    container:
+      image: ghcr.io/cdellacqua/bootcher:latest
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-tags: true
+      - name: Own the checkout
+        run: chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
+      - name: Pull the members
+        run: |
+          set -eu
+          echo "$GITHUB_TOKEN" | podman login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          image="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')"
+          name="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Name }}')"
+          for arch in $(bootcher --manifest bootcher.ci.toml info --format '{{ json .Arches }}' | jq -r '.[]'); do
+            scratch="$image:ci-$(printf %.12s "$GITHUB_SHA")-$arch"
+            podman pull "$scratch"
+            podman tag "$scratch" "localhost/$name:latest-$arch"
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # With signing on, restore the private key from the SIGN_KEY secret to wherever
+      # `[registry] key` points (`signing rotate` repoints it; `*.key` is git-ignored, so
+      # the tree stays clean). Signing off: a no-op.
+      - name: Restore the signing key
+        run: |
+          set -eu
+          key="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Key }}')"
+          if [ -z "$key" ]; then echo "signing off: nothing to restore"; exit 0; fi
+          test -n "$SIGN_KEY" || { echo "::error::signing is on ([registry] key = $key) but the SIGN_KEY secret is empty"; exit 1; }
+          printf '%s' "$SIGN_KEY" > "$key"
+        env:
+          SIGN_KEY: ${{ secrets.SIGN_KEY }}
+      # The tag is the release name. `--skip-build` checks each member records this
+      # commit; publishing an already-published tag from the same commit is a no-op.
+      - name: Publish ${{ github.ref_name }}
+        # The promote reuses the registry login above (podman and skopeo share it).
+        run: |
+          set -eu
+          set -- release publish "$GITHUB_REF_NAME" --skip-build --git-tag no
+          if [ -n "$PROMOTE_TO" ]; then set -- "$@" --promote "$PROMOTE_TO" -y --skip-remotes; fi
+          bootcher --manifest bootcher.ci.toml "$@"
+        env:
+          BOOTCHER_SIGN_PASSPHRASE: ${{ secrets.SIGN_PASSPHRASE }}
+
+  cleanup:
+    needs: [publish]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write # delete old package versions
+    container:
+      image: ghcr.io/cdellacqua/bootcher:latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Prune old image versions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # org-owned package refused? use a CLEANUP_TOKEN PAT
+          DRY_RUN: "false" # "true" = log the plan without deleting (validate a first run)
+        run: python3 ci/ghcr_cleanup.py
