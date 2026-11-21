@@ -70,6 +70,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      # First: checkout empties a workspace that isn't a repo yet, so running it
+      # after the download would delete dist/. Only the tag message is used.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Collect artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -95,10 +98,25 @@ jobs:
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
             echo "::notice::$TAG is not a final release — publishing it as a GitHub prerelease"
           fi
+      # The release description is the annotated tag's body: `cargo xtask release`
+      # renders the changelog from the conventional-commit subjects since the
+      # previous tag and stores it there (see crates/xtask/src/changelog.rs), so no
+      # toolchain is needed here. The explicit fetch makes sure the local ref is the
+      # annotated tag object rather than a lightweight ref to the commit, which
+      # would carry no message. A tag without a body yields an empty description.
+      - name: Extract release notes
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          git fetch --force --no-tags origin "refs/tags/$TAG:refs/tags/$TAG"
+          git tag -l --format='%(contents:body)' "$TAG" > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
       - name: Publish release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: dist/*.tar.gz
+          body_path: ${{ runner.temp }}/notes.md
           prerelease: ${{ steps.tag.outputs.prerelease }}
 
   # Build the per-arch container images and push each to ghcr under an arch-suffixed

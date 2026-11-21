@@ -45,6 +45,7 @@ use std::{
 };
 use xshell::{Shell, cmd};
 
+mod changelog;
 mod release;
 
 #[derive(Parser)]
@@ -129,6 +130,9 @@ enum Cmd {
 	/// by `docs` does not survive here. Use this to edit prose and `docs` when
 	/// you need working API links.
 	DocsWatch,
+	/// Print the release notes for the commits since the latest vX.Y.Z tag — what
+	/// `release` would put in the tag message and on the GitHub release.
+	Changelog,
 	/// Cut a release: bump the workspace version, commit, tag vX.Y.Z, and push —
 	/// which triggers the release/image jobs in .github/workflows/release.yml.
 	/// Must be on a clean `main`.
@@ -212,6 +216,7 @@ fn run() -> Result<ExitCode> {
 		Cmd::DocsWatch => {
 			cmd!(sh, "mdbook serve docs/").run()?;
 		}
+		Cmd::Changelog => print!("{}", changelog::unreleased(&sh)?),
 		Cmd::Release { bump } => release::release(&sh, &bump)?,
 	}
 	Ok(ExitCode::SUCCESS)

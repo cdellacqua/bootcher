@@ -114,6 +114,24 @@ edits `[workspace.package].version` in [Cargo.toml](Cargo.toml) in place with
 version via `version.workspace = true`, so that one field is the single source of
 truth.
 
+The release notes come from the commit history. `release` groups the
+[conventional-commit](https://www.conventionalcommits.org/) subjects since the
+previous final release (a plain `vX.Y.Z` tag; prerelease tags are skipped) into
+sections: breaking changes (`type!:` or a `BREAKING
+CHANGE:` footer), features, bug fixes, performance, and documentation, with
+everything else (tests, refactors, CI, and non-conventional subjects) folded
+into a collapsed "Other changes" block. Merge commits and `release vX.Y.Z`
+bumps are left out. The Markdown becomes the body of the annotated tag, and the
+release workflow publishes that body as the GitHub release description. To see
+what the next release will say, run:
+
+```sh
+cargo xtask changelog
+```
+
+Reword a subject before it lands on `main` if it reads badly there. To fix a
+published release, edit its description on GitHub; the tag can stay as it is.
+
 Every guard — clean tree, on `main`, the version parses, the tag doesn't already
 exist — runs *before* the manifest is touched, so a release rejected by one of
 them leaves the tree exactly as it found it. Past that point the steps are
