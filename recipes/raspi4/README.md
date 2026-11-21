@@ -54,7 +54,7 @@ aarch64 = "raw"
 post = "recipes/raspi4/embed-firmware.sh"
 ```
 
-Then `bootcher disk` (or `bootcher provision`) builds the image and runs the hook.
+Then `bootcher disk` (or `bootcher device provision`) builds the image and runs the hook.
 
 ## Requirements
 

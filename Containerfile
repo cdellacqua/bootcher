@@ -25,7 +25,7 @@ RUN cargo build --release --locked -p bootcher-cli
 # Fedora carries every system tool bootcher shells out to, plus libudev.so.1
 # (systemd-libs) and the UEFI firmware the VM builder boots guests with.
 #
-# sudo: the image-builder disk step (`bootcher provision`) shells out to it to run
+# sudo: the image-builder disk step (`bootcher device provision`, `bootcher disk`) shells out to it to run
 # the privileged disk build, so it belongs in the runtime even though the binary
 # never calls it directly on the deploy path.
 #
@@ -46,7 +46,7 @@ RUN cargo build --release --locked -p bootcher-cli
 # image manifest.
 #
 # git-core: bootcher stamps git provenance (`org.opencontainers.image.revision` /
-# `.version` labels, the CalVer tag's commit suffix) by shelling out to git, which is
+# `.version` labels, the `bootcher.source` commit a release is refreshed from) by shelling out to git, which is
 # silently skipped without it — and actions/checkout falls back to a .git-less tarball
 # download when the job container has no git.
 FROM quay.io/fedora/fedora:44

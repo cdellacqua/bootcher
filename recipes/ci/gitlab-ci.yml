@@ -184,7 +184,9 @@ refresh:
       when: manual
     - if: $RELEASE
       when: manual
-  needs: []
+  # In a tag pipeline, wait for this pipeline's `publish` (a promote before the push
+  # would find no `:X`, or the previous one); a run-pipeline (RELEASE) has none.
+  needs: [{ job: publish, optional: true }]
   before_script:
     - echo "$CI_REGISTRY_PASSWORD" | skopeo login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
   script:

@@ -93,11 +93,10 @@ class PlanTest(unittest.TestCase):
         for pruned in old[:2]:
             self.assertEqual(pkg.family(pruned) - deleted, set(), f"{pruned} not fully pruned")
 
-    def test_releases_rank_by_age_not_tag_across_calver_formats(self):
-        # Tags minted before seconds were added (`YYYYMMDD.HHMM.g<sha>`, no git
-        # `YYYYMMDD.HH.MM`) sit beside `YYYYMMDD.HHMMSS[.g<sha>]` ones. Compared as
-        # strings, an old no-git tag sorts before every new tag of the same hour, even
-        # a later one; the cleanup ranks by push time, so the mix doesn't matter.
+    def test_releases_rank_by_age_not_tag_across_naming_schemes(self):
+        # Release names are free-form, so mixed schemes (here date-like names with and
+        # without a commit suffix) don't sort by age as strings; the cleanup ranks by
+        # push time, so the mix doesn't matter.
         pkg = Package()
         oldest = pkg.release("a", ["20260113.120100"])
         old_git = pkg.release("b", ["20260113.1205.g0a1b2c3d4e5f"])

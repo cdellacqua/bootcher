@@ -100,7 +100,7 @@ Merge semantics:
 
 `extend` chains are followed (a parent may itself `extend` a grandparent, applied underneath) and cycles are rejected. Only the manifest is redirected: the build context and every other relative path (Containerfile, `sysroot/`, keys) stay anchored to the working directory, so a variant layers over the same project tree. `extend` is resolved at load time and never appears in a serialized manifest.
 
-A refresh builds an older release commit under **that commit's** manifest, loaded from the same relative `--manifest` path in a worktree of the commit, with normal validation and no merging with today's config. Unknown tables (an old `[deploy]`, say) are ignored rather than rejected.
+A refresh builds an older release commit under **that commit's** manifest, loaded from the same relative `--manifest` path (and, for a project below the top of its git repository, the same subdirectory) in a temporary worktree of the commit under `.git/bootcher-worktrees/`, with normal validation and no merging with today's config. Unknown tables (an old `[deploy]`, say) are ignored rather than rejected.
 
 ---
 
@@ -373,7 +373,7 @@ Every hook is run with a single environment variable, `BOOTCHER_METADATA`, holdi
   "stage": "post",            // "pre" | "post"
   "image_name": "kiosk",
   "arches": ["x86_64", "aarch64"],
-  "image_ref": "registry.example.com/org/kiosk:latest",
+  "image_ref": "localhost/kiosk:latest", // what the phase acts on: the local list, or a release/channel ref
   "revision": "9f3a1c2-dirty",        // git commit the image was built from (omitted outside a git tree)
   "version": "v1.4.0-2-g9f3a1c2",      // git describe: nearest tag / short SHA (omitted outside a git tree)
 
