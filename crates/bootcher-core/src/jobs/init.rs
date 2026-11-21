@@ -20,19 +20,23 @@
 //! it keeps the release this bootcher version was published with. `--fedora-release`
 //! picks it explicitly (and skips the lookup).
 //!
-//! Interaction: `-y`/`--yes` is non-interactive (host platform, LAN deploys,
-//! all-`local` builders); a TTY without `-y` runs a short questionnaire
-//! (platform, registry, signing, deploy targets, build/image builders per arch);
+//! Interaction: `-y`/`--yes` is non-interactive (host platform, no registry, so
+//! every device is direct; all-`local` builders — `--registry`, `--channel` and
+//! `--sign` add a registry, its channels and signing, see [`RegistryArgs`]); a TTY
+//! without `-y` runs a short
+//! questionnaire (platform, registry → channels → signing, devices, build/image
+//! builders per arch);
 //! a non-TTY without `-y` is a hard fail (can't prompt, and defaults weren't
 //! opted into).
 
 use crate::builder;
 use crate::context::{
-	Arch, ArchBuilder, BuilderConfig, BuilderSpec, ConcurrencyConfig, DEFAULT_CHANNEL,
-	DeployConfig, DiskType, General, Hooks, MANIFEST, Manifest, RegistryConfig, RemoteConfig,
-	Rootfs, SCHEMA, SCHEMA_DIRECTIVE, Targets, manifest_schema_json,
+	Arch, ArchBuilder, BuilderConfig, BuilderSpec, ConcurrencyConfig, DiskType, General, Hooks,
+	MANIFEST, Manifest, RegistryConfig, RemoteConfig, Rootfs, SCHEMA, SCHEMA_DIRECTIVE, Targets,
+	manifest_schema_json,
 };
 use crate::hooks::{METADATA_SCHEMA, metadata_schema_json};
+use crate::interactive::Prompted;
 use anyhow::{Context, Result, bail};
 use include_dir::{Dir, include_dir};
 use std::ffi::OsStr;
@@ -69,17 +73,17 @@ const BUILDER_OVERRIDE_EXAMPLE: &str = "\
 /// live table so a fresh project has *no* hooks until the user opts in.
 const HOOKS_EXAMPLE: &str = "\
 # Lifecycle hooks (optional): shell commands bootcher runs around its phases —
-# the container build, the disk-image step, the deploy upgrade, the takeover, and
-# the credential rotation. This is the
+# the container build, the disk-image step, publishing a release, moving a
+# channel, the device rollout, the takeover, and the credential rotation. This is the
 # extension point for board- or project-specific work; bootcher itself stays
 # generic. Each command runs with `sh -c` from this directory, with the progress
 # UI suspended and the terminal handed over (so it can print, prompt, or `sudo`);
 # a non-zero exit aborts the run. Each phase has an optional pre/post pair, and
-# fires wherever that phase runs (build also during provision/deploy, image also
-# during provision, upgrade also during deploy, takeover with or without
-# --skip-build, rotate for every rotate subcommand). A post hook runs once its
-# phase succeeded; on the fleet phases (upgrade, takeover, rotate) it runs even
-# after a partial failure, with each device's outcome in the metadata `results`.
+# fires wherever that phase runs (build during every build, including a refresh's
+# rebuild of an older commit — which runs that commit's own hooks). A post hook
+# runs once its phase succeeded; on the device phases (upgrade, takeover, rotate)
+# it runs even after a partial failure, with each device's outcome in the
+# metadata `results`.
 #
 # Each hook gets a BOOTCHER_METADATA env var (JSON) describing the phase and the
 # artifacts it concerns — e.g. disk.post lists each built disk's resolved path, so
@@ -94,7 +98,15 @@ const HOOKS_EXAMPLE: &str = "\
 # pre  = \"echo REPLACEME\"
 # post = \"echo REPLACEME\"
 #
-# [hooks.upgrade]   # around the deploy push + per-device `bootc upgrade`
+# [hooks.publish]   # around pushing a release (release publish/refresh, channel refresh)
+# pre  = \"echo REPLACEME\"
+# post = \"echo REPLACEME\"
+#
+# [hooks.promote]   # around moving a channel (channel promote/refresh)
+# pre  = \"echo REPLACEME\"
+# post = \"echo REPLACEME\"
+#
+# [hooks.upgrade]   # around the per-device rollout (switch + upgrade + reboot)
 # pre  = \"echo REPLACEME\"
 # post = \"echo REPLACEME\"
 #
@@ -102,7 +114,7 @@ const HOOKS_EXAMPLE: &str = "\
 # pre  = \"echo REPLACEME\"
 # post = \"echo REPLACEME\"
 #
-# [hooks.rotate]    # around the per-device credential rollout (every `rotate` subcommand)
+# [hooks.rotate]    # around the per-device credential rollout (`device rotate`, signing)
 # pre  = \"echo REPLACEME\"
 # post = \"echo REPLACEME\"
 ";
@@ -128,36 +140,29 @@ const CONCURRENCY_EXAMPLE: &str = "\
 # takeover = 2  # live hosts being converted to bootc       (default: unbounded)
 ";
 
-/// Signing hint appended to the scaffolded manifest when a plain-URL registry is
-/// configured — documents how to opt into signing. Omitted in LAN mode (nothing to
-/// expand) and when signing is already live in the rendered manifest.
+/// Signing hint appended to the scaffolded manifest when a registry is configured
+/// without a key — documents how to opt into signing.
 const SIGNING_EXAMPLE: &str = "\
-# Image signing (optional): sign pushed images with a cosign key and make devices
-# reject unsigned/tampered ones on `bootc upgrade`. To enable, run:
-#   bootcher sign enroll
-# which writes cosign.key/.pub, patches `[deploy] registry` to the signing form, and
-# bakes sysroot/usr/lib/bootc/install/30-bootcher-signing.toml so a freshly
-# provisioned device enforces signatures from first boot. The passphrase comes from
-# BOOTCHER_SIGN_PASSPHRASE (or a prompt); the public key is injected into each device
-# at `provision`. Rotate a leaked/expiring key with `bootcher rotate sign-key`.
+# Image signing (optional): sign every published release with a cosign key and
+# make channel devices reject unsigned/tampered ones on `bootc upgrade`. Enable it
+# with `bootcher signing enroll`, which writes cosign.key/.pub, sets `key` in
+# [registry], and bakes sysroot/usr/lib/bootc/install/30-bootcher-signing.toml so a
+# freshly installed device enforces signatures from first boot. The passphrase
+# comes from BOOTCHER_SIGN_PASSPHRASE (or a prompt). Rotate the key with
+# `bootcher signing rotate`, then `bootcher signing retire` the old one.
 ";
 
-/// Release-channels hint appended to the scaffolded manifest when a registry is
-/// configured but no channels were declared at init — documents how to add them.
-/// Omitted in LAN mode (channels are registry-only) and when the manifest already
-/// lists some (the rendered `[deploy] channels` then speaks for itself).
-const CHANNELS_EXAMPLE: &str = "\
-# Release channels (optional, registry mode): publish to named mutable tags beyond
-# the implicit `latest` every project always ships. A channel is a registry tag a
-# subset of devices tracks (<registry>/<name>:<channel>): `deploy --channel stable`
-# pushes the image under :stable instead of :latest, and `provision`/`takeover
-# --channel stable` point a device's bootc origin at it so it follows that channel.
-# The immutable :CalVer tag is shared across channels — a channel is just *which*
-# subscribers see a build, not a separate identity. Declaring them here validates
-# `--channel` against the set (a typo is rejected, not silently published).
+/// Registry hint appended to the scaffolded manifest when no registry is
+/// configured — documents how to publish releases and channels later.
+const REGISTRY_EXAMPLE: &str = "\
+# Releases and channels (optional): without a [registry] every device is direct —
+# built here and updated over SSH with `bootcher device deploy`. Add a registry to
+# publish named releases (`bootcher release publish v1.0`) and move channels devices
+# follow (`bootcher channel promote v1.0 stable`):
 #
-# [deploy]
-# channels = [\"stable\", \"next\", \"testing\"]
+# [registry]
+# url = \"registry.example.com/org/project\"
+# channels = [\"stable\"]
 ";
 
 /// Resolve the destination first (so an invalid/occupied target fails before any
@@ -172,11 +177,65 @@ pub fn run(
 	yes: bool,
 	force: bool,
 	fedora_release: Option<u32>,
+	registry: RegistryArgs,
 ) -> Result<()> {
 	let target = Target::resolve(name, force)?;
-	let settings = collect(yes)?;
+	let settings = collect(yes, registry)?;
 	let release = fedora_release.map_or_else(resolve_release, Ok)?;
 	target.write(&settings, release)
+}
+
+/// The registry settings a non-interactive (`-y`) `init` takes from flags in place
+/// of the questionnaire's registry → channels → signing prompts. All empty means no
+/// registry, the `-y` default.
+#[derive(Debug, Default)]
+pub struct RegistryArgs {
+	/// `--registry <url>`: the `[registry] url` namespace.
+	pub url: Option<String>,
+	/// `--channel <ch>` (repeatable): the declared channels; `stable` when none is
+	/// given.
+	pub channels: Vec<String>,
+	/// `--sign`: enroll a signing key, as `bootcher signing enroll` does. The
+	/// passphrase comes from `BOOTCHER_SIGN_PASSPHRASE`, else a prompt on a TTY.
+	pub sign: bool,
+}
+
+impl RegistryArgs {
+	/// The `(url, channels, signing)` a `-y` scaffold writes, validated as the
+	/// questionnaire validates them.
+	fn resolve(self) -> Result<(Option<String>, Vec<String>, bool)> {
+		let Some(url) = self.url.map(|u| u.trim().to_owned()) else {
+			if !self.channels.is_empty() || self.sign {
+				bail!("`--channel` and `--sign` need `--registry <url>`");
+			}
+			return Ok((None, Vec::new(), false));
+		};
+		if url.is_empty() {
+			bail!("`--registry` needs a registry namespace, e.g. ghcr.io/acme");
+		}
+		let mut channels: Vec<String> = Vec::new();
+		for c in self.channels.iter().map(|c| c.trim()) {
+			crate::context::check_channel_name(c)?;
+			if !channels.iter().any(|o| o == c) {
+				channels.push(c.to_owned());
+			}
+		}
+		if channels.is_empty() {
+			channels.push("stable".to_owned());
+		}
+		// Fail before anything is written, not halfway through the scaffold.
+		if self.sign
+			&& std::env::var_os(crate::jobs::signing::ENV_SIGN_PASSPHRASE).is_none()
+			&& !std::io::stdin().is_terminal()
+		{
+			bail!(
+				"`--sign` needs the new key's passphrase: set {} (or run on a TTY to be \
+				 prompted)",
+				crate::jobs::signing::ENV_SIGN_PASSPHRASE
+			);
+		}
+		Ok((Some(url), channels, self.sign))
+	}
 }
 
 /// The scaffold's `Containerfile`, whose `ARG FEDORA_VERSION=<N>` line `init` rewrites.
@@ -234,19 +293,17 @@ struct Settings {
 	/// Root filesystem to format (`[general] rootfs`).
 	rootfs: Rootfs,
 	registry: Option<String>,
-	/// Whether to enable opt-in image signing. Only offered in registry mode; when
+	/// Whether to enable opt-in image signing. Only offered with a registry; when
 	/// set, `write` calls `signing::enable_signing` to generate the keypair, upgrade
 	/// `registry` to the signing inline-table form, and bake the
 	/// `enforce-container-sigpolicy` install config so first boot enforces it.
 	signing: bool,
-	/// SSH deploy targets collected at init time (`[deploy] remotes`). Each is a
+	/// Devices collected at init time (`remotes`). Each is a
 	/// bare connection string (`[user@]host` or `ssh://[user@]host[:port]`) with
 	/// no per-target SSH options — those can be added by hand later.
 	remotes: Vec<String>,
-	/// Extra release channels beyond the implicit `latest` (`[deploy] channels`).
-	/// Registry-mode only and empty by default — the single-`latest` case is the
-	/// common one; a project that wants `stable`/`nightly`/… names them here so
-	/// `deploy --channel` validates against the set.
+	/// The declared channels (`[registry] channels`): required and non-empty with a
+	/// registry, so the questionnaire suggests `stable`.
 	channels: Vec<String>,
 	/// Builder config for the `[builder]` table; always concrete so the scaffolded
 	/// manifest records every key explicitly.
@@ -309,25 +366,22 @@ impl Target {
 		// every builder key explicitly — the scaffold doubles as documentation. The
 		// embedded files stay project-agnostic. `annotate_values` then prepends each
 		// enumerated key with a `# a, b, c` hint of its accepted values.
-		// Build the registry config: always a plain URL here (or absent in LAN mode).
-		// When signing is enabled, `signing::enable_signing` below upgrades this entry
-		// to the inline-table signing form — the single code path that wires signing.
-		let registry_config = settings.registry.clone().map(RegistryConfig::Url);
+		// The registry table carries no key here; when signing is enabled,
+		// `signing::enable_signing` below sets it — the single code path that wires
+		// signing.
+		let registry_config = settings.registry.clone().map(|url| RegistryConfig {
+			url,
+			channels: settings.channels.clone(),
+			key: None,
+		});
 		let manifest = Manifest {
 			// A scaffold is a standalone base, never an `extend` override.
 			extend: None,
 			general: General { name: self.name.clone(), rootfs: settings.rootfs },
 			targets: settings.targets.clone(),
 			builder: settings.builder.clone(),
-			deploy: DeployConfig {
-				registry: registry_config,
-				remotes: settings
-					.remotes
-					.iter()
-					.map(|r| RemoteConfig::ConnStr(r.clone()))
-					.collect(),
-				channels: settings.channels.clone(),
-			},
+			registry: registry_config,
+			remotes: settings.remotes.iter().map(|r| RemoteConfig::ConnStr(r.clone())).collect(),
 			// Unbounded by default (each fan-out scales to the host's cores);
 			// `ConcurrencyConfig::is_empty` keeps the `[concurrency]` table out of the
 			// serialized manifest, and `CONCURRENCY_EXAMPLE` documents it as comments.
@@ -336,22 +390,16 @@ impl Target {
 			// the serialized manifest, and `HOOKS_EXAMPLE` documents it as comments
 			// instead (an empty table would read as "configured but blank").
 			hooks: Hooks::default(),
+			root: PathBuf::new(),
 		};
 		let rendered =
 			annotate_values(&toml::to_string(&manifest).context("serialising the manifest")?);
 		let manifest_path = self.dest.join(MANIFEST);
-		// Show the signing example only when a plain-URL registry is configured —
-		// it shows how to expand it. Irrelevant in LAN mode (no registry to expand)
-		// and redundant when signing is already live in the rendered manifest.
+		// Show the signing example only with a registry and no key yet, and the
+		// registry example only without a registry.
 		let signing_doc =
 			if settings.registry.is_some() && !settings.signing { SIGNING_EXAMPLE } else { "" };
-		// Same gate for the channels hint: registry-only, and only when none were
-		// declared at init (a rendered `[deploy] channels` already documents itself).
-		let channels_doc = if settings.registry.is_some() && settings.channels.is_empty() {
-			CHANNELS_EXAMPLE
-		} else {
-			""
-		};
+		let registry_doc = if settings.registry.is_none() { REGISTRY_EXAMPLE } else { "" };
 		// Emit the JSON Schemas (generated from the live types, so they can't drift)
 		// into `schemas/`: the manifest schema, bound to the manifest by a first-line
 		// `#:schema` directive so editors (Taplo / Even Better TOML) validate and
@@ -369,19 +417,20 @@ impl Target {
 		fs::write(
 			&manifest_path,
 			format!(
-				"{SCHEMA_DIRECTIVE}\n{rendered}{BUILDER_OVERRIDE_EXAMPLE}{CONCURRENCY_EXAMPLE}{HOOKS_EXAMPLE}{signing_doc}{channels_doc}"
+				"{SCHEMA_DIRECTIVE}\n{rendered}{BUILDER_OVERRIDE_EXAMPLE}{CONCURRENCY_EXAMPLE}{HOOKS_EXAMPLE}{registry_doc}{signing_doc}"
 			),
 		)
 		.with_context(|| format!("writing {}", manifest_path.display()))?;
 
 		// With signing enabled, fully wire it now (single path, shared with
-		// `bootcher sign enroll`): generate the keypair, upgrade `[deploy] registry`
-		// to the signing form, and bake the enforce-container-sigpolicy install config
-		// so first boot enforces signatures. Prompts for a passphrase (this is an
-		// interactive run — non-interactive `-y` leaves signing off). Doing it here
+		// `bootcher signing enroll`): generate the keypair, set `[registry] key`, and
+		// bake the enforce-container-sigpolicy install config
+		// so first boot enforces signatures. The passphrase comes from
+		// `BOOTCHER_SIGN_PASSPHRASE`, else a prompt (`RegistryArgs::resolve` already
+		// refused a `-y --sign` run that has neither). Doing it here
 		// means a signed scaffold is never left referencing a key that doesn't exist.
 		if settings.signing {
-			crate::jobs::signing::enable_signing(&self.dest, "cosign", false)
+			crate::jobs::signing::enable_signing(&self.dest, "cosign")
 				.context("enrolling the signing key")?;
 		}
 
@@ -398,11 +447,18 @@ impl Target {
 		} else {
 			""
 		};
+		let next = if settings.registry.is_some() {
+			"  bootcher device provision   # build a disk image (asks: a channel, or direct)\n  \
+			 bootcher release publish v1  # publish a release, then `bootcher channel promote v1 <channel>`"
+		} else {
+			"  bootcher device provision   # build a disk image (prompts for your admin SSH key)\n  \
+			 bootcher device deploy      # later: build here and update the devices in `remotes`"
+		};
 		eprintln!(
 			"init: scaffolded {where_} as '{}' (Fedora {release})\n\nNext:\n{cd}{sign}  \
-			 # edit Containerfile / bootcher.toml ([targets] sets target arches + formats), then:\n  \
-			 bootcher provision   # build the disk image (prompts for your admin SSH key)\n  \
-			 # the artifacts land under output/<arch>/ (the image grows its root FS on first boot)",
+			 # edit Containerfile / bootcher.toml ([targets] sets target arches + formats), then:\n\
+			 {next}\n  \
+			 # disk artifacts land under output/<arch>/ (the image grows its root FS on first boot)",
 			self.name,
 		);
 		Ok(())
@@ -410,21 +466,21 @@ impl Target {
 }
 
 /// Collect the manifest settings per interaction mode (see the module docs).
-fn collect(yes: bool) -> Result<Settings> {
+fn collect(yes: bool, registry: RegistryArgs) -> Result<Settings> {
 	if yes {
 		// Defaults: host arch (so never cross-arch) building a single qcow2, ext4
-		// rootfs, LAN deploys, all-`local` builders.
+		// rootfs, all-`local` builders, and no registry (every device direct) unless
+		// the registry flags name one.
+		let (registry, channels, signing) = registry.resolve()?;
 		let mut targets = Targets::default();
 		targets.set(default_platform(), vec![DiskType::Qcow2]);
 		Ok(Settings {
 			targets,
 			rootfs: Rootfs::Ext4,
-			registry: None,
-			// No registry under `-y`, so signing (registry-only) is off.
-			signing: false,
+			registry,
+			signing,
 			remotes: Vec::new(),
-			// No registry under `-y`, so channels (registry-only) stay empty.
-			channels: Vec::new(),
+			channels,
 			builder: BuilderConfig::default(),
 		})
 	} else if std::io::stdin().is_terminal() {
@@ -448,7 +504,8 @@ fn questionnaire() -> Result<Settings> {
 	let platform = inquire::MultiSelect::new("Target platform(s):", options)
 		.with_default(&[start])
 		.with_help_message("space to toggle, enter to confirm; pick several for a multi-arch image")
-		.prompt()?;
+		.prompt()
+		.prompted()?;
 	if platform.is_empty() {
 		bail!("pick at least one target platform");
 	}
@@ -468,7 +525,8 @@ fn questionnaire() -> Result<Settings> {
 		.with_help_message(
 			"space to toggle, enter to confirm; qcow2 boots as-is in a VM, raw writes to a block device, bootc-installer makes an installer ISO",
 		)
-		.prompt()?;
+		.prompt()
+		.prompted()?;
 		if chosen.is_empty() {
 			bail!("pick at least one image format for {arch}");
 		}
@@ -480,63 +538,101 @@ fn questionnaire() -> Result<Settings> {
 	let rootfs =
 		inquire::Select::new("Root filesystem (image-builder --bootc-default-fs):", rootfses)
 			.with_starting_cursor(start)
-			.prompt()?;
+			.prompt()
+			.prompted()?;
 
-	let registry = inquire::Text::new("Registry namespace (blank = LAN deploys over SSH):")
+	let publish = inquire::Confirm::new("Publish releases to a registry?")
+		.with_default(false)
 		.with_help_message(
-			"e.g. registry.gitlab.com/org/project — switches deploy to registry mode",
+			"no: every device is direct — built here and updated over SSH with `device deploy`; \
+			 yes: devices can also follow channels you promote releases to",
 		)
-		.prompt()?;
-	let registry = Some(registry.trim().to_owned()).filter(|s| !s.is_empty());
+		.prompt()
+		.prompted()?;
+	let registry = if publish {
+		let url = inquire::Text::new("Registry namespace:")
+			.with_help_message("e.g. registry.example.com/org/project or ghcr.io/acme")
+			.with_validator(|s: &str| {
+				Ok(if s.trim().is_empty() {
+					inquire::validator::Validation::Invalid(
+						"a registry namespace is required".into(),
+					)
+				} else {
+					inquire::validator::Validation::Valid
+				})
+			})
+			.prompt()
+			.prompted()?;
+		Some(url.trim().to_owned())
+	} else {
+		None
+	};
 
-	// Image signing is registry-mode only (a LAN deploy's integrity rides the ssh
-	// channel), so only offer it when a registry is set. Saying yes enrolls the
-	// signing key right away (generates the keypair — prompting for a passphrase —
-	// expands the registry to the signing form, and bakes the
-	// enforce-container-sigpolicy install config), so no separate step is needed.
-	let signing = registry.is_some()
-		&& inquire::Confirm::new("Enforce image signatures on devices?")
-			.with_default(false)
+	// With a registry, at least one channel is required (devices follow channels);
+	// `stable` is suggested.
+	let channels: Vec<String> = if registry.is_some() {
+		let raw = inquire::Text::new("Channels devices can follow (comma-separated):")
+			.with_initial_value("stable")
 			.with_help_message(
-				"signs pushes with a cosign key and makes devices reject unsigned/tampered \
-				 images; enrolls a cosign key now (prompts for a passphrase)",
+				"e.g. stable, next — each a registry tag a subset of devices follows",
 			)
-			.prompt()?;
-
-	// Extra release channels are registry-mode only (a channel is a mutable registry
-	// tag with no LAN equivalent) and opt-in: blank keeps the project on just the
-	// implicit `latest`, the common single-channel case. A comma-separated list is
-	// parsed into the declared set `deploy --channel` then validates against; `latest`
-	// is always implicit, so it's dropped if the user lists it.
-	let channels = if registry.is_some() {
-		let raw = inquire::Text::new("Extra release channels beyond `latest` (comma-separated, blank for none):")
-			.with_help_message("e.g. stable, next, testing — each a registry tag a subset of devices tracks; deploy to one with `--channel`")
-			.prompt()?;
-		raw.split(',')
-			.map(str::trim)
-			.filter(|c| !c.is_empty() && *c != DEFAULT_CHANNEL)
-			.map(str::to_owned)
-			.collect()
+			.with_validator(|s: &str| {
+				let chans: Vec<&str> =
+					s.split(',').map(str::trim).filter(|c| !c.is_empty()).collect();
+				Ok(if chans.is_empty() {
+					inquire::validator::Validation::Invalid("name at least one channel".into())
+				} else if let Some(e) =
+					chans.iter().find_map(|c| crate::context::check_channel_name(c).err())
+				{
+					inquire::validator::Validation::Invalid(e.to_string().into())
+				} else {
+					inquire::validator::Validation::Valid
+				})
+			})
+			.prompt()
+			.prompted()?;
+		let mut out: Vec<String> = Vec::new();
+		for c in raw.split(',').map(str::trim).filter(|c| !c.is_empty()) {
+			if !out.iter().any(|o| o == c) {
+				out.push(c.to_owned());
+			}
+		}
+		out
 	} else {
 		Vec::new()
 	};
 
-	// Collect deploy targets: plain connection strings only (no per-remote SSH
+	// Image signing protects registry pulls, so it's only offered with a registry.
+	// Saying yes enrolls the signing key right away (generates the keypair —
+	// prompting for a passphrase — sets `[registry] key`, and bakes the
+	// enforce-container-sigpolicy install config), so no separate step is needed.
+	let signing = registry.is_some()
+		&& inquire::Confirm::new("Sign releases and enforce signatures on channel devices?")
+			.with_default(false)
+			.with_help_message(
+				"signs every release with a cosign key and makes channel devices reject \
+				 unsigned/tampered images; enrolls a cosign key now (prompts for a passphrase)",
+			)
+			.prompt()
+			.prompted()?;
+
+	// Collect devices: plain connection strings only (no per-remote SSH
 	// options — those can be added by hand in the manifest later). An empty entry
 	// ends the loop; the list may be left empty and filled in afterward.
 	let mut remotes: Vec<String> = Vec::new();
 	loop {
 		let prompt = if remotes.is_empty() {
-			"Deploy target (blank to skip / finish):"
+			"Device to manage over SSH (blank to skip / finish):"
 		} else {
-			"Another deploy target (blank to finish):"
+			"Another device (blank to finish):"
 		};
 		let raw = inquire::Text::new(prompt)
 			.with_initial_value("admin@")
 			.with_help_message(
 				"type the IP or hostname after admin@; edit the prefix to change the user or use a full ssh:// URL",
 			)
-			.prompt()?;
+			.prompt()
+			.prompted()?;
 		let raw = raw.trim().to_owned();
 		if raw.is_empty() || raw == "admin@" {
 			break;

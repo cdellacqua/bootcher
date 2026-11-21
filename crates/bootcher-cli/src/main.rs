@@ -1,19 +1,26 @@
-use anyhow::{Context, Result};
-use bootcher_core::context::{Arch, DiskType, MANIFEST, Manifest, ToSsh};
+use anyhow::Result;
+use bootcher_core::context::{Arch, DiskType, MANIFEST, Manifest};
+use bootcher_core::jobs::device::{self, Mode};
 use bootcher_core::progress::Scope;
-use bootcher_core::{cache, jobs, pipelines};
-use clap::{Parser, Subcommand};
+use bootcher_core::{cache, jobs};
+use clap::{Args, Parser, Subcommand};
 use std::process::ExitCode;
 
 #[derive(Parser)]
-#[command(version, about = "bootc image provisioning pipeline")]
+#[command(
+	// The Cargo.toml version, plus `git describe` when built from a commit that isn't
+	// exactly that release (see build.rs).
+	version = env!("BOOTCHER_VERSION"),
+	about = "bootc image lifecycle: build, provision, update devices, publish releases"
+)]
 struct Cli {
 	/// Load the project manifest from this file instead of `./bootcher.toml`, for
 	/// keeping per-pipeline overrides (e.g. `bootcher --manifest bootcher.ci.toml
-	/// provision`) beside the default. Only the manifest is redirected: the build
-	/// context and every relative path it names (Containerfile, `sysroot/`, keys) stay
-	/// anchored to the working directory, so an alternate manifest layers over the same
-	/// project tree. Ignored by `init`, which writes a fresh `bootcher.toml`.
+	/// build`) beside the default. Only the manifest is redirected: the build context
+	/// and every relative path it names (Containerfile, `sysroot/`, keys) stay
+	/// anchored to the working directory. A refresh loads the same relative path from
+	/// the release commit's own tree. Ignored by `init`, which writes a fresh
+	/// `bootcher.toml`.
 	#[arg(short = 'm', long = "manifest", global = true, default_value = MANIFEST)]
 	manifest: String,
 	#[command(subcommand)]
@@ -21,9 +28,10 @@ struct Cli {
 }
 
 /// A bootcher project is one image, described by `bootcher.toml` in the working
-/// directory. Everything the image-building subcommands need — the name, the
-/// target arch(es) (`[targets]`, one or several for a multi-arch image), the build
-/// location, the layout — comes from the manifest; edit it to change the target.
+/// directory. Commands are grouped by what they act on: the project itself
+/// (`init`, `info`, `build`, `clean`), the devices (`device`), the releases
+/// published to a registry (`release`), the channels devices follow (`channel`), and
+/// image signing (`signing`).
 #[derive(Subcommand)]
 enum Cmd {
 	/// Scaffold a new bootcher project: create `<name>/` with a starter
@@ -34,10 +42,22 @@ enum Cmd {
 		/// parent dirs are made and `.`/`..` resolved). Omit to scaffold the
 		/// current directory in place.
 		name: Option<String>,
-		/// Accept defaults without prompting (host platform, LAN deploys) — the
-		/// non-interactive path for scripts/CI.
+		/// Accept defaults without prompting (host platform, no registry unless
+		/// `--registry` names one) — the non-interactive path for scripts/CI.
 		#[arg(short = 'y', long = "yes")]
 		yes: bool,
+		/// With `-y`: publish releases to this registry namespace (`[registry] url`,
+		/// e.g. `ghcr.io/acme`).
+		#[arg(long = "registry", value_name = "URL", requires = "yes")]
+		registry: Option<String>,
+		/// With `--registry`: a channel devices can follow (repeatable; default
+		/// `stable`).
+		#[arg(long = "channel", value_name = "CHANNEL", requires = "registry")]
+		channel: Vec<String>,
+		/// With `--registry`: enroll a signing key, as `signing enroll` does (the
+		/// passphrase is read from `BOOTCHER_SIGN_PASSPHRASE`, else prompted).
+		#[arg(long = "sign", requires = "registry")]
+		sign: bool,
 		/// Scaffold into a non-empty (or already-existing) directory anyway,
 		/// overwriting any files the scaffold collides with.
 		#[arg(short = 'f', long = "force")]
@@ -47,241 +67,434 @@ enum Cmd {
 		#[arg(long = "fedora-release", value_name = "N")]
 		fedora_release: Option<u32>,
 	},
-	/// First-time provisioning: build the container, then build its disk image under
-	/// `output/` for you to write or upload to the target device. Any project-specific
-	/// post-processing (e.g. embedding firmware) can be performed by custom
-	/// lifecycle hooks (e.g. `[hooks.disk] post = "dd ..."`) configurable in `bootcher.toml`.
-	Provision {
-		/// Admin SSH private key to install on the device. The public key is read
-		/// from the `<key>.pub` sibling, mirroring how `[deploy] registry` signing
-		/// keys work. Omit to pick interactively on a TTY, or to auto-select when
-		/// only one key is available.
-		#[arg(long = "ssh-key")]
-		ssh_key: Option<String>,
-		/// When provisioning, if you want to specify a registry for future updates and
-		/// that registry requires an authentication token, bootcher will try to validate it
-		/// from the current machine. With this flag you can skip the validation entirely since it
-		/// might not be possibile if, for example, the registry and devices you're provisioning
-		/// are inside a VPN.
-		#[arg(long = "skip-pull-check")]
-		skip_pull_check: bool,
-		/// The configured registry is public (no authentication): provision without a
-		/// pull credential, baking no `/etc/ostree/auth.json`, so the device pulls
-		/// anonymously. Without this, a registry-mode provision requires a pull
-		/// credential. No effect in LAN mode.
-		#[arg(long = "anonymous")]
-		anonymous: bool,
-		/// Restrict the build to a single target architecture from `[targets]`
-		/// (`aarch64` or `x86_64`), instead of every arch the project lists. Lets a
-		/// multi-arch project drive one provision job per arch — e.g. on a per-arch CI
-		/// runner. Must name an arch the manifest builds.
-		#[arg(long = "target")]
-		target: Option<Arch>,
-		/// Restrict the disks built for `--target` to these `image-builder` type(s)
-		/// from its `[targets]` list, instead of all of them. Repeatable (`--disk
-		/// qcow2 --disk raw`). Requires `--target`, and each must be a type that arch
-		/// lists.
-		#[arg(long = "disk", requires = "target")]
-		disk: Vec<DiskType>,
-		/// Build the disk from the already-built container, skipping the container
-		/// build — for iterating on the disk step alone, or when an earlier `build`
-		/// already produced the container. The container is taken from local storage
-		/// when present, otherwise pulled from the configured registry — so a fresh CI
-		/// runner reuses the image a prior `deploy` already built and pushed instead of
-		/// rebuilding it (registry mode only; needs this host logged in to pull a
-		/// private registry).
-		#[arg(long = "skip-build")]
-		skip_build: bool,
-		/// Provision the device to track this release channel instead of the default
-		/// `latest`: its bootc origin is set to `<registry>/<name>:<channel>`, so it
-		/// upgrades only when *that* channel is deployed to. Must be one of `[deploy]
-		/// channels` in bootcher.toml. Registry mode only.
-		#[arg(long = "channel")]
-		channel: Option<String>,
-	},
-	/// Subsequent deployment to the configured targets in `bootcher.toml`: build the
-	/// container, then push it and trigger `bootc upgrade`.
-	/// For LAN deploys this uploads the image by emulating a simple registry and
-	/// tunnelling via an SSH connection.
-	/// If a registry is configured, this pushes the up-to-date container image to it and,
-	/// if `bootcher.toml` includes remotes, a `bootc upgrade` command will be launched via SSH to start
-	/// the upgrade immediately.
-	Deploy {
-		/// Registry mode only: push the image to the registry and return without
-		/// `SSHing` into the configured remotes to run `bootc upgrade` + reboot.
-		/// Devices will pick up the new revision on their next auto-update cycle.
-		/// Has no effect in LAN mode.
-		#[arg(long = "skip-bootc-upgrade")]
-		skip_bootc_upgrade: bool,
-		/// Push the already-built container, skipping the container build — for
-		/// shipping an image an earlier `build` already produced, or iterating on the
-		/// push/upgrade step alone.
-		#[arg(long = "skip-build")]
-		skip_build: bool,
-		/// Publish to this release channel instead of the default `latest`: the image
-		/// is pushed under the mutable `<registry>/<name>:<channel>` tag (the immutable
-		/// `CalVer` tag is shared across channels), and only the devices tracking that
-		/// channel pick it up. Must be one of `[deploy] channels` in bootcher.toml.
-		/// Registry mode only — channels have no LAN equivalent.
-		#[arg(long = "channel")]
-		channel: Option<String>,
-	},
-	/// Build the bootc container image.
-	Build {
-		/// Restrict the build to a single target architecture from `[targets]`
-		/// (`aarch64` or `x86_64`), instead of every arch the project lists. The build
-		/// stops at the per-arch `localhost/<name>:latest-<arch>` member and does *not*
-		/// assemble the multi-arch `:latest` list — so a CI pipeline can build each arch
-		/// on its own native runner (in parallel), transfer the members (`podman
-		/// save`/`load`), and have one `deploy --skip-build` assemble + push the list
-		/// from them. Must name an arch the manifest builds.
-		#[arg(long = "target")]
-		target: Option<Arch>,
-	},
-	/// Convert live, SSH-reachable hosts (stock Ubuntu/Debian/Rocky on a VPS) into
-	/// bootc systems **in place** with `bootc install to-existing-root`: build + a
-	/// destructive per-host rollout over the `[deploy] remotes` SSH channel. The
-	/// aggressive name is deliberate — this irreversibly wipes each target's current
-	/// OS. Afterwards each host is an ordinary bootc device on the same origin, so
-	/// `deploy`/`rotate` work against it unchanged. Each host must already
-	/// have `podman` and `sudo` installed (bootcher never mutates the foreign distro).
-	Takeover {
-		/// Admin SSH private key: its public half is installed on the new system, and
-		/// its private half is the identity bootcher reconnects with as `admin@host`
-		/// after the reboot (the stock cloud user is gone by then). Effectively
-		/// required; omit only to pick interactively on a TTY. See `provision`.
-		#[arg(long = "ssh-key")]
-		ssh_key: Option<String>,
-		/// Fleet-wide default stock cloud login for the *initial* connection
-		/// (`debian`/`ubuntu`/`cloud-user`/`root`), before the image's `admin`
-		/// user replaces it. Override per host with a remote's `takeover_login` in
-		/// bootcher.toml. There is no safe cross-distro default, so a host with
-		/// neither set is an error.
-		#[arg(long = "login")]
-		login: Option<String>,
-		/// See `provision`.
-		#[arg(long = "skip-pull-check")]
-		skip_pull_check: bool,
-		/// See `provision`.
-		#[arg(long = "anonymous")]
-		anonymous: bool,
-		/// Skip the interactive destructive-action confirmation (the scriptable/CI
-		/// path). Without it, a non-TTY run fails closed rather than wiping a host
-		/// unprompted.
-		#[arg(short = 'y', long = "yes")]
-		yes: bool,
-		/// Convert the hosts from the already-built container, skipping the container
-		/// build — for re-running against more hosts, or when an earlier `build`
-		/// already produced the image.
-		#[arg(long = "skip-build")]
-		skip_build: bool,
-		/// Take the hosts over onto this release channel instead of the default
-		/// `latest`: each host's bootc origin is set to `<registry>/<name>:<channel>`,
-		/// so it follows that channel from then on. Must be one of `[deploy] channels`
-		/// in bootcher.toml. Registry mode only.
-		#[arg(long = "channel")]
-		channel: Option<String>,
-	},
-	/// Image-signing helpers (registry mode). See `sign`.
-	#[command(subcommand)]
-	Sign(SignCmd),
-	/// Rotate a credential on the already-deployed devices in `[deploy] remotes`,
-	/// over the same SSH channel `deploy` uses — no rebuild or re-provision, just
-	/// the on-device secret replaced. See `rotate`.
-	#[command(subcommand)]
-	Rotate(RotateCmd),
-	/// Print the project's resolved facts (name, mode, the `<registry>/<name>` image
-	/// ref, channels, targets) from `bootcher.toml`. Like `podman info`: prints the
-	/// whole document by default (or with `--format json`), or extracts one value with
-	/// a `--format '{{ .Field }}'` template — so a script or CI pipeline reads a single
-	/// fact (e.g. the image ref for a scratch tag) instead of re-parsing the manifest.
+	/// Print the project's resolved facts (name, registry, the `<registry>/<name>`
+	/// image ref, channels, remotes, signing, targets) from `bootcher.toml`, offline.
+	/// Prints the whole document by default (or with `--format json`), or extracts one
+	/// value with a `--format '{{ .Field }}'` template.
 	Info {
-		/// Extract a value with a `podman info`-style Go-template subset
-		/// (`{{ .Image }}`, `{{ .Name }}`, `{{ .Targets.x86_64 }}`; fields match
-		/// case-insensitively), or pass `json` for the whole document as JSON. Omit
-		/// for the full document as pretty JSON.
-		#[arg(long = "format")]
-		format: Option<String>,
+		#[command(flatten)]
+		format: FormatArg,
+	},
+	/// Build the current checkout into `localhost/<name>:latest-<arch>` (plus the
+	/// local `localhost/<name>:latest` list when unscoped). Never publishes.
+	Build {
+		#[command(flatten)]
+		target: TargetArg,
 	},
 	/// Delete the bootcher cache (`~/.cache/bootcher`): the cross-arch builder VM
 	/// images.
 	Clean,
+	/// Devices: what they run, provisioning and takeover, updates, moves, credentials.
+	#[command(subcommand)]
+	Device(DeviceCmd),
+	/// Releases: named, signed images in the registry, built from a clean commit.
+	#[command(subcommand)]
+	Release(ReleaseCmd),
+	/// Channels: the tags devices follow, each a copy of some release.
+	#[command(subcommand)]
+	Channel(ChannelCmd),
+	/// Image signing: the key releases are signed with and channel devices trust.
+	#[command(subcommand)]
+	Signing(SigningCmd),
 }
 
-/// `bootcher sign <what>`: container-image signing helpers. Signing is opt-in via
-/// the `[deploy] registry` inline-table form (registry mode only); see `bootcher.toml`.
+// ------------------------------------------------------------------ shared args
+
+/// `-y/--yes`: proceed without asking. On a TTY it skips the confirmation; off a
+/// TTY it is required for any command that touches devices or moves a channel.
+#[derive(Args, Clone, Copy, Debug, Default)]
+struct YesArg {
+	/// Proceed without asking (required off a TTY).
+	#[arg(short = 'y', long = "yes")]
+	yes: bool,
+}
+
+/// `--remote <name>` (repeatable): restrict the device step to these remotes, named
+/// by their full destination or bare host.
+#[derive(Args, Clone, Debug, Default)]
+struct RemoteArgs {
+	/// Restrict the device step to this remote (repeatable): its destination as
+	/// written in `remotes`, or just its host.
+	#[arg(long = "remote", value_name = "NAME")]
+	remote: Vec<String>,
+}
+
+/// `--format`: the `info` template subset, plus `json`.
+#[derive(Args, Clone, Debug, Default)]
+struct FormatArg {
+	/// `json`, or a Go-template subset (`{{ .Field }}`, `{{ json .Field }}`; fields
+	/// match case-insensitively).
+	#[arg(long = "format")]
+	format: Option<String>,
+}
+
+/// `--target <arch>`: only where one arch makes sense alone.
+#[derive(Args, Clone, Copy, Debug, Default)]
+struct TargetArg {
+	/// Restrict to one architecture from `[targets]` (`aarch64` or `x86_64`).
+	#[arg(long = "target")]
+	target: Option<Arch>,
+}
+
+/// `--channel ch | --direct`: how a device receives updates.
+#[derive(Args, Clone, Debug, Default)]
+#[group(id = "mode", multiple = false)]
+struct ModeArgs {
+	/// Follow this declared channel (`[registry] channels`).
+	#[arg(long = "channel", value_name = "CHANNEL")]
+	channel: Option<String>,
+	/// Be updated over SSH from this machine (`bootcher device deploy`). Implied
+	/// without a `[registry]`.
+	#[arg(long = "direct")]
+	direct: bool,
+}
+
+impl ModeArgs {
+	fn mode(&self) -> Option<Mode> {
+		match (&self.channel, self.direct) {
+			(Some(ch), _) => Some(Mode::Channel(ch.clone())),
+			(None, true) => Some(Mode::Direct),
+			(None, false) => None,
+		}
+	}
+}
+
+/// The pull-credential flags, valid only with `--channel`.
+#[derive(Args, Clone, Copy, Debug, Default)]
+struct PullArgs {
+	/// The registry is public: install no pull credential.
+	#[arg(long = "anonymous", requires = "channel", conflicts_with = "direct")]
+	anonymous: bool,
+	/// Don't verify the pull credential from this machine (e.g. a registry only the
+	/// devices can reach). Each device still verifies it before committing it.
+	#[arg(long = "skip-pull-check", requires = "channel", conflicts_with = "direct")]
+	skip_pull_check: bool,
+}
+
+/// `--skip-build` for the commands that build here: reuse the
+/// `localhost/<name>:latest-<arch>` images already in local storage.
+#[derive(Args, Clone, Copy, Debug, Default)]
+struct SkipBuildArg {
+	/// Use the `localhost/<name>:latest-<arch>` images already in local storage
+	/// (however they got there) instead of building.
+	#[arg(long = "skip-build", conflicts_with = "channel")]
+	skip_build: bool,
+}
+
+/// `--skip-remotes`: skip the device step after moving a channel.
+#[derive(Args, Clone, Copy, Debug, Default)]
+struct SkipRemotesArg {
+	/// Move the channel but don't run the device step: devices pick it up on their
+	/// next auto-update.
+	#[arg(long = "skip-remotes")]
+	skip_remotes: bool,
+}
+
+// ------------------------------------------------------------------ device
+
 #[derive(Subcommand)]
-enum SignCmd {
-	/// Generate a cosign/sigstore signing keypair — `<prefix>.key` (private,
-	/// 0600, git-ignored) and `<prefix>.pub` (public, safe to commit). Set
-	/// `key` in `[deploy] registry`; the passphrase is read from
-	/// `BOOTCHER_SIGN_PASSPHRASE` or prompted.
+enum DeviceCmd {
+	/// What each remote runs: its class (channel, direct, foreign, unreachable),
+	/// origin, booted/staged digest and version, and for channel devices the release
+	/// and whether it lags its channel. Read-only.
+	Status {
+		#[command(flatten)]
+		remotes: RemoteArgs,
+		#[command(flatten)]
+		format: FormatArg,
+	},
+	/// Build disk images for new devices under `output/<arch>/<disk_type>/`. A
+	/// `--channel` device follows that channel (the images are pulled from it, never
+	/// built); a `--direct` one runs what's built here and is updated with `device
+	/// deploy`.
+	Provision {
+		#[command(flatten)]
+		mode: ModeArgs,
+		#[command(flatten)]
+		target: TargetArg,
+		/// Restrict the disks built for `--target` to these `image-builder` type(s)
+		/// (repeatable). Requires `--target`.
+		#[arg(long = "disk", requires = "target")]
+		disk: Vec<DiskType>,
+		/// Admin SSH private key to install (its `.pub` sibling is baked). Omit to
+		/// pick interactively on a TTY.
+		#[arg(long = "ssh-key")]
+		ssh_key: Option<String>,
+		#[command(flatten)]
+		skip_build: SkipBuildArg,
+		#[command(flatten)]
+		pull: PullArgs,
+	},
+	/// Convert live, SSH-reachable hosts (stock Ubuntu/Debian/Rocky on a VPS) into
+	/// bootc systems **in place**, irreversibly wiping their current OS. Each host
+	/// must already have `podman` and `sudo`.
+	Takeover {
+		#[command(flatten)]
+		mode: ModeArgs,
+		/// The hosts to convert (repeatable). Required off a TTY; never all remotes by
+		/// default.
+		#[command(flatten)]
+		remotes: RemoteArgs,
+		/// Fleet-wide stock cloud login for the initial connection (`debian`,
+		/// `ubuntu`, `cloud-user`, `root`); a remote's `takeover_login` overrides it.
+		#[arg(long = "login")]
+		login: Option<String>,
+		/// Admin SSH private key: installed on the new system and used to reconnect as
+		/// `admin@host` after the reboot.
+		#[arg(long = "ssh-key")]
+		ssh_key: Option<String>,
+		#[command(flatten)]
+		skip_build: SkipBuildArg,
+		#[command(flatten)]
+		pull: PullArgs,
+		#[command(flatten)]
+		yes: YesArg,
+	},
+	/// Build this checkout here (dirty trees welcome) and push it to the direct
+	/// devices. Never moves a device.
+	Deploy {
+		/// Push the images already in local storage instead of building.
+		#[arg(long = "skip-build")]
+		skip_build: bool,
+		#[command(flatten)]
+		remotes: RemoteArgs,
+		#[command(flatten)]
+		yes: YesArg,
+	},
+	/// Base patches for direct devices: rebuild the commit each one runs on the
+	/// current base and ship it back to just those devices.
+	Refresh {
+		#[command(flatten)]
+		remotes: RemoteArgs,
+		/// Rebuild (with `--no-cache`) even when the base hasn't moved.
+		#[arg(long = "force")]
+		force: bool,
+		#[command(flatten)]
+		yes: YesArg,
+	},
+	/// Move devices onto a channel or to direct — the only verb that moves a device.
+	Switch {
+		#[command(flatten)]
+		mode: ModeArgs,
+		/// The devices to move (repeatable). Required off a TTY.
+		#[command(flatten)]
+		remotes: RemoteArgs,
+		#[command(flatten)]
+		skip_build: SkipBuildArg,
+		#[command(flatten)]
+		pull: PullArgs,
+		#[command(flatten)]
+		yes: YesArg,
+	},
+	/// Rotate a credential on the devices, over SSH, without re-provisioning.
+	#[command(subcommand)]
+	Rotate(RotateCmd),
+}
+
+#[derive(Subcommand)]
+enum RotateCmd {
+	/// Replace the admin SSH key on every reachable remote, lockout-safe: the new key
+	/// is added beside the old one and the old one retired only once a fresh login
+	/// proves the new key works.
+	SshKey {
+		/// The new admin SSH private key (its `.pub` sibling is installed). Omit to
+		/// pick interactively on a TTY.
+		#[arg(long = "ssh-key")]
+		ssh_key: Option<String>,
+		#[command(flatten)]
+		remotes: RemoteArgs,
+		#[command(flatten)]
+		yes: YesArg,
+	},
+	/// Replace the registry pull credential on the channel devices, each verified
+	/// against its own channel before it's committed. From `BOOTCHER_PULL_USER` /
+	/// `BOOTCHER_PULL_TOKEN`, or prompted on a TTY.
+	PullToken {
+		/// Skip the local check that the new token authenticates.
+		#[arg(long = "skip-pull-check")]
+		skip_pull_check: bool,
+		#[command(flatten)]
+		remotes: RemoteArgs,
+		#[command(flatten)]
+		yes: YesArg,
+	},
+}
+
+// ------------------------------------------------------------------ release
+
+/// `--git-tag`: what to do with a git tag named like the release.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum GitTag {
+	/// Create an annotated tag at HEAD and push it upstream.
+	Push,
+	/// Create the annotated tag locally only.
+	Local,
+	/// Don't create one.
+	No,
+}
+
+#[derive(Subcommand)]
+enum ReleaseCmd {
+	/// Publish release `X` from a clean checkout: build every arch, push the signed
+	/// multi-arch index as `<registry>/<name>:X`. Idempotent: an `X` already built
+	/// from HEAD is left alone.
+	Publish {
+		/// The release name (any valid OCI tag that isn't a channel). Omit to be
+		/// asked on a TTY.
+		name: Option<String>,
+		/// Publish the `latest-<arch>` images already in local storage (each must
+		/// record HEAD as its `bootcher.source`) instead of building.
+		#[arg(long = "skip-build")]
+		skip_build: bool,
+		/// Rebuild and re-push `X` even though it already records HEAD.
+		#[arg(long = "rebuild", conflicts_with = "skip_build")]
+		rebuild: bool,
+		/// Afterwards, create a git tag named `X` at HEAD: `push` it upstream,
+		/// `local` only, or `no`. Off a TTY the default is `no`.
+		#[arg(long = "git-tag", value_enum)]
+		git_tag: Option<GitTag>,
+		/// Afterwards, promote `X` to this channel (`bootcher channel promote X CH`,
+		/// device step included).
+		#[arg(long = "promote", value_name = "CHANNEL")]
+		promote: Option<String>,
+		#[command(flatten)]
+		remotes: PromoteRemotes,
+	},
+	/// Rebuild release `X` on the current base (its stale arches, or all with
+	/// `--force`) from its recorded commit and re-push it. Moves no channel.
+	Refresh {
+		/// The release to refresh.
+		name: String,
+		/// Rebuild every arch (with `--no-cache`) even when the base hasn't moved.
+		#[arg(long = "force")]
+		force: bool,
+		/// Publish the `latest-<arch>` images already in local storage (each must
+		/// record the release's commit) instead of building.
+		#[arg(long = "skip-build")]
+		skip_build: bool,
+	},
+	/// The published releases: source commit, per-arch base status, and the channels
+	/// serving each. Read-only.
+	List {
+		#[command(flatten)]
+		format: FormatArg,
+	},
+}
+
+/// The device-step flags `release publish` takes only with `--promote`.
+#[derive(Args, Clone, Debug, Default)]
+struct PromoteRemotes {
+	/// Restrict the promote's device step to this remote (repeatable).
+	#[arg(long = "remote", value_name = "NAME", requires = "promote")]
+	remote: Vec<String>,
+	/// Promote but skip the device step.
+	#[arg(long = "skip-remotes", requires = "promote")]
+	skip_remotes: bool,
+	/// Proceed without asking (required off a TTY with `--promote`).
+	#[arg(short = 'y', long = "yes", requires = "promote")]
+	yes: bool,
+}
+
+// ------------------------------------------------------------------ channel
+
+#[derive(Subcommand)]
+enum ChannelCmd {
+	/// Per channel: the release it serves, its source commit, per-arch base
+	/// current/stale, and whether it lags its release. Read-only.
+	Status {
+		/// The channels to show (default: every declared one).
+		channels: Vec<String>,
+		/// `json`, or a template (`{{ .Release }}`, `{{ .Commit }}`, `{{ .Stale }}`)
+		/// when exactly one channel is selected.
+		#[arg(long = "format")]
+		format: Option<String>,
+	},
+	/// Point channel `CH` at release `X` (a byte-for-byte copy), then update the
+	/// devices following it.
+	Promote {
+		/// The release to promote. Omit to pick on a TTY.
+		release: Option<String>,
+		/// The channel to move. Omit to pick on a TTY.
+		channel: Option<String>,
+		/// Promote even though a member's base isn't the base's current digest.
+		#[arg(long = "allow-stale-base")]
+		allow_stale_base: bool,
+		#[command(flatten)]
+		remotes: RemoteArgs,
+		#[command(flatten)]
+		skip_remotes: SkipRemotesArg,
+		#[command(flatten)]
+		yes: YesArg,
+	},
+	/// Base patches for channels: rebuild the release each channel serves on the
+	/// current base (from its own commit), re-push it, re-copy the channels, then
+	/// update their devices.
+	Refresh {
+		/// The channels to refresh (default: every declared one).
+		channels: Vec<String>,
+		/// Leave this channel alone (repeatable).
+		#[arg(long = "exclude", value_name = "CHANNEL")]
+		exclude: Vec<String>,
+		/// Rebuild every arch (with `--no-cache`) even when the base hasn't moved.
+		#[arg(long = "force")]
+		force: bool,
+		/// Publish the `latest-<arch>` images already in local storage (each must
+		/// record the served release's commit) instead of building. The selected
+		/// channels must serve a single release.
+		#[arg(long = "skip-build")]
+		skip_build: bool,
+		#[command(flatten)]
+		remotes: RemoteArgs,
+		#[command(flatten)]
+		skip_remotes: SkipRemotesArg,
+		#[command(flatten)]
+		yes: YesArg,
+	},
+}
+
+// ------------------------------------------------------------------ signing
+
+#[derive(Subcommand)]
+enum SigningCmd {
+	/// Turn signing on: write a cosign keypair (`<prefix>.key` private, `<prefix>.pub`
+	/// public), set `[registry] key`, and bake the install drop-in. On a running
+	/// fleet, also sign every release a channel serves and install the trust files on
+	/// the channel devices.
 	Enroll {
 		/// Output filename prefix (`<prefix>.key` + `<prefix>.pub`).
 		#[arg(default_value = "cosign")]
 		prefix: String,
-		/// Overwrite an existing `<prefix>.key`, any image signed with the old key becomes unverifiable.
-		#[arg(short = 'f', long = "force")]
-		force: bool,
+		#[command(flatten)]
+		remotes: RemoteArgs,
+		#[command(flatten)]
+		yes: YesArg,
 	},
-	/// Verify that a registry image carries a valid cosign/sigstore signature
-	/// from a given public key — the same check a signing-enforcing device
-	/// performs on `bootc upgrade`. Exits 0 on success; useful as a post-deploy
-	/// sanity check in CI. Registry mode only.
+	/// Rotate the signing key with no window in which a device rejects what its
+	/// channel serves: add a new key, sign every served release with it, trust old +
+	/// new on the channel devices, then point `[registry] key` at the new key.
+	Rotate {
+		/// Output filename prefix for the new key (default: `cosign-<fingerprint>`).
+		prefix: Option<String>,
+		#[command(flatten)]
+		remotes: RemoteArgs,
+		#[command(flatten)]
+		yes: YesArg,
+	},
+	/// Trust only the current key on the channel devices and delete the others. Run
+	/// it once every device — including ones not in `remotes` — has the new key.
+	Retire {
+		#[command(flatten)]
+		remotes: RemoteArgs,
+		#[command(flatten)]
+		yes: YesArg,
+	},
+	/// Verify that an image carries a valid signature from the configured (or given)
+	/// public key — the same check a channel device performs on `bootc upgrade`.
 	Verify {
-		/// Fully-qualified image reference to verify
-		/// (e.g. `reg.example.com/org/name:tag`).
+		/// A full image ref, or a bare release or channel name resolved against the
+		/// project image (`<registry>/<name>:<tag>`).
 		image: String,
-		/// Path to the cosign/sigstore public key (`.pub` from `bootcher sign
-		/// enroll`). Defaults to the public key from `key` in `[deploy] registry`
-		/// in `bootcher.toml`.
-		#[arg(long)]
-		pubkey: Option<String>,
-		/// Verify the registry's TLS certificate. Pass `--tls-verify=false` for
-		/// a plain-HTTP registry (e.g. a local test registry).
-		#[arg(long = "tls-verify", default_value_t = true, action = clap::ArgAction::Set)]
-		tls_verify: bool,
-	},
-}
-
-/// `bootcher rotate <what>`: which on-device credential to roll. The targets are
-/// the `[deploy] remotes` devices; the new value is collected the same way
-/// `provision` collects it (TTY prompt, or env on a non-TTY run).
-#[derive(Subcommand)]
-enum RotateCmd {
-	/// Replace the registry pull token (`/etc/ostree/auth.json`) on each deployed
-	/// device with a freshly collected one — for when the registry deploy token
-	/// has expired or been revoked, without re-provisioning. Registry mode only; the
-	/// new credential is prompted on a TTY, or read from `BOOTCHER_PULL_USER` /
-	/// `BOOTCHER_PULL_TOKEN` on a non-TTY run, exactly like `provision`.
-	PullToken {
-		/// Skip the eager local pre-flight that the new token authenticates before
-		/// the rollout starts. Each device still verifies the token before committing it.
-		#[arg(long = "skip-pull-check")]
-		skip_pull_check: bool,
-	},
-	/// Replace the admin SSH key (`/etc/ssh/authorized_keys.d/admin`) on each
-	/// deployed device with a freshly collected one — for when the admin keypair is
-	/// being rolled, without re-provisioning. Lockout-safe: the new key is added
-	/// *alongside* the old one and the old one is retired only after a fresh login
-	/// proves the new key works, so an interrupted run leaves both keys valid. The
-	/// new key is picked with the same mechanism as `provision`.
-	SshKey {
-		/// Admin SSH private key to roll to, or omit to pick from `~/.ssh/` on a
-		/// TTY (same as `provision`). The public key is read from the `<path>.pub`
-		/// sibling and injected into the device's `authorized_keys`.
-		#[arg(long)]
-		path: Option<String>,
-	},
-	/// Replace the image-**signing** key trusted on each device (registry mode) —
-	/// for a leaked or expiring cosign key, without re-provisioning. `SSHes` into every
-	/// `[deploy] remotes` device and atomically replaces its trusted signing key.
-	/// Defaults to the public key from `[deploy] registry` in bootcher.toml; pass
-	/// `--pubkey` to rotate to a different key. The next `bootcher deploy`
-	/// re-signs with the new key; any upgrade attempt in the interim will fail and retry cleanly.
-	SignKey {
-		/// The new signing public key (a `.pub` path, e.g. from `bootcher sign
-		/// enroll`). Defaults to the key from `[deploy] registry` in bootcher.toml.
+		/// Path to the public key (default: the `.pub` of `[registry] key`).
 		#[arg(long)]
 		pubkey: Option<String>,
 	},
@@ -298,11 +511,10 @@ fn main() -> ExitCode {
 	}
 	match result {
 		Ok(()) => ExitCode::SUCCESS,
-		// An interrupt unwinds as an ordinary error, but it isn't a failure to
-		// report as one: print a terse note and exit 130 (128 + SIGINT), the
-		// conventional status for a signal-terminated process. Keyed off the
-		// signal flag rather than the error text so any error raised mid-unwind
-		// still reports as the interruption it was.
+		// An interrupt (a signal, or Esc/Ctrl-C in a prompt) unwinds as an ordinary
+		// error, but it isn't a failure to report as one: print a terse note and exit
+		// 130 (128 + SIGINT). Keyed off the signal flag rather than the error text so
+		// any error raised mid-unwind still reports as the interruption it was.
 		Err(_) if bootcher_core::signals::interrupted() => {
 			eprintln!("interrupted");
 			ExitCode::from(130)
@@ -321,177 +533,245 @@ fn run() -> Result<()> {
 	// leaking them.
 	bootcher_core::signals::install()?;
 	let cli = Cli::parse();
-	// The path the global `--manifest` selects (default `./bootcher.toml`). `init`
-	// ignores it — it always scaffolds a fresh `bootcher.toml` — but every other
-	// subcommand loads the manifest from here.
 	let manifest_path = cli.manifest.as_str();
+	let load = || Manifest::load(manifest_path);
 	match cli.cmd {
-		Cmd::Init { name, yes, force, fedora_release } => {
-			jobs::init::run(name, yes, force, fedora_release)
+		Cmd::Init { name, yes, force, fedora_release, registry, channel, sign } => {
+			let registry = jobs::init::RegistryArgs { url: registry, channels: channel, sign };
+			jobs::init::run(name, yes, force, fedora_release, registry)
 		}
-		Cmd::Provision {
-			ssh_key,
-			skip_pull_check,
-			anonymous,
-			target,
-			disk,
-			skip_build,
-			channel,
-		} => {
-			let manifest = Manifest::load(manifest_path)?;
-			// Validate the `--target`/`--disk` selection once up front (no manifest
-			// narrowing); the selection is then threaded to each phase, which projects
-			// the manifest through it. The `--channel` is resolved/validated the same way.
-			manifest.check_selection(target, &disk)?;
-			let channel = manifest.resolve_channel(channel.as_deref())?;
-			pipelines::provision::preflight(&manifest, target, skip_build)?;
-			let config = jobs::secrets::Provisioning::collect(
-				&manifest,
-				ssh_key.as_deref(),
-				skip_pull_check,
-				anonymous,
-			)?
-			.blueprint()?;
-			pipelines::provision::run(&manifest, target, &disk, Some(&config), skip_build, &channel)
-		}
-		Cmd::Deploy { skip_bootc_upgrade, skip_build, channel } => {
-			let manifest = Manifest::load(manifest_path)?;
-			let channel = manifest.resolve_channel(channel.as_deref())?;
-			pipelines::deploy::preflight(&manifest, skip_bootc_upgrade, skip_build)?;
-			pipelines::deploy::run(&manifest, skip_bootc_upgrade, skip_build, &channel)
-		}
-		Cmd::Build { target } => {
-			let manifest = Manifest::load(manifest_path)?;
-			// `--target <arch>` scopes the build to one arch and, being `Some`, makes
-			// `build::run` stop at the per-arch member instead of assembling
-			// `localhost/<name>:latest` (the producer half of a split CI pipeline). A
-			// bare `build` (`None`) builds every arch and assembles the list.
-			manifest.check_selection(target, &[])?;
-			jobs::build::preflight(&manifest, target)?;
-			jobs::build::run(&manifest, target, &mut Scope::standalone())
-		}
-		Cmd::Takeover { ssh_key, login, skip_pull_check, anonymous, yes, skip_build, channel } => {
-			let manifest = Manifest::load(manifest_path)?;
-			let channel = manifest.resolve_channel(channel.as_deref())?;
-			// Pre-flight before collecting secrets or building: local build tools, plus
-			// the per-host over-SSH readiness checks (podman/sudo, arch, layout) — so a
-			// disqualified host fails fast rather than after a multi-GB build.
-			pipelines::takeover::preflight(&manifest, login.as_deref(), skip_build)?;
-			// Collect the same secret set provision bakes, plus the resolved admin
-			// private key path — takeover needs it as the post-reboot `admin@host`
-			// identity, not just the public half baked into authorized_keys.
-			let (provisioning, key_path) = jobs::secrets::Provisioning::collect_with_key(
-				&manifest,
-				ssh_key.as_deref(),
-				skip_pull_check,
-				anonymous,
-			)?;
-			let key_path = key_path.to_str().context("admin SSH key path is not valid UTF-8")?;
-			// Name every target and gate on the destructive confirmation before the run.
-			let hosts: Vec<String> =
-				manifest.deploy_remotes().to_ssh().iter().map(|s| s.host().to_owned()).collect();
-			jobs::takeover::confirm(&hosts, yes)?;
-			pipelines::takeover::run(
-				&manifest,
-				login.as_deref(),
-				&provisioning,
-				key_path,
-				skip_build,
-				&channel,
-				yes,
-			)
-		}
-		Cmd::Sign(cmd) => run_sign(cmd, manifest_path),
-		Cmd::Rotate(cmd) => run_rotate(cmd, manifest_path),
 		Cmd::Info { format } => {
-			let manifest = Manifest::load(manifest_path)?;
-			let info = jobs::info::Info::from_manifest(&manifest);
-			println!("{}", jobs::info::render(&info, format.as_deref())?);
+			let info = jobs::info::Info::from_manifest(&load()?);
+			println!("{}", jobs::info::render(&info, format.format.as_deref())?);
 			Ok(())
 		}
+		Cmd::Build { target } => {
+			let manifest = load()?;
+			// `--target <arch>` scopes the build to one arch and stops at the per-arch
+			// member (the producer half of a split CI pipeline); a bare `build` builds
+			// every arch and assembles `localhost/<name>:latest`.
+			manifest.check_selection(target.target, &[])?;
+			jobs::build::preflight(&manifest, target.target)?;
+			jobs::build::run(&manifest, target.target, &mut Scope::standalone())
+		}
 		Cmd::Clean => cache::clean(),
+		Cmd::Device(cmd) => run_device(cmd, &load()?),
+		Cmd::Release(cmd) => run_release(cmd, &load()?),
+		Cmd::Channel(cmd) => run_channel(cmd, &load()?),
+		Cmd::Signing(cmd) => run_signing(cmd, manifest_path),
 	}
 }
 
-/// `bootcher sign <cmd>`. `enroll` generates a keypair in-process (no external
-/// tools); `verify` shells out to `podman`, so it preflights that.
-fn run_sign(cmd: SignCmd, manifest_path: &str) -> Result<()> {
+fn run_device(cmd: DeviceCmd, manifest: &Manifest) -> Result<()> {
 	match cmd {
-		SignCmd::Enroll { prefix, force } => {
-			let enrolled =
-				jobs::signing::enable_signing(std::path::Path::new("."), &prefix, force)?;
-			let jobs::signing::Enrolled { key, public, registry_patched } = enrolled;
-			if registry_patched {
-				eprintln!(
-					"sign: wrote {key} (private — keep it secret; the scaffold .gitignore covers \
-					 *.key), {public}, patched bootcher.toml, and wrote {}.",
-					jobs::signing::ENFORCE_SIGPOLICY_PATH
-				);
-			} else {
+		DeviceCmd::Status { remotes, format } => {
+			device::status(manifest, &remotes.remote, format.format.as_deref())
+		}
+		DeviceCmd::Provision { mode, target, disk, ssh_key, skip_build, pull } => {
+			device::provision(
+				manifest,
+				&device::ProvisionArgs {
+					mode: mode.mode(),
+					target: target.target,
+					disks: disk,
+					ssh_key,
+					skip_build: skip_build.skip_build,
+					skip_pull_check: pull.skip_pull_check,
+					anonymous: pull.anonymous,
+				},
+			)
+		}
+		DeviceCmd::Takeover { mode, remotes, login, ssh_key, skip_build, pull, yes } => {
+			device::takeover(
+				manifest,
+				&device::TakeoverArgs {
+					mode: mode.mode(),
+					remotes: remotes.remote,
+					login,
+					ssh_key,
+					skip_build: skip_build.skip_build,
+					skip_pull_check: pull.skip_pull_check,
+					anonymous: pull.anonymous,
+					yes: yes.yes,
+				},
+			)
+		}
+		DeviceCmd::Deploy { skip_build, remotes, yes } => {
+			device::deploy(manifest, skip_build, &remotes.remote, yes.yes)
+		}
+		DeviceCmd::Refresh { remotes, force, yes } => {
+			let _ = (remotes, force, yes);
+			anyhow::bail!("`device refresh` is not implemented yet")
+		}
+		DeviceCmd::Switch { mode, remotes, skip_build, pull, yes } => device::switch(
+			manifest,
+			&device::SwitchArgs {
+				mode: mode.mode(),
+				remotes: remotes.remote,
+				skip_build: skip_build.skip_build,
+				anonymous: pull.anonymous,
+				skip_pull_check: pull.skip_pull_check,
+				yes: yes.yes,
+			},
+		),
+		DeviceCmd::Rotate(RotateCmd::SshKey { ssh_key, remotes, yes }) => {
+			device::rotate_ssh_key(manifest, ssh_key.as_deref(), &remotes.remote, yes.yes)
+		}
+		DeviceCmd::Rotate(RotateCmd::PullToken { skip_pull_check, remotes, yes }) => {
+			device::rotate_pull_token(manifest, skip_pull_check, &remotes.remote, yes.yes)
+		}
+	}
+}
+
+fn run_release(cmd: ReleaseCmd, manifest: &Manifest) -> Result<()> {
+	let _ = (cmd, manifest);
+	anyhow::bail!("the `release` commands are not implemented yet")
+}
+
+fn run_channel(cmd: ChannelCmd, manifest: &Manifest) -> Result<()> {
+	let _ = (cmd, manifest);
+	anyhow::bail!("the `channel` commands are not implemented yet")
+}
+
+fn run_signing(cmd: SigningCmd, manifest_path: &str) -> Result<()> {
+	match cmd {
+		SigningCmd::Enroll { prefix, remotes, yes } => {
+			let _ = (remotes, yes);
+			let manifest = Manifest::load(manifest_path)?;
+			if manifest.signing().is_some() {
 				anyhow::bail!(
-					"keypair written ({key}, {public}) but no `registry` entry found in \
-					 bootcher.toml — add `[deploy] registry = {{ url = \"<url>\", key = \"{key}\" }}`, \
-					 commit {public}, then run `bootcher provision`/`deploy`"
+					"a signing key is already configured (`[registry] key`) — use `bootcher signing rotate`"
 				);
 			}
+			let jobs::signing::Enrolled { key, public } =
+				jobs::signing::enable_signing(manifest.root(), &prefix)?;
+			eprintln!(
+				"signing: wrote {key} (private — keep it secret; the scaffold .gitignore covers \
+				 *.key), {public}, set `[registry] key`, and wrote {}.",
+				jobs::signing::ENFORCE_SIGPOLICY_PATH
+			);
 			Ok(())
 		}
-		SignCmd::Verify { image, pubkey, tls_verify } => {
+		SigningCmd::Rotate { .. } | SigningCmd::Retire { .. } => {
+			anyhow::bail!("`signing rotate` and `signing retire` are not implemented yet")
+		}
+		SigningCmd::Verify { image, pubkey } => {
 			jobs::signing::preflight_verify()?;
-			let pubkey_path = if let Some(p) = pubkey {
+			let manifest = Manifest::load(manifest_path).ok();
+			let image_ref = resolve_image(manifest.as_ref(), &image)?;
+			let pubkey = if let Some(p) = pubkey {
 				std::path::PathBuf::from(p)
 			} else {
-				let manifest = Manifest::load(manifest_path)?;
-				let signing = manifest.signing().ok_or_else(|| {
-					anyhow::anyhow!(
-						"no signing key configured in `[deploy] registry`; pass `--pubkey` explicitly"
-					)
+				let signing = manifest.as_ref().and_then(Manifest::signing).ok_or_else(|| {
+					anyhow::anyhow!("no signing key configured in `[registry]`; pass `--pubkey`")
 				})?;
 				std::path::PathBuf::from(signing.public_key_path())
 			};
-			jobs::signing::verify(&image, &pubkey_path, tls_verify, &Scope::standalone())
+			jobs::signing::verify(&image_ref, &pubkey, &Scope::standalone())
 		}
 	}
 }
 
-/// `bootcher rotate <cmd>`: each reaches the deployed devices over ssh; the
-/// pull-token path additionally pre-flights the new token locally via podman
-/// (unless `--skip-pull-check`).
-fn run_rotate(cmd: RotateCmd, manifest_path: &str) -> Result<()> {
-	let manifest = Manifest::load(manifest_path)?;
-	let pull_check = matches!(&cmd, RotateCmd::PullToken { skip_pull_check } if !skip_pull_check);
-	jobs::rotate::preflight(pull_check)?;
-	match cmd {
-		RotateCmd::PullToken { skip_pull_check } => {
-			jobs::rotate::registry_token(&manifest, skip_pull_check, &mut Scope::standalone())
-		}
-		RotateCmd::SshKey { path } => {
-			jobs::rotate::ssh_key(&manifest, path.as_deref(), &mut Scope::standalone())
-		}
-		RotateCmd::SignKey { pubkey } => {
-			jobs::rotate::signing_key(&manifest, pubkey.as_deref(), &mut Scope::standalone())
-		}
+/// A full image ref as given, or a bare release/channel name (no `/`) resolved
+/// against the project image.
+fn resolve_image(manifest: Option<&Manifest>, image: &str) -> Result<String> {
+	if image.contains('/') {
+		return Ok(image.to_owned());
 	}
+	manifest.and_then(|m| m.tag_ref(image)).ok_or_else(|| {
+		anyhow::anyhow!(
+			"`{image}` isn't a full image ref, and there's no project `[registry]` to resolve it \
+			 against — pass `<registry>/<name>:<tag>`"
+		)
+	})
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
 
-	fn sign_verify_tls(flags: &[&str]) -> bool {
-		let base = ["bootcher", "sign", "verify", "reg.example.com/org/name:tag"];
-		let cli = Cli::try_parse_from(base.iter().chain(flags)).unwrap();
-		match cli.cmd {
-			Cmd::Sign(SignCmd::Verify { tls_verify, .. }) => tls_verify,
-			_ => unreachable!(),
+	fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+		Cli::try_parse_from(std::iter::once("bootcher").chain(args.iter().copied()))
+	}
+
+	#[test]
+	fn the_tree_is_grouped_by_domain() {
+		for args in [
+			&["device", "status"][..],
+			&["device", "deploy", "-y", "--remote", "a", "--remote", "b"],
+			&["device", "provision", "--channel", "stable", "--target", "x86_64", "--disk", "raw"],
+			&["device", "switch", "--direct", "--remote", "k", "--skip-build"],
+			&["device", "rotate", "ssh-key", "--ssh-key", "k"],
+			&["device", "rotate", "pull-token", "--skip-pull-check"],
+			&["release", "publish", "v1.4", "--promote", "next", "-y", "--skip-remotes"],
+			&["release", "refresh", "v1.3", "--force"],
+			&["release", "list", "--format", "json"],
+			&["channel", "status", "stable", "--format", "{{ .Stale }}"],
+			&["channel", "promote", "v1.4", "stable", "--allow-stale-base"],
+			&["channel", "refresh", "--exclude", "stable", "--skip-build", "-y"],
+			&["signing", "enroll"],
+			&["signing", "verify", "v1.4"],
+		] {
+			parse(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+		}
+		// No top-level aliases for the old flat commands.
+		for old in ["deploy", "provision", "takeover", "rotate", "sign"] {
+			assert!(parse(&[old]).is_err(), "{old}");
 		}
 	}
 
 	#[test]
-	fn sign_verify_tls_verify_takes_a_value() {
-		assert!(sign_verify_tls(&[]));
-		assert!(!sign_verify_tls(&["--tls-verify=false"]));
-		assert!(!sign_verify_tls(&["--tls-verify", "false"]));
-		assert!(sign_verify_tls(&["--tls-verify=true"]));
+	fn mode_flags_are_exclusive_and_gate_their_options() {
+		assert!(parse(&["device", "provision", "--channel", "a", "--direct"]).is_err());
+		// The pull flags need `--channel`; `--skip-build` conflicts with it.
+		assert!(parse(&["device", "provision", "--direct", "--anonymous"]).is_err());
+		assert!(parse(&["device", "provision", "--skip-pull-check"]).is_err());
+		assert!(
+			parse(&["device", "provision", "--channel", "a", "--anonymous", "--skip-pull-check"])
+				.is_ok()
+		);
+		assert!(parse(&["device", "provision", "--channel", "a", "--skip-build"]).is_err());
+		assert!(parse(&["device", "switch", "--channel", "a", "--skip-build"]).is_err());
+		assert!(parse(&["device", "takeover", "--direct", "--anonymous"]).is_err());
+		// `--disk` needs `--target`.
+		assert!(parse(&["device", "provision", "--disk", "raw"]).is_err());
+		let cli = parse(&["device", "switch", "--channel", "next"]).unwrap();
+		let Cmd::Device(DeviceCmd::Switch { mode, .. }) = cli.cmd else { unreachable!() };
+		assert_eq!(mode.mode(), Some(Mode::Channel("next".into())));
+	}
+
+	#[test]
+	fn publish_device_flags_need_promote() {
+		assert!(parse(&["release", "publish", "v1", "-y"]).is_err());
+		assert!(parse(&["release", "publish", "v1", "--remote", "a"]).is_err());
+		assert!(parse(&["release", "publish", "v1", "--skip-remotes"]).is_err());
+		assert!(parse(&["release", "publish", "v1", "--rebuild", "--skip-build"]).is_err());
+		let cli = parse(&["release", "publish", "v1", "--git-tag", "local"]).unwrap();
+		let Cmd::Release(ReleaseCmd::Publish { git_tag, .. }) = cli.cmd else { unreachable!() };
+		assert_eq!(git_tag, Some(GitTag::Local));
+	}
+
+	#[test]
+	fn read_only_commands_take_no_yes() {
+		assert!(parse(&["device", "status", "-y"]).is_err());
+		assert!(parse(&["release", "list", "-y"]).is_err());
+		assert!(parse(&["channel", "status", "-y"]).is_err());
+		assert!(parse(&["signing", "verify", "x", "-y"]).is_err());
+	}
+
+	#[test]
+	fn verify_drops_tls_verify() {
+		assert!(parse(&["signing", "verify", "r/o/x:1", "--tls-verify=false"]).is_err());
+	}
+
+	#[test]
+	fn bare_names_resolve_against_the_project_image() {
+		let m: Manifest = toml::from_str(
+			"[general]\nname = \"kiosk\"\n[registry]\nurl = \"r.io/o\"\nchannels = [\"stable\"]\n",
+		)
+		.unwrap();
+		assert_eq!(resolve_image(Some(&m), "v1.4").unwrap(), "r.io/o/kiosk:v1.4");
+		assert_eq!(resolve_image(Some(&m), "q.io/a/b:c").unwrap(), "q.io/a/b:c");
+		assert!(resolve_image(None, "v1.4").is_err());
 	}
 }

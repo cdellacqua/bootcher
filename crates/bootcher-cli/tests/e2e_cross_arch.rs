@@ -133,7 +133,7 @@ impl Harness {
 
 	/// `bootcher provision` for the cross arch: the container builds locally under
 	/// qemu-user, the disk image builds inside the foreign builder VM (`image =
-	/// "vm"`). LAN mode, so only the admin key is collected.
+	/// "vm"`). A direct device, so only the admin key is collected.
 	fn provision(&self, expect: &str) {
 		eprintln!(
 			"e2e/cross: provisioning ({expect}) — boots a foreign builder VM under TCG, very slow"
@@ -181,8 +181,8 @@ impl Harness {
 	}
 
 	fn bootcher(&self, args: &[&str]) -> AssertCommand {
-		// No agent socket: cross-arch provision is LAN mode but bootcher's ssh isn't
-		// exercised here (provision only builds), and the e2e uses raw `-i key` ssh.
+		// No agent socket: a direct provision only collects the admin key, bootcher's ssh
+		// isn't exercised here (provision only builds), and the e2e uses raw `-i key` ssh.
 		let mut c = common::bootcher_cmd(&self.proj, self.home.path(), STORE_DIR, None);
 		c.args(args)
 			// Persist the builder VM's cloud-image download + prepared overlay across

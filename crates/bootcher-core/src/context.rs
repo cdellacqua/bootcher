@@ -12,13 +12,28 @@ use crate::ssh::Ssh;
 /// directory as a bootcher project; [`Manifest::load`] parses it.
 pub const MANIFEST: &str = "bootcher.toml";
 
-/// The implicit default release channel every project ships, used as the mutable
-/// registry tag (`<registry>/<name>:latest`) when no `--channel` is given. It's
-/// always valid without being declared in `[deploy] channels` (see
-/// [`Manifest::resolve_channel`]); a single-channel project never names a channel
-/// at all. The OCI-conventional `latest`, kept so existing devices — provisioned
-/// against `:latest` before channels existed — stay on their channel untouched.
-pub const DEFAULT_CHANNEL: &str = "latest";
+/// The image-config label every member is stamped with at build time, naming the
+/// commit it was built from (`git rev-parse HEAD`). Only a clean work tree stamps a
+/// commit; a dirty tree, or a project outside git, stamps it empty, so a dirty build
+/// can never pass a source check (an inherited value from the base is overwritten
+/// either way). The `release` and `channel` commands read it to decide which commit a
+/// release records, and the refreshes rebuild that commit.
+pub const SOURCE_LABEL: &str = "bootcher.source";
+
+/// The manifest-list (index) annotation naming the release a list was published as
+/// (`bootcher release publish X`). Written when the list is assembled, so the build
+/// never needs to know the release; a channel, being a byte-for-byte copy of a
+/// release's index, carries it too.
+pub const RELEASE_ANNOTATION: &str = "bootcher.release";
+
+/// The OCI annotation buildah stamps on every image built `FROM` a registry image,
+/// naming that base (`quay.io/fedora/fedora-bootc:44`).
+pub const BASE_NAME_ANNOTATION: &str = "org.opencontainers.image.base.name";
+
+/// The OCI annotation buildah stamps with the base's **per-arch** manifest digest
+/// at build time. Compared against the base's current digest to tell whether a
+/// newer base (a patch) has been published since.
+pub const BASE_DIGEST_ANNOTATION: &str = "org.opencontainers.image.base.digest";
 
 /// Directory `bootcher init` writes the generated JSON Schemas into (the manifest
 /// schema [`SCHEMA`] and the hook-metadata schema), keeping them out of the
@@ -241,12 +256,12 @@ pub enum Rootfs {
 	Btrfs,
 }
 
-/// The per-project manifest, parsed from [`MANIFEST`] in the project root (the
-/// cwd). A bootcher project is a single image: the manifest names it (used for
-/// the container tag and the output dir) and everything else is convention
-/// relative to the project root — the `Containerfile` and the `sysroot/` overlay
-/// live alongside it. Keys live under tables (`[general]`, `[builder]`,
-/// `[deploy]`, `[concurrency]`, `[hooks]`) to leave room for future sections.
+/// The per-project manifest, parsed from [`MANIFEST`] in the project root. A
+/// bootcher project is a single image: the manifest names it (used for the
+/// container tag and the output dir) and everything else is convention relative to
+/// the project root — the `Containerfile` and the `sysroot/` overlay live alongside
+/// it. Keys live under tables (`[general]`, `[targets]`, `[builder]`, `[registry]`,
+/// `[concurrency]`, `[hooks]`) plus the top-level `remotes` device list.
 #[derive(Clone, Debug, Deserialize, Serialize, schemars::JsonSchema)]
 #[schemars(title = "bootcher.toml", description = "The bootcher project manifest.")]
 pub struct Manifest {
@@ -259,6 +274,13 @@ pub struct Manifest {
 	/// never appears in a serialized manifest. See [`Manifest::load`].
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub extend: Option<String>,
+	/// The devices bootcher reaches over SSH (`device deploy`, `device status`, the
+	/// channel device steps, `device rotate`, `device takeover`). Each entry is a bare
+	/// `[user@]host` or a table with per-device `ssh_opts`; see [`RemoteConfig`]. There
+	/// is no per-device mode or channel: what a device follows is read live from the
+	/// device itself. Defaults to no devices.
+	#[serde(default)]
+	pub remotes: Vec<RemoteConfig>,
 	pub general: General,
 	/// The build matrix (`[targets]`): each target arch mapped to the
 	/// `image-builder` disk type(s) to render it as. See [`Targets`]. The present
@@ -270,38 +292,42 @@ pub struct Manifest {
 	/// all-`local` when the table is absent.
 	#[serde(default)]
 	pub builder: BuilderConfig,
-	/// Deployment targets; see [`DeployConfig`]. Defaults to no targets when the
-	/// table is absent.
-	#[serde(default)]
-	pub deploy: DeployConfig,
+	/// The registry releases and channels are published to; see [`RegistryConfig`].
+	/// Absent for a project that only updates its devices directly over SSH.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub registry: Option<RegistryConfig>,
 	/// Per-activity caps on parallel worker counts; see [`ConcurrencyConfig`].
 	/// Defaults to unbounded (host core count) for every activity when the table
 	/// is absent, and is omitted from a freshly serialized manifest so `bootcher
 	/// init` can document it with commented examples instead of an empty table.
 	#[serde(default, skip_serializing_if = "ConcurrencyConfig::is_empty")]
 	pub concurrency: ConcurrencyConfig,
-	/// Lifecycle hook commands wrapping the build/image/upgrade phases; see [`Hooks`].
+	/// Lifecycle hook commands wrapping bootcher's phases; see [`Hooks`].
 	/// Defaults to no hooks when the table is absent, and is omitted from a
 	/// freshly serialized manifest so `bootcher init` can document it with
 	/// commented examples instead of an empty table.
 	#[serde(default, skip_serializing_if = "Hooks::is_empty")]
 	pub hooks: Hooks,
+	/// The project directory this manifest describes: the build context, the root
+	/// every relative path resolves against, the hooks' working directory, and the
+	/// tree git provenance is read from. Set by [`Manifest::load_in`]; the current
+	/// directory unless a refresh loads a commit's own config from a temporary
+	/// worktree. Never part of the file.
+	#[serde(skip)]
+	#[schemars(skip)]
+	pub root: PathBuf,
 }
 
-/// Opt-in cosign/sigstore image signing config, embedded in [`RegistryConfig::WithSigning`].
-/// When present, `deploy`/`upgrade` sign the pushed multi-arch image with the local private
-/// key, `provision` injects the matching public key + a signature-requiring `policy.json`
-/// into the device's `/etc`, and the device's bootc origin is recorded with the verifying
-/// `ostree-image-signed:` scheme — so a tampered or unsigned push is rejected on `bootc upgrade`.
-///
-/// ```toml
-/// [deploy]
-/// registry = { url = "registry.example.com/org", key = "cosign.key" }
-/// ```
+/// Opt-in cosign/sigstore image signing config, derived from [`RegistryConfig::key`].
+/// When present, every publish signs the pushed release with the local private key,
+/// a channel device gets the matching public key + a signature-requiring
+/// `policy.json` (provision, takeover, and every channel device step install them),
+/// and the image's install drop-in records a verifying `ostree-image-signed` origin —
+/// so a tampered or unsigned push is rejected on `bootc upgrade`.
 ///
 /// The public key is always the `<key>.pub` sibling (`cosign.key` → `cosign.pub`),
-/// matching the naming `bootcher sign enroll` produces. The signing **passphrase** is
-/// never stored here: it's read from `BOOTCHER_SIGN_PASSPHRASE` (or prompted on a TTY),
+/// matching the naming `bootcher signing enroll` produces. The signing **passphrase**
+/// is never stored: it's read from `BOOTCHER_SIGN_PASSPHRASE` (or prompted on a TTY),
 /// mirroring the registry pull token (see [`crate::jobs::secrets`]).
 #[derive(Clone, Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SigningConfig {
@@ -318,13 +344,19 @@ impl SigningConfig {
 	/// gets `.pub` appended.
 	#[must_use]
 	pub fn public_key_path(&self) -> String {
-		for ext in [".key", ".private"] {
-			if let Some(stem) = self.key.strip_suffix(ext) {
-				return format!("{stem}.pub");
-			}
-		}
-		format!("{}.pub", self.key)
+		public_key_path(&self.key)
 	}
+}
+
+/// The `.pub` sibling of a private-key path (see [`SigningConfig::public_key_path`]).
+#[must_use]
+pub fn public_key_path(key: &str) -> String {
+	for ext in [".key", ".private"] {
+		if let Some(stem) = key.strip_suffix(ext) {
+			return format!("{stem}.pub");
+		}
+	}
+	format!("{key}.pub")
 }
 
 /// Schema-only mirror of a [`Targets`] entry's accepted shapes: a bare
@@ -616,8 +648,8 @@ pub struct ArchBuilder {
 	pub image: Option<BuilderSpec>,
 }
 
-/// One entry in the `[deploy] remotes` array. Two interchangeable shapes, so the
-/// common case stays terse and the rare per-target tweak doesn't force every entry
+/// One entry in the top-level `remotes` array. Two interchangeable shapes, so the
+/// common case stays terse and the rare per-device tweak doesn't force every entry
 /// into the verbose form:
 ///
 /// ```toml
@@ -629,24 +661,25 @@ pub struct ArchBuilder {
 ///
 /// The host is whatever ssh accepts as a destination — `[user@]host`, or
 /// `ssh://[user@]host[:port]` for a non-default port. Resolved to an [`Ssh`] via the
-/// `From` impl below.
+/// `From` impl below. A remote is named on the command line (`--remote`) by its full
+/// destination or by its bare host (see [`RemoteConfig::matches`]).
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum RemoteConfig {
 	/// Bare connection string: the host with no extra ssh args.
 	ConnStr(#[serde(default)] String),
-	/// A host plus per-target extra ssh args.
+	/// A host plus per-device extra ssh args.
 	WithOpts {
 		#[serde(default)]
 		remote: String,
-		/// Extra `ssh` args prepended to every connection to a `remotes` device
-		/// (`upgrade`/`deploy`/`rotate`) — e.g. `["-o", "StrictHostKeyChecking=accept-new"]`
-		/// or `["-i", "/path/to/key"]`. For a target whose ssh needs more than the
-		/// user's `~/.ssh/config` provides, without a config file.
+		/// Extra `ssh` args prepended to every connection to this device — e.g.
+		/// `["-o", "StrictHostKeyChecking=accept-new"]` or `["-i", "/path/to/key"]`.
+		/// For a device whose ssh needs more than the user's `~/.ssh/config`
+		/// provides, without a config file.
 		#[serde(default, skip_serializing_if = "Vec::is_empty")]
 		ssh_opts: Vec<String>,
 		/// The stock cloud login (`debian`/`ubuntu`/`cloud-user`/`root`) `bootcher
-		/// takeover` uses for its *initial* connection to this host, before the
+		/// device takeover` uses for its *initial* connection to this host, before the
 		/// image's `admin` user replaces it. Per-host override of the fleet-wide
 		/// `--login`; unused outside takeover. The steady-state identity stays
 		/// `admin@` (the `remote` above), so after takeover this is an ordinary
@@ -656,43 +689,38 @@ pub enum RemoteConfig {
 	},
 }
 
-/// The `[deploy] registry` field: either a plain namespace string (no signing)
-/// or a rich object pairing the namespace with cosign signing config. Mirrors the
-/// `remotes` dual-shape — a bare string for the common case, an inline table to
-/// add signing without a separate top-level section.
+/// The `[registry]` table: where releases and channels are published, and the
+/// optional signing key. A project without it only updates its devices directly
+/// over SSH (`bootcher device deploy`).
 ///
 /// ```toml
-/// # plain (no signing):
-/// registry = "registry.gitlab.com/org/project"
-///
-/// # with signing:
-/// registry = { url = "registry.gitlab.com/org/project", key = "cosign.key" }
+/// [registry]
+/// url = "registry.example.com/org/project"
+/// channels = ["stable", "next"]
+/// key = "cosign.key"   # optional: sign every release
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(untagged)]
-pub enum RegistryConfig {
-	/// Bare namespace: registry URL with no image signing.
-	Url(String),
-	/// Namespace plus cosign signing configuration.
-	WithSigning { url: String, key: String },
+pub struct RegistryConfig {
+	/// Registry namespace the image is pushed under (`<url>/<name>:<tag>`), e.g.
+	/// `ghcr.io/acme` or `registry.example.com/org/project`.
+	pub url: String,
+	/// Release channels: mutable tags (`<url>/<name>:<channel>`) devices follow. A
+	/// channel is a byte-for-byte copy of some release, moved by `bootcher channel
+	/// promote`. Required and non-empty; each must be a valid OCI tag. `latest` is
+	/// not special: declare it to use it.
+	pub channels: Vec<String>,
+	/// Path to the cosign/sigstore **private** signing key (its public half is the
+	/// `.pub` sibling). Set by `bootcher signing enroll`/`rotate`; when present,
+	/// every release is signed and channel devices verify signatures.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub key: Option<String>,
 }
 
 impl RegistryConfig {
-	/// The registry namespace URL (the push/pull address), regardless of variant.
-	#[must_use]
-	pub fn namespace(&self) -> &str {
-		match self {
-			Self::Url(url) | Self::WithSigning { url, .. } => url,
-		}
-	}
-
-	/// The signing config embedded in this registry entry, if any.
+	/// The signing config, when a key is configured.
 	#[must_use]
 	pub fn signing(&self) -> Option<SigningConfig> {
-		match self {
-			Self::WithSigning { key, .. } => Some(SigningConfig { key: key.clone() }),
-			Self::Url(_) => None,
-		}
+		self.key.clone().map(|key| SigningConfig { key })
 	}
 }
 
@@ -716,8 +744,23 @@ impl RemoteConfig {
 		}
 	}
 
+	/// The configured ssh destination (`[user@]host` or `ssh://…`), the remote's
+	/// display name.
+	#[must_use]
+	pub fn dest(&self) -> &str {
+		self.parts().0
+	}
+
+	/// Whether `name` (a `--remote` argument) names this remote: its full
+	/// destination, or its bare host (no user, scheme or port).
+	#[must_use]
+	pub fn matches(&self, name: &str) -> bool {
+		let dest = self.dest();
+		dest == name || bare_host(dest) == name
+	}
+
 	/// The steady-state **admin** [`Ssh`] for this remote (`admin@host` + `ssh_opts`)
-	/// with `identity` appended as an extra `-i <key>`. `bootcher takeover` uses this
+	/// with `identity` appended as an extra `-i <key>`. `bootcher device takeover` uses this
 	/// after the reboot, when the stock cloud user is gone and only the just-injected
 	/// admin key (`--ssh-key`'s private half) authenticates. Equivalent to
 	/// `Ssh::from(self)` plus the identity flag.
@@ -730,7 +773,7 @@ impl RemoteConfig {
 		Ssh::new(host, opts)
 	}
 
-	/// The **initial-connection** [`Ssh`] `bootcher takeover` uses *before* the
+	/// The **initial-connection** [`Ssh`] `bootcher device takeover` uses *before* the
 	/// reboot — the same host as the steady-state remote but with the user rewritten
 	/// to the resolved stock cloud login. The login is the remote's own
 	/// `takeover_login`, else `default_login` (the fleet-wide `--login`), else a hard
@@ -770,9 +813,18 @@ fn rewrite_ssh_user(dest: &str, login: &str) -> String {
 	}
 }
 
-/// Resolve a slice of deploy targets into ready-to-drive [`Ssh`] connections.
+/// The bare host of an ssh destination: `admin@h` → `h`, `ssh://admin@h:2222` → `h`.
+#[must_use]
+pub fn bare_host(dest: &str) -> &str {
+	let url = dest.strip_prefix("ssh://");
+	let rest = url.unwrap_or(dest);
+	let rest = rest.split_once('@').map_or(rest, |(_, h)| h);
+	if url.is_some() { rest.split(':').next().unwrap_or(rest) } else { rest }
+}
+
+/// Resolve a slice of remotes into ready-to-drive [`Ssh`] connections.
 /// The `to_ssh` companion to the [`From<&RemoteConfig>`] bridge, so call sites read
-/// `ctx.deploy_remotes().to_ssh()` (cf. `[T]::to_vec`) instead of spelling out the
+/// `manifest.remotes().to_ssh()` (cf. `[T]::to_vec`) instead of spelling out the
 /// iterate-map-collect — keeping the `Ssh` operations type out of [`Manifest`]'s API.
 pub trait ToSsh {
 	fn to_ssh(&self) -> Vec<Ssh>;
@@ -788,43 +840,6 @@ impl Default for RemoteConfig {
 	fn default() -> Self {
 		Self::ConnStr(String::default())
 	}
-}
-
-/// The `[deploy]` section: optional registry config plus the SSH targets a
-/// `deploy` / `upgrade` ships the image to. `registry` is either a bare namespace
-/// string or a [`RegistryConfig::WithSigning`] inline table; absent means LAN
-/// (SSH-tunnel) mode. `remotes` is the device list; in LAN mode at least one is
-/// required, in registry mode it may be empty (devices self-update on their timer;
-/// listed remotes are additionally upgraded immediately). The default is an empty
-/// table; `bootcher init` writes both keys for discoverability.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
-pub struct DeployConfig {
-	/// Registry namespace + optional signing config. Absent selects the LAN backend.
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub registry: Option<RegistryConfig>,
-	#[serde(default)]
-	pub remotes: Vec<RemoteConfig>,
-	/// Named release channels this project publishes, beyond the implicit
-	/// [`DEFAULT_CHANNEL`] (`latest`) every project always has. Each is a mutable
-	/// registry tag a subset of devices tracks (`<registry>/<name>:<channel>`),
-	/// pushed in place of `:latest` by a `--channel <name>` deploy; the immutable
-	/// `:CalVer` tag for the same digest is shared across channels, so a channel is
-	/// a *pointer*, not a separate identity (see [`Manifest::registry_version_ref`]).
-	///
-	/// Declaring them is opt-in and serves two purposes: it validates `--channel`
-	/// against a known set (a typo'd `--channel nightyl` is rejected rather than
-	/// silently minting a stray tag), and it gives `bootcher init` something to seed.
-	/// An empty list (the default) means the project only ships `latest` — the simple
-	/// single-channel case, where `--channel` is never needed. Channels are a
-	/// registry-mode concept: with no `[deploy] registry`, only `latest` is valid.
-	///
-	/// ```toml
-	/// [deploy]
-	/// registry = "registry.example.com/org/project"
-	/// channels = ["stable", "next", "testing"]
-	/// ```
-	#[serde(default, skip_serializing_if = "Vec::is_empty")]
-	pub channels: Vec<String>,
 }
 
 /// The `[concurrency]` section: optional caps on how many workers each parallel
@@ -852,21 +867,21 @@ pub struct DeployConfig {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ConcurrencyConfig {
 	/// Max parallel workers for the multi-arch container `build` fan-out
-	/// (`build` / `provision` / `deploy`).
+	/// (every building command).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub build: Option<NonZeroUsize>,
 	/// Max parallel workers for the multi-arch `disk` (`image-builder`) fan-out
-	/// (`disk` / `provision`).
+	/// (`device provision`).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub disk: Option<NonZeroUsize>,
-	/// Max parallel workers for the per-device `upgrade` rollout (`upgrade` /
-	/// `deploy`).
+	/// Max parallel workers for every per-device rollout (`device deploy|refresh|switch`,
+	/// and the channel device steps of `channel promote|refresh` and `signing`).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub upgrade: Option<NonZeroUsize>,
-	/// Max parallel workers for the per-device `rotate` rollout.
+	/// Max parallel workers for the per-device `device rotate` rollout.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub rotate: Option<NonZeroUsize>,
-	/// Max parallel workers for the per-host `takeover` rollout (`takeover`). Its own
+	/// Max parallel workers for the per-host `takeover` rollout (`device takeover`). Its own
 	/// knob rather than sharing `upgrade`'s: a takeover moves files in place on a live
 	/// host (and may pull a multi-GB image per host) rather than wiping a disk, a
 	/// different per-host time/resource profile.
@@ -897,39 +912,45 @@ impl ConcurrencyConfig {
 /// Each phase is a `[hooks.<phase>]` table with optional `pre`/`post` keys (see
 /// [`HookPair`]), and the hooks fire wherever that phase runs:
 ///
-/// - `[hooks.build]` wraps the container build, so it applies to `build`,
-///   `provision` and `deploy` alike.
-/// - `[hooks.disk]` wraps the `image-builder` step, so it applies to `disk`
-///   and `provision`.
-/// - `[hooks.upgrade]` wraps the push + per-device `bootc upgrade`, so it applies
-///   to `upgrade` and `deploy`.
-/// - `[hooks.takeover]` wraps the image transfer + per-host in-place conversion,
-///   so it applies to `takeover` (with or without `--skip-build`).
-/// - `[hooks.rotate]` wraps the per-device credential rollout, so it applies to
-///   every `rotate` subcommand (`pull-token`, `ssh-key`, `sign-key`).
+/// - `[hooks.build]` wraps the container build, so it fires wherever one runs:
+///   `build`, `device provision|deploy|switch|refresh|takeover`, `release
+///   publish|refresh`, `channel refresh` (a refresh builds in a temporary worktree of
+///   the release's commit and runs *that commit's* hook).
+/// - `[hooks.disk]` wraps the `image-builder` step (`device provision`).
+/// - `[hooks.publish]` wraps pushing a release `:X` (`release publish|refresh`,
+///   `channel refresh`, and the re-signing in `signing enroll|rotate`).
+/// - `[hooks.promote]` wraps moving a channel (`channel promote|refresh`, `release
+///   publish --promote`).
+/// - `[hooks.upgrade]` wraps the device rollout only: `device
+///   deploy|refresh|switch` and every channel device step.
+/// - `[hooks.takeover]` wraps the per-host in-place conversion (`device takeover`).
+/// - `[hooks.rotate]` wraps the per-device credential rollout (`device rotate`, and
+///   the `signing` device steps with `credential = "sign-key"`).
 ///
 /// Every table and key is optional; an absent one is no hook. Each is
 /// `skip_serializing_if`-empty so a hookless project serializes no `[hooks]`
 /// tables.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct Hooks {
-	/// Hooks around the container build (`build` / `provision` / `deploy`).
+	/// Hooks around every container build.
 	#[serde(default, skip_serializing_if = "HookPair::is_empty")]
 	pub build: HookPair,
-	/// Hooks around the `image-builder` disk-image step (`disk` /
-	/// `provision`).
+	/// Hooks around the `image-builder` disk-image step (`device provision`).
 	#[serde(default, skip_serializing_if = "HookPair::is_empty")]
 	pub disk: HookPair,
-	/// Hooks around the deploy push + per-device `bootc upgrade` (`upgrade` /
-	/// `deploy`).
+	/// Hooks around pushing a release to the registry.
+	#[serde(default, skip_serializing_if = "HookPair::is_empty")]
+	pub publish: HookPair,
+	/// Hooks around moving a channel to a release.
+	#[serde(default, skip_serializing_if = "HookPair::is_empty")]
+	pub promote: HookPair,
+	/// Hooks around a per-device rollout (`bootc switch` + `upgrade` + reboot).
 	#[serde(default, skip_serializing_if = "HookPair::is_empty")]
 	pub upgrade: HookPair,
-	/// Hooks around the takeover transfer + per-host in-place conversion
-	/// (`takeover`).
+	/// Hooks around the per-host in-place conversion (`device takeover`).
 	#[serde(default, skip_serializing_if = "HookPair::is_empty")]
 	pub takeover: HookPair,
-	/// Hooks around the per-device credential rollout (`rotate pull-token` /
-	/// `ssh-key` / `sign-key`).
+	/// Hooks around the per-device credential rollout (`device rotate`, `signing`).
 	#[serde(default, skip_serializing_if = "HookPair::is_empty")]
 	pub rotate: HookPair,
 }
@@ -964,6 +985,8 @@ impl Hooks {
 	pub fn is_empty(&self) -> bool {
 		self.build.is_empty()
 			&& self.disk.is_empty()
+			&& self.publish.is_empty()
+			&& self.promote.is_empty()
 			&& self.upgrade.is_empty()
 			&& self.takeover.is_empty()
 			&& self.rotate.is_empty()
@@ -1042,20 +1065,35 @@ fn deep_merge(mut base: toml::Table, over: toml::Table) -> toml::Table {
 }
 
 impl Manifest {
-	/// Read and parse a manifest at `path` (default `./bootcher.toml`, see
-	/// [`MANIFEST`]), failing with a pointer to `bootcher init` when the cwd isn't a
-	/// bootcher project. The build context and every relative path the manifest names
-	/// (Containerfile, `sysroot/`, keys) stay anchored to the cwd, not to `path`, so a
-	/// `--manifest bootcher.ci.toml` is a per-pipeline override layered over the same
-	/// project tree.
+	/// Read and parse the manifest at `path` (default `./bootcher.toml`, see
+	/// [`MANIFEST`]) for the project in the current directory. See [`Self::load_in`].
 	///
 	/// # Errors
 	///
-	/// Returns an error if the manifest is missing, unreadable, or fails to parse.
+	/// Returns an error if the manifest is missing, unreadable, fails to parse, or
+	/// fails validation.
 	pub fn load(path: impl AsRef<Path>) -> Result<Self> {
-		let path = path.as_ref();
+		Self::load_in(Path::new("."), path)
+	}
+
+	/// Read and parse the manifest at `root/path` for the project rooted at `root`,
+	/// failing with a pointer to `bootcher init` when it's missing. The build context
+	/// and every relative path the manifest names (Containerfile, `sysroot/`) stay
+	/// anchored to `root`, not to the manifest's directory, so a `--manifest
+	/// bootcher.ci.toml` is a per-pipeline override layered over the same project
+	/// tree. A refresh loads a release commit's own config this way, from a temporary
+	/// worktree of that commit, with the same relative `path`.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the manifest is missing, unreadable, fails to parse, or
+	/// fails validation (an empty `[targets]`, a `[registry]` without valid
+	/// channels).
+	pub fn load_in(root: &Path, path: impl AsRef<Path>) -> Result<Self> {
+		let path =
+			if root == Path::new(".") { path.as_ref().to_path_buf() } else { root.join(path) };
 		let display = path.display();
-		let raw = match fs::read_to_string(path) {
+		let raw = match fs::read_to_string(&path) {
 			Ok(raw) => raw,
 			Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(
 				"no {display} in the current directory — not a bootcher project.\n\
@@ -1071,35 +1109,78 @@ impl Manifest {
 		// overrides. Resolve the whole chain into one table before deserializing. The
 		// common no-`extend` case stays on the original path, keeping toml's
 		// line-located type errors that a post-merge deserialize would lose.
-		let manifest: Manifest = if table.contains_key("extend") {
-			let merged = resolve_extends(table, path, &mut vec![canonical(path)])?;
+		let mut manifest: Manifest = if table.contains_key("extend") {
+			let merged = resolve_extends(table, &path, &mut vec![canonical(&path)])?;
 			toml::Value::Table(merged).try_into().with_context(|| format!("parsing {display}"))?
 		} else {
 			toml::from_str(&raw).with_context(|| format!("parsing {display}"))?
 		};
-		// A present-but-empty `[targets]` table leaves nothing to build — the per-entry
-		// deserializer can't catch it (it never sees an arch), so reject it here where
-		// the whole table is in hand.
-		if manifest.targets.is_empty() {
-			bail!("`[targets]` must list at least one architecture to build");
-		}
+		manifest.root = root.to_path_buf();
+		manifest.validate().with_context(|| format!("invalid {display}"))?;
 		Ok(manifest)
 	}
 
-	/// The container image this project builds for `arch` (its disk artifacts, if
-	/// any, come from [`Self::disk_types_for`]). Arch is the container/registry axis,
-	/// so this carries no disk type — see [`DiskTarget`].
+	/// The checks serde can't express: a present-but-empty `[targets]` table leaves
+	/// nothing to build, and `[registry] channels` must be non-empty, unique, valid
+	/// OCI tags.
+	///
+	/// # Errors
+	///
+	/// Returns an error naming the first problem found.
+	pub fn validate(&self) -> Result<()> {
+		if self.targets.is_empty() {
+			bail!("`[targets]` must list at least one architecture to build");
+		}
+		if let Some(reg) = &self.registry {
+			if reg.url.trim().is_empty() {
+				bail!("`[registry] url` is empty");
+			}
+			if reg.channels.is_empty() {
+				bail!(
+					"`[registry] channels` must name at least one channel devices can follow, \
+					 e.g. `channels = [\"stable\"]`"
+				);
+			}
+			for (i, ch) in reg.channels.iter().enumerate() {
+				check_channel_name(ch)?;
+				if reg.channels[..i].contains(ch) {
+					bail!("`[registry] channels` lists `{ch}` twice");
+				}
+			}
+		}
+		Ok(())
+	}
+
+	/// The project directory (see [`Manifest::root`]); `.` when unset.
+	#[must_use]
+	pub fn root(&self) -> &Path {
+		if self.root.as_os_str().is_empty() { Path::new(".") } else { &self.root }
+	}
+
+	/// The container image this project builds for `arch`, under the default
+	/// `latest-<arch>` member tag (its disk artifacts, if any, come from
+	/// [`Self::disk_types_for`]). Arch is the container/registry axis, so this
+	/// carries no disk type — see [`DiskTarget`].
 	#[must_use]
 	pub fn image(&self, arch: Arch) -> ImageRef {
+		self.image_tagged(arch, LATEST)
+	}
+
+	/// [`Self::image`] under another member tag prefix: `localhost/<name>:<prefix>-<arch>`
+	/// (`pull-<channel>` for a provision pulled from a channel, `refresh-<sha12>` for a
+	/// refresh build), so those never overwrite what `build` left under `latest-<arch>`.
+	#[must_use]
+	pub fn image_tagged(&self, arch: Arch, prefix: &str) -> ImageRef {
 		ImageRef {
 			name: self.general.name.clone(),
 			arch,
 			rootfs: self.general.rootfs,
-			build_ctx: PathBuf::from("."),
-			registry: self.deploy.registry.as_ref().map(|r| r.namespace().to_owned()),
+			build_ctx: self.root().to_path_buf(),
+			tag_prefix: prefix.to_owned(),
 			// Filled on the build path (see `jobs::build`); empty for the many
 			// non-build callers that only read a ref, so this never invokes git.
 			provenance_args: Vec::new(),
+			no_cache: false,
 		}
 	}
 
@@ -1111,98 +1192,83 @@ impl Manifest {
 		self.targets.types(arch)
 	}
 
-	/// The registry namespace URL, if configured. `None` selects the LAN backend.
-	pub fn registry(&self) -> Option<&str> {
-		self.deploy.registry.as_ref().map(RegistryConfig::namespace)
-	}
-
-	/// Suffix-free, fully-qualified registry reference for registry-mode deploys
-	/// (`<namespace>/<name>:<channel>`, e.g.
-	/// `registry.gitlab.com/org/project/kiosk:latest`), or `None` when no registry
-	/// is configured — in which case `deploy`/`upgrade` use the LAN (ssh-tunnelled
-	/// pull from a temporary builder-local registry) backend. It's the multi-arch
-	/// manifest list bootcher pushes and that each device pulls its own arch from.
-	/// `channel` is the mutable channel tag a run publishes to / a device tracks
-	/// (default [`DEFAULT_CHANNEL`]; resolved from `--channel` by
-	/// [`Self::resolve_channel`]). Project-level (it spans every arch): both name and
-	/// namespace come from the manifest, so it doesn't belong to any one [`ImageRef`].
+	/// The `[registry]` table, if configured.
 	#[must_use]
-	pub fn registry_list_ref(&self, channel: &str) -> Option<String> {
-		self.registry().map(|ns| format!("{ns}/{}:{channel}", self.general.name))
+	pub fn registry(&self) -> Option<&RegistryConfig> {
+		self.registry.as_ref()
 	}
 
-	/// The release channels this project declares it publishes — the implicit
-	/// [`DEFAULT_CHANNEL`] always first, then any extra `[deploy] channels`. The set
-	/// [`Self::resolve_channel`] validates a `--channel` against and `bootcher init`
-	/// lists; `latest` is always present even when the manifest declares none.
-	#[must_use]
-	pub fn declared_channels(&self) -> Vec<&str> {
-		let mut v = vec![DEFAULT_CHANNEL];
-		v.extend(self.deploy.channels.iter().map(String::as_str).filter(|c| *c != DEFAULT_CHANNEL));
-		v
-	}
-
-	/// Resolve a run's active channel from the `--channel` flag: `None` is
-	/// [`DEFAULT_CHANNEL`]; a given name must be one this project declares (see
-	/// [`Self::declared_channels`]) and the project must be in registry mode, since a
-	/// channel is a registry tag with no LAN analogue. The validated channel is then
-	/// threaded into [`Self::registry_list_ref`] like the `--target`/`--disk`
-	/// selection — it narrows what a run publishes/tracks without touching the manifest.
+	/// The `[registry]` table, or an error explaining that `what` needs one.
 	///
 	/// # Errors
 	///
-	/// Returns an error if a non-default channel is named with no `[deploy] registry`
-	/// configured, or if it isn't one of the declared channels (each naming the valid
-	/// choices).
-	pub fn resolve_channel(&self, flag: Option<&str>) -> Result<String> {
-		let Some(channel) = flag else { return Ok(DEFAULT_CHANNEL.to_owned()) };
-		if channel == DEFAULT_CHANNEL {
-			return Ok(channel.to_owned());
-		}
-		if self.registry().is_none() {
+	/// Returns an error when no `[registry]` is configured.
+	pub fn require_registry(&self, what: &str) -> Result<&RegistryConfig> {
+		self.registry.as_ref().with_context(|| {
+			format!(
+				"{what} needs a registry, but bootcher.toml has no `[registry]` table — add \
+				 `[registry]` with a `url` and `channels` (devices without one are updated \
+				 with `bootcher device deploy`)"
+			)
+		})
+	}
+
+	/// The suffix-free registry repository (`<url>/<name>`), or `None` without a
+	/// registry. Every release and channel is a tag on it.
+	#[must_use]
+	pub fn repo(&self) -> Option<String> {
+		self.registry.as_ref().map(|r| format!("{}/{}", r.url, self.general.name))
+	}
+
+	/// The fully-qualified ref of `tag` (a release or channel) in the registry
+	/// repository (`<url>/<name>:<tag>`), or `None` without a registry.
+	#[must_use]
+	pub fn tag_ref(&self, tag: &str) -> Option<String> {
+		self.repo().map(|repo| format!("{repo}:{tag}"))
+	}
+
+	/// The declared channels (`[registry] channels`); empty without a registry.
+	#[must_use]
+	pub fn channels(&self) -> &[String] {
+		self.registry.as_ref().map_or(&[], |r| r.channels.as_slice())
+	}
+
+	/// Check that `channel` is one of the declared channels.
+	///
+	/// # Errors
+	///
+	/// Returns an error if there is no registry, or `channel` isn't declared (naming
+	/// the declared ones).
+	pub fn check_channel(&self, channel: &str) -> Result<()> {
+		let reg = self.require_registry(&format!("channel `{channel}`"))?;
+		if !reg.channels.iter().any(|c| c == channel) {
 			bail!(
-				"`--channel {channel}` needs a registry: channels are mutable registry tags with \
-				 no LAN equivalent. Set `[deploy] registry` to publish to a channel."
+				"`{channel}` isn't a declared channel; `[registry] channels` lists: {}. Add it \
+				 there first.",
+				reg.channels.join(", ")
 			);
 		}
-		let declared = self.declared_channels();
-		if !declared.contains(&channel) {
-			bail!(
-				"`--channel {channel}` isn't a declared channel; `[deploy] channels` allows: {}. \
-				 Add it there to publish to it.",
-				declared.join(", ")
-			);
-		}
-		Ok(channel.to_owned())
+		Ok(())
 	}
 
 	/// Suffix-free **local** manifest-list ref (`localhost/<name>:latest`) — the
-	/// build's final artifact (the assembled manifest list) and the
-	/// ref the push/serve paths name to ship the list the build already assembled,
-	/// without rebuilding it. The arch-independent local counterpart to
-	/// [`Self::registry_list_ref`]: the name is the project's, not any one
-	/// [`ImageRef`]'s, so it derives straight from the manifest.
+	/// build's final artifact (the assembled manifest list) and what `device deploy`
+	/// serves to direct devices, which store it under the same name.
 	#[must_use]
 	pub fn local_list_ref(&self) -> String {
-		format!("localhost/{}:latest", self.general.name)
+		self.local_list_ref_tagged(LATEST)
 	}
 
-	/// Fully-qualified registry reference for an immutable `CalVer` tag
-	/// (`<namespace>/<name>:<version>`), or `None` when no registry is configured.
-	/// Pushed alongside [`Self::registry_list_ref`] in registry mode: the mutable
-	/// `:latest` is the channel devices track, while this version tag is a durable,
-	/// human-readable handle for the same manifest digest — a stable anchor for
-	/// rollback/audit that a registry GC pass won't reap (an untagged digest can be).
-	/// `version` comes from [`calver_now`].
+	/// The local manifest-list ref for another tag (`localhost/<name>:<tag>`), e.g. a
+	/// refresh's `refresh-<sha12>` list.
 	#[must_use]
-	pub fn registry_version_ref(&self, version: &str) -> Option<String> {
-		self.registry().map(|ns| format!("{ns}/{}:{version}", self.general.name))
+	pub fn local_list_ref_tagged(&self, tag: &str) -> String {
+		format!("localhost/{}:{tag}", self.general.name)
 	}
 
 	/// One [`ImageRef`] per target arch in `[targets]`. The container/registry
-	/// fan-out the `build`, `deploy` and `upgrade` subcommands iterate (disk types
-	/// don't factor in here — see [`Self::disk_types_for`]); a single-arch project
-	/// yields a one-element vec.
+	/// fan-out the build and publish steps iterate (disk types don't factor in here —
+	/// see [`Self::disk_types_for`]); a single-arch project yields a one-element vec.
 	#[must_use]
 	pub fn images(&self) -> Vec<ImageRef> {
 		self.targets.arches().into_iter().map(|arch| self.image(arch)).collect()
@@ -1256,12 +1322,8 @@ impl Manifest {
 	}
 
 	/// The [`ImageRef`]s a run acts on: every arch in `[targets]` for an unfiltered
-	/// run (`target` `None`), or just `target`'s when one is named. The `--target`
-	/// projection of [`Self::images`] — same vec, optionally restricted to one arch —
-	/// so the build/disk fan-outs iterate the run's arches without the manifest itself
-	/// being narrowed. Validate `target` with [`Self::check_selection`] first (a
-	/// `target` not in `[targets]` yields an [`ImageRef`] for an arch the project
-	/// doesn't build).
+	/// run (`target` `None`), or just `target`'s when one is named. Validate `target`
+	/// with [`Self::check_selection`] first.
 	#[must_use]
 	pub fn images_for(&self, target: Option<Arch>) -> Vec<ImageRef> {
 		match target {
@@ -1272,10 +1334,7 @@ impl Manifest {
 
 	/// The disk types to build for `arch` this run: its full `[targets]` list, or —
 	/// when `filter` (`provision --disk`) is non-empty — only the listed types, in
-	/// manifest order (a type repeated on the command line is built once). The
-	/// `--disk` projection of [`Self::disk_types_for`]. `filter` is only ever
-	/// non-empty alongside a `--target` (enforced by [`Self::check_selection`]), so it
-	/// only narrows that one arch.
+	/// manifest order (a type repeated on the command line is built once).
 	#[must_use]
 	pub fn disks_for(&self, arch: Arch, filter: &[DiskType]) -> Vec<DiskType> {
 		let available = self.disk_types_for(arch);
@@ -1286,9 +1345,8 @@ impl Manifest {
 		}
 	}
 
-	/// Builder spec for `arch`'s container build / `deploy` / `upgrade` (its
-	/// `[builder.<arch>] build` override, else the flat `[builder] build`; `local`
-	/// unless configured).
+	/// Builder spec for `arch`'s container build (its `[builder.<arch>] build`
+	/// override, else the flat `[builder] build`; `local` unless configured).
 	#[must_use]
 	pub fn build_builder(&self, arch: Arch) -> &BuilderSpec {
 		self.builder.build_for(arch)
@@ -1302,11 +1360,11 @@ impl Manifest {
 		self.builder.image_for(arch)
 	}
 
-	/// The configured deployment targets (the `[deploy] remotes` array; empty
-	/// unless configured).
+	/// The configured devices (the top-level `remotes` array; empty unless
+	/// configured).
 	#[must_use]
-	pub fn deploy_remotes(&self) -> &[RemoteConfig] {
-		&self.deploy.remotes
+	pub fn remotes(&self) -> &[RemoteConfig] {
+		&self.remotes
 	}
 
 	/// The configured parallel-worker caps (the `[concurrency]` table; every
@@ -1323,13 +1381,51 @@ impl Manifest {
 		&self.hooks
 	}
 
-	/// The signing config when image signing is in effect — i.e. `[deploy] registry`
-	/// is a [`RegistryConfig::WithSigning`] entry. `None` means no signing. The
-	/// single switch the push/provision/upgrade paths gate on.
+	/// The signing config when image signing is in effect — i.e. `[registry] key`
+	/// is set. `None` means no signing.
 	#[must_use]
 	pub fn signing(&self) -> Option<SigningConfig> {
-		self.deploy.registry.as_ref()?.signing()
+		self.registry.as_ref()?.signing()
 	}
+}
+
+/// The default member tag prefix and local list tag (`latest-<arch>`, `latest`):
+/// what `build` produces and direct devices store. Unrelated to any registry tag.
+pub const LATEST: &str = "latest";
+
+/// Whether `tag` is a valid OCI tag: `[A-Za-z0-9_][A-Za-z0-9._-]{0,127}`.
+#[must_use]
+pub fn valid_tag(tag: &str) -> bool {
+	let mut chars = tag.chars();
+	let Some(first) = chars.next() else { return false };
+	(first.is_ascii_alphanumeric() || first == '_')
+		&& tag.len() <= 128
+		&& chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+}
+
+/// Tag prefixes bootcher reserves in the registry repository: `sha256-…` are the
+/// sigstore signature attachments, `ci-…` the CI hand-off scratch tags. Neither a
+/// release nor a channel may use them.
+pub const RESERVED_TAG_PREFIXES: &[&str] = &["sha256-", "ci-"];
+
+/// Check a `[registry] channels` entry: a valid OCI tag outside the reserved
+/// prefixes. Also `bootcher init`'s channel prompt validator, so the prompt rejects
+/// exactly what loading the manifest later would.
+///
+/// # Errors
+///
+/// Returns an error naming why `ch` isn't a usable channel name.
+pub(crate) fn check_channel_name(ch: &str) -> Result<()> {
+	if !valid_tag(ch) {
+		bail!(
+			"`[registry] channels` entry `{ch}` isn't a valid OCI tag (letters, digits, `_`, \
+			 `.`, `-`; at most 128 characters; not starting with `.` or `-`)"
+		);
+	}
+	if let Some(p) = RESERVED_TAG_PREFIXES.iter().find(|p| ch.starts_with(*p)) {
+		bail!("`[registry] channels` entry `{ch}` uses the reserved `{p}` prefix");
+	}
+	Ok(())
 }
 
 /// The `[targets]` default when the manifest omits the table: a single entry for
@@ -1411,14 +1507,18 @@ pub struct ImageRef {
 	/// Build context directory (the project root). The `Containerfile` is
 	/// resolved as `build_ctx.join("Containerfile")`.
 	pub build_ctx: PathBuf,
-	/// Registry namespace from the manifest, if any — the registry/LAN deploy
-	/// switch (see [`Manifest::registry_list_ref`]).
-	pub registry: Option<String>,
+	/// Member tag prefix: the image lives at `localhost/<name>:<tag_prefix>-<arch>`.
+	/// `latest` for a normal build; `pull-<channel>` and `refresh-<sha12>` keep a
+	/// channel pull or a refresh build from overwriting it.
+	pub tag_prefix: String,
 	/// OCI provenance to stamp on the built container, as ready-to-splice
 	/// `--label`/`--annotation <key>=<value>` argv tokens (from
 	/// [`GitProvenance::provenance_args`]). Empty unless the build path enriched it —
 	/// [`Manifest::image`] leaves it empty so reading an image ref never shells out to git.
 	pub provenance_args: Vec<String>,
+	/// Build with `--no-cache` (a forced refresh), so no cached layer from an earlier
+	/// build of the same source survives.
+	pub no_cache: bool,
 }
 
 impl fmt::Display for ImageRef {
@@ -1428,14 +1528,14 @@ impl fmt::Display for ImageRef {
 }
 
 impl ImageRef {
-	/// `localhost/<name>:latest-<arch>` — the per-arch **member** tag. Each arch's
-	/// container is built and stored under it so the arches coexist in podman's
-	/// flat tag namespace; it's also a member of the suffix-free
-	/// [`Manifest::local_list_ref`] manifest list. The `latest-` prefix keeps the
-	/// door open for future channels (`stable-aarch64`, etc.).
+	/// `localhost/<name>:<prefix>-<arch>` — the per-arch **member** tag
+	/// (`latest-<arch>` unless overridden, see [`ImageRef::tag_prefix`]). Each arch's
+	/// container is built and stored under it so the arches coexist in podman's flat
+	/// tag namespace; it's also a member of the suffix-free
+	/// [`Manifest::local_list_ref`] manifest list.
 	#[must_use]
 	pub fn tag(&self) -> String {
-		format!("localhost/{}:latest-{}", self.name, self.arch)
+		format!("localhost/{}:{}-{}", self.name, self.tag_prefix, self.arch)
 	}
 }
 
@@ -1458,25 +1558,6 @@ impl DiskTarget {
 	#[must_use]
 	pub fn output_dir(&self) -> PathBuf {
 		PathBuf::from("output").join(self.image.arch.to_string()).join(self.disk_type.to_string())
-	}
-}
-
-/// The current UTC instant as a `CalVer` tag. With a git `short_sha` it reads
-/// `YYYYMMDD.HHMMSS.g<short-sha>` (e.g. `20260113.123304.g0a1b2c3d4e5f`); without one
-/// (no git) it falls back to `YYYYMMDD.HHMMSS` (e.g. `20260113.123304`).
-///
-/// The commit suffix is what makes the tag a *stable identity* rather than a mere
-/// clock reading: it pins the exact source the image was built from. Second
-/// resolution is the collision floor: two deploys minting a tag within the same
-/// second (of the same commit, or of anything without git) would share it, and the
-/// later push would repoint it. Possible in theory, negligible in practice.
-/// UTC throughout so tags from different machines sort and compare unambiguously.
-#[must_use]
-pub fn calver_now(short_sha: Option<&str>) -> String {
-	let now = jiff::Timestamp::now();
-	match short_sha {
-		Some(sha) => format!("{}.g{sha}", now.strftime("%Y%m%d.%H%M%S")),
-		None => now.strftime("%Y%m%d.%H%M%S").to_string(),
 	}
 }
 
@@ -1504,6 +1585,9 @@ pub struct GitProvenance {
 	/// (with the commit distance/SHA when ahead of it), or a short SHA when the repo
 	/// is untagged, `-dirty`-suffixed likewise. `org.opencontainers.image.version`.
 	pub version: Option<String>,
+	/// The commit a **clean** tree is at — what [`SOURCE_LABEL`] records. `None` for
+	/// a dirty tree or outside git, so a dirty build never claims a source.
+	pub source: Option<String>,
 }
 
 impl GitProvenance {
@@ -1555,6 +1639,7 @@ impl GitProvenance {
 				None
 			}
 		};
+		let source = revision.as_deref().filter(|r| !r.ends_with("-dirty")).map(str::to_owned);
 		let warning = failure.map(|reason| {
 			let consequence = if revision.is_none() && version.is_none() {
 				"images will carry no revision/version labels"
@@ -1563,24 +1648,13 @@ impl GitProvenance {
 			};
 			format!("warning: git provenance unavailable ({reason}); {consequence}")
 		});
-		(Self { revision, version }, warning)
+		(Self { revision, version, source }, warning)
 	}
 
-	/// The abbreviated commit for use as the `CalVer` tag suffix (see [`calver_now`]):
-	/// the first 12 hex chars of [`Self::revision`], with its `-dirty` marker preserved
-	/// (so a tag built from an uncommitted tree can't masquerade as the clean commit).
-	/// `None` when there's no revision — i.e. no git — which is exactly when
-	/// [`calver_now`] drops back to its timestamp-only form.
+	/// Whether the tree was clean at a commit (so a build records its source).
 	#[must_use]
-	pub fn short_sha(&self) -> Option<String> {
-		self.revision.as_deref().map(|rev| {
-			let (sha, dirty) = match rev.strip_suffix("-dirty") {
-				Some(clean) => (clean, "-dirty"),
-				None => (rev, ""),
-			};
-			let short: String = sha.chars().take(12).collect();
-			format!("{short}{dirty}")
-		})
+	pub fn is_clean(&self) -> bool {
+		self.source.is_some()
 	}
 
 	/// The provenance as ready-to-splice `podman build` argv tokens: for each field
@@ -1592,6 +1666,10 @@ impl GitProvenance {
 	/// while the labels say otherwise. An unresolved field passes nothing, leaving the
 	/// base's value inherited. Reused for both the argv (in-process build) and
 	/// shell-string (remote build) invocations, so the two backends stamp identically.
+	///
+	/// [`SOURCE_LABEL`] is always stamped (a config label only): the clean commit, or
+	/// empty for a dirty tree / no git, so a value inherited from the base image can't
+	/// pass for this build's source.
 	#[must_use]
 	pub fn provenance_args(&self) -> Vec<String> {
 		let mut out = Vec::new();
@@ -1604,6 +1682,10 @@ impl GitProvenance {
 				out.extend(["--label".to_owned(), kv.clone(), "--annotation".to_owned(), kv]);
 			}
 		}
+		out.extend([
+			"--label".to_owned(),
+			format!("{SOURCE_LABEL}={}", self.source.as_deref().unwrap_or("")),
+		]);
 		out
 	}
 }
@@ -1914,96 +1996,92 @@ mod tests {
 	#[test]
 	fn suffix_free_refs_span_every_arch() {
 		// The member tag is per-arch (coexistence), but the list tag and registry
-		// ref the device sees carry no arch suffix.
+		// refs carry no arch suffix.
 		let m = parse(
 			"[general]\nname = \"kiosk\"\n[targets]\naarch64 = \"qcow2\"\n\
-			 [deploy]\nregistry = \"reg.example.com/org\"\n",
+			 [registry]\nurl = \"reg.example.com/org\"\nchannels = [\"stable\"]\n",
 		);
 		let img = m.image(Arch::Aarch64);
 		assert_eq!(img.tag(), "localhost/kiosk:latest-aarch64");
-		// The list ref and registry refs are project-level (arch-independent) — they
-		// live on the manifest, not the per-arch image.
+		// A tag override keeps a channel pull / refresh build off `latest-<arch>`.
+		assert_eq!(
+			m.image_tagged(Arch::Aarch64, "pull-stable").tag(),
+			"localhost/kiosk:pull-stable-aarch64"
+		);
 		assert_eq!(m.local_list_ref(), "localhost/kiosk:latest");
-		assert_eq!(
-			m.registry_list_ref(DEFAULT_CHANNEL).as_deref(),
-			Some("reg.example.com/org/kiosk:latest")
-		);
-		// A non-default channel is a different mutable tag for the same project.
-		assert_eq!(
-			m.registry_list_ref("stable").as_deref(),
-			Some("reg.example.com/org/kiosk:stable")
-		);
-		assert_eq!(
-			m.registry_version_ref("20260113.123304").as_deref(),
-			Some("reg.example.com/org/kiosk:20260113.123304")
-		);
+		assert_eq!(m.local_list_ref_tagged("refresh-abc"), "localhost/kiosk:refresh-abc");
+		assert_eq!(m.repo().as_deref(), Some("reg.example.com/org/kiosk"));
+		assert_eq!(m.tag_ref("stable").as_deref(), Some("reg.example.com/org/kiosk:stable"));
+		assert_eq!(m.tag_ref("v1.4").as_deref(), Some("reg.example.com/org/kiosk:v1.4"));
 	}
 
 	#[test]
-	fn registry_version_ref_is_none_without_registry() {
+	fn no_registry_means_no_refs_and_no_channels() {
 		let m = parse("[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n");
-		assert!(m.registry_list_ref(DEFAULT_CHANNEL).is_none());
-		assert!(m.registry_version_ref("20260113.123304").is_none());
+		assert!(m.repo().is_none() && m.tag_ref("stable").is_none());
+		assert!(m.channels().is_empty());
+		assert!(m.check_channel("stable").unwrap_err().to_string().contains("needs a registry"));
 	}
 
 	#[test]
-	fn resolve_channel_validates_against_declared_set() {
+	fn check_channel_validates_against_declared_set() {
 		let m = parse(
 			"[general]\nname = \"kiosk\"\n[targets]\nx86_64 = \"qcow2\"\n\
-			 [deploy]\nregistry = \"reg.example.com/org\"\nchannels = [\"stable\", \"next\"]\n",
+			 [registry]\nurl = \"reg.example.com/org\"\nchannels = [\"stable\", \"next\"]\n",
 		);
-		// No flag → the implicit default; a declared channel passes through.
-		assert_eq!(m.resolve_channel(None).unwrap(), DEFAULT_CHANNEL);
-		assert_eq!(m.resolve_channel(Some("latest")).unwrap(), "latest");
-		assert_eq!(m.resolve_channel(Some("stable")).unwrap(), "stable");
-		// An undeclared channel is rejected.
-		assert!(m.resolve_channel(Some("nightly")).is_err());
+		assert!(m.check_channel("stable").is_ok());
+		// `latest` is not special any more: undeclared, it's rejected like any other.
+		let err = m.check_channel("latest").unwrap_err().to_string();
+		assert!(err.contains("isn't a declared channel") && err.contains("stable, next"), "{err}");
 	}
 
 	#[test]
-	fn resolve_channel_rejects_non_default_without_registry() {
-		let m = parse("[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n");
-		// `latest` is always fine; any other channel needs a registry.
-		assert_eq!(m.resolve_channel(None).unwrap(), DEFAULT_CHANNEL);
-		assert!(m.resolve_channel(Some("stable")).is_err());
+	fn registry_channels_are_required_non_empty_and_valid() {
+		let base =
+			"[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n[registry]\nurl = \"r/o\"\n";
+		// Missing `channels` is a parse error (no default).
+		assert!(toml::from_str::<Manifest>(base).is_err());
+		let validate = |channels: &str| parse(&format!("{base}channels = {channels}\n")).validate();
+		assert!(validate("[]").unwrap_err().to_string().contains("at least one channel"));
+		assert!(validate("[\"-bad\"]").unwrap_err().to_string().contains("valid OCI tag"));
+		assert!(validate("[\"ci-x\"]").unwrap_err().to_string().contains("reserved"));
+		assert!(validate("[\"a\", \"a\"]").unwrap_err().to_string().contains("twice"));
+		assert!(validate("[\"stable\", \"v1.x_y-z\"]").is_ok());
 	}
 
 	#[test]
-	fn calver_now_without_git_is_timestamp_only() {
-		// `YYYYMMDD.HHMMSS`: 8 digits, dot, 6 digits — all numeric.
-		let v = calver_now(None);
-		let (date, time) = v.split_once('.').expect("a dot after the date");
-		assert_eq!(date.len(), 8, "date is YYYYMMDD: {v}");
-		assert_eq!(time.len(), 6, "time is HHMMSS: {v}");
-		assert!(date.chars().chain(time.chars()).all(|c| c.is_ascii_digit()), "numeric: {v}");
+	fn tag_grammar() {
+		for ok in ["v1.4", "latest", "_x", "A.b-c_9", &"a".repeat(128)] {
+			assert!(valid_tag(ok), "{ok}");
+		}
+		for bad in ["", ".x", "-x", "a/b", "a:b", "a b", &"a".repeat(129)] {
+			assert!(!valid_tag(bad), "{bad}");
+		}
 	}
 
 	#[test]
-	fn calver_now_with_git_appends_commit_suffix() {
-		// `YYYYMMDD.HHMMSS.g<short-sha>`: time to the second in one field, commit suffixed.
-		let v = calver_now(Some("0a1b2c3d4e5f"));
-		let (date, rest) = v.split_once('.').expect("a dot after the date");
-		let (hhmmss, sha) = rest.split_once('.').expect("a dot before the commit suffix");
-		assert_eq!(date.len(), 8, "date is YYYYMMDD: {v}");
-		assert_eq!(hhmmss.len(), 6, "time is HHMMSS: {v}");
-		assert!(hhmmss.chars().all(|c| c.is_ascii_digit()), "time is numeric: {v}");
-		assert_eq!(sha, "g0a1b2c3d4e5f", "commit suffix is g-prefixed: {v}");
+	fn load_in_threads_the_project_dir() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::write(
+			dir.path().join("ci.toml"),
+			"[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n",
+		)
+		.unwrap();
+		let m = Manifest::load_in(dir.path(), "ci.toml").unwrap();
+		assert_eq!(m.root(), dir.path());
+		assert_eq!(m.image(Arch::X86_64).build_ctx, dir.path());
+		// The default (cwd) project dir.
+		assert_eq!(parse("[general]\nname = \"x\"\n").root(), Path::new("."));
 	}
 
 	#[test]
-	fn short_sha_truncates_and_keeps_dirty_marker() {
-		let clean =
-			GitProvenance { revision: Some("0a1b2c3d4e5f6a7b8c9d".to_owned()), version: None };
-		assert_eq!(clean.short_sha().as_deref(), Some("0a1b2c3d4e5f"));
-
-		let dirty = GitProvenance {
-			revision: Some("0a1b2c3d4e5f6a7b8c9d-dirty".to_owned()),
-			version: None,
-		};
-		assert_eq!(dirty.short_sha().as_deref(), Some("0a1b2c3d4e5f-dirty"));
-
-		let none = GitProvenance::default();
-		assert_eq!(none.short_sha(), None);
+	fn remote_matches_full_dest_or_bare_host() {
+		let plain = RemoteConfig::ConnStr("admin@kiosk-1".into());
+		assert!(plain.matches("admin@kiosk-1") && plain.matches("kiosk-1"));
+		assert!(!plain.matches("kiosk"));
+		let url = RemoteConfig::ConnStr("ssh://admin@10.0.0.2:2222".into());
+		assert!(url.matches("10.0.0.2") && url.matches("ssh://admin@10.0.0.2:2222"));
+		assert_eq!(bare_host("h"), "h");
 	}
 
 	/// Run `git -C dir <args>` in a test, asserting it succeeds — the setup half of
@@ -2035,6 +2113,8 @@ mod tests {
 		let (clean, warning) = GitProvenance::resolve(dir);
 		assert_eq!(clean.revision.as_deref(), Some(head.as_str()));
 		assert_eq!(clean.version.as_deref(), Some("v1.0.0"));
+		// A clean tree records its commit as the source.
+		assert_eq!(clean.source.as_deref(), Some(head.as_str()));
 		assert_eq!(warning, None, "a healthy repo warns about nothing");
 
 		// Dirty the work tree: both fields gain the `-dirty` suffix.
@@ -2042,6 +2122,8 @@ mod tests {
 		let (dirty, warning) = GitProvenance::resolve(dir);
 		assert_eq!(dirty.revision.as_deref(), Some(format!("{head}-dirty").as_str()));
 		assert_eq!(dirty.version.as_deref(), Some("v1.0.0-dirty"));
+		// …and a dirty one records none.
+		assert_eq!(dirty.source, None);
 		assert_eq!(warning, None);
 	}
 
@@ -2078,7 +2160,8 @@ mod tests {
 		let (p, warning) = GitProvenance::resolve(dir.path());
 		assert_eq!(p.revision, None);
 		assert_eq!(p.version, None);
-		assert!(p.provenance_args().is_empty());
+		// Only the (empty) source label, overriding anything the base carried.
+		assert_eq!(p.provenance_args(), ["--label", "bootcher.source="]);
 		assert_eq!(warning, None, "not being in git is silent");
 	}
 
@@ -2130,8 +2213,11 @@ mod tests {
 	#[test]
 	fn provenance_args_emits_only_present_fields() {
 		// Both fields → a `--label k=v` + `--annotation k=v` pair each, revision first.
-		let both =
-			GitProvenance { revision: Some("abc123".into()), version: Some("v1.0.0".into()) };
+		let both = GitProvenance {
+			revision: Some("abc123".into()),
+			version: Some("v1.0.0".into()),
+			source: Some("abc123".into()),
+		};
 		assert_eq!(
 			both.provenance_args(),
 			[
@@ -2143,10 +2229,13 @@ mod tests {
 				"org.opencontainers.image.version=v1.0.0",
 				"--annotation",
 				"org.opencontainers.image.version=v1.0.0",
+				"--label",
+				"bootcher.source=abc123",
 			]
 		);
 		// A single resolved field stamps only that key…
-		let ver_only = GitProvenance { revision: None, version: Some("v1.0.0".into()) };
+		let ver_only =
+			GitProvenance { revision: None, version: Some("v1.0.0".into()), source: None };
 		assert_eq!(
 			ver_only.provenance_args(),
 			[
@@ -2154,43 +2243,45 @@ mod tests {
 				"org.opencontainers.image.version=v1.0.0",
 				"--annotation",
 				"org.opencontainers.image.version=v1.0.0",
+				"--label",
+				"bootcher.source=",
 			]
 		);
-		// …and nothing resolved (not a git tree) stamps nothing, so the base image's
-		// own annotations are inherited untouched.
-		assert!(GitProvenance::default().provenance_args().is_empty());
+		// …and nothing resolved (not a git tree) stamps only the empty source label, so
+		// the base image's own annotations are inherited untouched.
+		assert_eq!(GitProvenance::default().provenance_args(), ["--label", "bootcher.source="]);
 	}
 
 	#[test]
-	fn absent_deploy_table_has_no_remotes() {
+	fn absent_remotes_means_no_remotes() {
 		let m = parse("[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n");
-		assert!(m.deploy_remotes().is_empty());
+		assert!(m.remotes().is_empty());
 	}
 
 	#[test]
-	fn deploy_remotes_parse_in_order() {
+	fn remotes_parse_in_order() {
 		let m = parse(
-			"[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n\
-			 [deploy]\nremotes = [\"a@h1\", \"b@h2:2222\"]\n",
+			"remotes = [\"a@h1\", \"b@h2:2222\"]\n\
+			 [general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n",
 		);
 		assert_eq!(
-			m.deploy_remotes(),
+			m.remotes(),
 			[RemoteConfig::ConnStr("a@h1".into()), RemoteConfig::ConnStr("b@h2:2222".into())]
 		);
 	}
 
 	#[test]
-	fn deploy_remotes_accept_the_object_form_with_ssh_opts() {
+	fn remotes_accept_the_object_form_with_ssh_opts() {
 		// A bare string and an object with per-remote `ssh_opts` may be mixed in one
 		// array (the untagged `RemoteConfig`).
 		let m = parse(
-			"[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n\
-			 [deploy]\nremotes = [\
+			"remotes = [\
 			 \"plain@h1\", \
-			 { remote = \"ssh://o@h2:2222\", ssh_opts = [\"-o\", \"UserKnownHostsFile=/dev/null\"] }]\n",
+			 { remote = \"ssh://o@h2:2222\", ssh_opts = [\"-o\", \"UserKnownHostsFile=/dev/null\"] }]\n\
+			 [general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n",
 		);
 		assert_eq!(
-			m.deploy_remotes(),
+			m.remotes(),
 			[
 				RemoteConfig::ConnStr("plain@h1".into()),
 				RemoteConfig::WithOpts {
@@ -2201,7 +2292,7 @@ mod tests {
 			]
 		);
 		// The opts reach the resolved `Ssh`: they land in the argv before the host.
-		let ssh = &m.deploy_remotes().to_ssh()[1];
+		let ssh = &m.remotes().to_ssh()[1];
 		let argv: Vec<String> =
 			ssh.argv(&[], "sh").iter().map(|a| a.to_string_lossy().into_owned()).collect();
 		assert!(argv.windows(2).any(|w| w[0] == "-o" && w[1] == "UserKnownHostsFile=/dev/null"));
@@ -2250,29 +2341,40 @@ mod tests {
 	}
 
 	#[test]
-	fn plain_registry_url_has_no_signing() {
+	fn registry_without_key_has_no_signing() {
 		let m = parse(
 			"[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n\
-			 [deploy]\nregistry = \"reg.example.com/org\"\n",
+			 [registry]\nurl = \"reg.example.com/org\"\nchannels = [\"stable\"]\n",
 		);
-		assert_eq!(m.registry(), Some("reg.example.com/org"));
+		assert_eq!(m.registry().unwrap().url, "reg.example.com/org");
 		assert!(m.signing().is_none());
-		// A plain URL serializes as a bare string, not an inline table.
+		// No `key` serializes no `key`.
 		let s = toml::to_string(&m).unwrap();
-		assert!(s.contains("registry = \"reg.example.com/org\""), "{s}");
+		assert!(s.contains("[registry]") && !s.contains("key ="), "{s}");
 	}
 
 	#[test]
-	fn signing_registry_parses_and_defaults_pub_key_to_the_sibling() {
+	fn registry_key_enables_signing_and_defaults_pub_key_to_the_sibling() {
 		let m = parse(
 			"[general]\nname = \"kiosk\"\n[targets]\nx86_64 = \"qcow2\"\n\
-			 [deploy]\nregistry = { url = \"reg.example.com/org\", key = \"cosign.key\" }\n",
+			 [registry]\nurl = \"reg.example.com/org\"\nchannels = [\"stable\"]\nkey = \"cosign.key\"\n",
 		);
-		assert_eq!(m.registry(), Some("reg.example.com/org"));
 		let s = m.signing().expect("signing present");
 		assert_eq!(s.key, "cosign.key");
-		// Unset `pub_key` ⇒ the `<key>.pub` sibling.
 		assert_eq!(s.public_key_path(), "cosign.pub");
+	}
+
+	#[test]
+	fn a_serialized_manifest_round_trips_with_remotes_first() {
+		// `remotes` is a top-level array, so it must serialize before the tables (TOML
+		// would otherwise read it as a key of the last table).
+		let m = parse(
+			"remotes = [\"admin@a\"]\n[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n\
+			 [registry]\nurl = \"r/o\"\nchannels = [\"stable\"]\n",
+		);
+		let back: Manifest = toml::from_str(&toml::to_string(&m).unwrap()).unwrap();
+		assert_eq!(back.remotes(), m.remotes());
+		assert_eq!(back.registry(), m.registry());
 	}
 
 	#[test]
@@ -2342,11 +2444,11 @@ mod tests {
 	#[test]
 	fn takeover_login_parses_in_the_object_form() {
 		let m = parse(
-			"[general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n\
-			 [deploy]\nremotes = [{ remote = \"admin@h\", takeover_login = \"debian\" }]\n",
+			"remotes = [{ remote = \"admin@h\", takeover_login = \"debian\" }]\n\
+			 [general]\nname = \"x\"\n[targets]\nx86_64 = \"qcow2\"\n",
 		);
 		assert_eq!(
-			m.deploy_remotes(),
+			m.remotes(),
 			[RemoteConfig::WithOpts {
 				remote: "admin@h".into(),
 				ssh_opts: vec![],

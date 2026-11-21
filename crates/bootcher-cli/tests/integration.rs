@@ -141,6 +141,78 @@ fn init_scaffold_is_secret_free_and_from_fedora_bootc() {
 }
 
 #[test]
+fn init_yes_takes_the_registry_from_flags() {
+	let tmp = tempfile::tempdir().unwrap();
+	bootcher_in(tmp.path(), tmp.path())
+		.args(["init", "-y", "--fedora-release", PINNED, "--registry", "ghcr.io/acme"])
+		.args(["--channel", "next", "--channel", "stable", "--channel", "next", "demo"])
+		.assert()
+		.success();
+	let proj = tmp.path().join("demo");
+	bootcher_in(tmp.path(), &proj)
+		.args(["info", "--format", "{{ .Image }} {{ .Channels }} {{ .Signing }}"])
+		.assert()
+		.success()
+		.stdout(r#"ghcr.io/acme/demo ["next","stable"] false"#.to_owned() + "\n");
+
+	// No `--channel`: the questionnaire's suggestion, `stable`.
+	bootcher_in(tmp.path(), tmp.path())
+		.args(["init", "-y", "--fedora-release", PINNED, "--registry", "ghcr.io/acme", "plain"])
+		.assert()
+		.success();
+	bootcher_in(tmp.path(), &tmp.path().join("plain"))
+		.args(["info", "--format", "{{ .Channels }}"])
+		.assert()
+		.success()
+		.stdout("[\"stable\"]\n");
+}
+
+#[test]
+fn init_yes_sign_enrolls_a_key() {
+	let tmp = tempfile::tempdir().unwrap();
+	bootcher_in(tmp.path(), tmp.path())
+		.args(["init", "-y", "--fedora-release", PINNED, "--registry", "ghcr.io/acme", "--sign"])
+		.arg("demo")
+		.env("BOOTCHER_SIGN_PASSPHRASE", "hunter2")
+		.assert()
+		.success();
+	let proj = tmp.path().join("demo");
+	assert!(proj.join("cosign.key").is_file() && proj.join("cosign.pub").is_file());
+	bootcher_in(tmp.path(), &proj)
+		.args(["info", "--format", "{{ .Signing }} {{ .Key }} {{ .PublicKey }}"])
+		.assert()
+		.success()
+		.stdout("true cosign.key cosign.pub\n");
+}
+
+#[test]
+fn init_registry_flags_are_checked_before_scaffolding() {
+	let tmp = tempfile::tempdir().unwrap();
+	// The registry flags are the `-y` path's; `--channel`/`--sign` need a registry.
+	for args in [
+		&["init", "--registry", "ghcr.io/acme", "demo"][..],
+		&["init", "-y", "--channel", "stable", "demo"],
+		&["init", "-y", "--sign", "demo"],
+	] {
+		bootcher_in(tmp.path(), tmp.path()).args(args).assert().failure();
+	}
+	// `--sign` off a TTY without a passphrase fails before writing anything.
+	bootcher_in(tmp.path(), tmp.path())
+		.args(["init", "-y", "--fedora-release", PINNED, "--registry", "ghcr.io/acme", "--sign"])
+		.arg("demo")
+		.env_remove("BOOTCHER_SIGN_PASSPHRASE")
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("BOOTCHER_SIGN_PASSPHRASE"));
+	bootcher_in(tmp.path(), tmp.path())
+		.args(["init", "-y", "--fedora-release", PINNED, "--registry", "ghcr.io/acme"])
+		.args(["--channel", "Not A Tag", "demo"])
+		.assert()
+		.failure();
+	assert!(!tmp.path().join("demo").exists(), "a refused init must write nothing");
+}
+
+#[test]
 fn init_refuses_existing_directory() {
 	let (tmp, _proj) = project("demo");
 	bootcher_in(tmp.path(), tmp.path())
@@ -354,14 +426,10 @@ fn extend_cycle_is_rejected() {
 #[test]
 fn info_extracts_the_image_ref_a_pipeline_consumes() {
 	// The CI recipes derive the scratch-tag base from `bootcher info` instead of
-	// hardcoding it. A registry-mode project's `{{ .Image }}` is the suffix-free
-	// `<registry>/<name>` — exactly what CI appends `:ci-<arch>` / `:latest` to.
+	// hardcoding it. A project with a registry has `{{ .Image }}` = the suffix-free
+	// `<registry>/<name>` — exactly what CI appends `:ci-<sha>-<arch>` / a release to.
 	let (tmp, proj) = project("demo");
-	// The scaffold ships a `[deploy]` table (with `remotes = []`); add a registry to it
-	// rather than a second table (duplicate tables are a TOML error).
-	let manifest = read(&proj, "bootcher.toml")
-		.replace("[deploy]\n", "[deploy]\nregistry = \"ghcr.io/acme\"\n");
-	fs::write(proj.join("bootcher.toml"), manifest).unwrap();
+	set_registry(&proj, "ghcr.io/acme", &["stable"]);
 
 	bootcher_in(tmp.path(), &proj)
 		.args(["info", "--format", "{{ .Image }}"])
@@ -382,7 +450,8 @@ fn info_reads_the_registry_through_the_extend_chain() {
 	// must come from the merged manifest, not just the file named — the whole reason CI
 	// derives it here instead of parsing TOML in shell (which can't follow `extend`).
 	let (tmp, proj) = project("demo");
-	let ci = extending_manifest(&proj, "[deploy]\nregistry = \"ghcr.io/acme\"");
+	let ci =
+		extending_manifest(&proj, "[registry]\nurl = \"ghcr.io/acme\"\nchannels = [\"stable\"]");
 	bootcher_in(tmp.path(), &proj)
 		.args(["--manifest", ci, "info", "--format", "{{ .Image }}"])
 		.assert()
@@ -391,15 +460,63 @@ fn info_reads_the_registry_through_the_extend_chain() {
 }
 
 #[test]
-fn info_reports_lan_mode_with_no_image_ref() {
-	// A freshly-scaffolded project is LAN mode (no `[deploy] registry`), so it has no
-	// registry image ref: `{{ .Image }}` is empty and the recipes' guard fires.
+fn info_reports_no_image_ref_without_a_registry() {
+	// A freshly-scaffolded project has no `[registry]`, so it has no registry image
+	// ref: `{{ .Image }}` is empty and the recipes' guard fires. There is no mode.
 	let (tmp, proj) = project("demo");
 	bootcher_in(tmp.path(), &proj)
-		.args(["info", "--format", "mode={{ .Mode }} image=[{{ .Image }}]"])
+		.args([
+			"info",
+			"--format",
+			"registry=[{{ .Registry }}] image=[{{ .Image }}] channels={{ .Channels }}",
+		])
 		.assert()
 		.success()
-		.stdout("mode=lan image=[]\n");
+		.stdout("registry=[] image=[] channels=[]\n");
+	bootcher_in(tmp.path(), &proj)
+		.args(["info", "--format", "{{ .Mode }}"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("no such field `Mode`"));
+}
+
+#[test]
+fn info_reports_registry_channels_remotes_and_signing() {
+	let (tmp, proj) = project("demo");
+	set_registry(&proj, "ghcr.io/acme", &["stable", "next"]);
+	set_remotes(&proj, &["admin@kiosk-1"]);
+	bootcher_in(tmp.path(), &proj)
+		.args(["info", "--format", "{{ .Channels }} {{ .Remotes }} {{ .Signing }}"])
+		.assert()
+		.success()
+		.stdout("[\"stable\",\"next\"] [\"admin@kiosk-1\"] false\n");
+}
+
+#[test]
+fn a_registry_needs_channels() {
+	// `[registry] channels` is required and non-empty; an old `[deploy]` table is
+	// simply ignored (unknown tables always were).
+	let (tmp, proj) = project("demo");
+	let path = proj.join("bootcher.toml");
+	let manifest = read(&proj, "bootcher.toml");
+	fs::write(&path, format!("{manifest}\n[registry]\nurl = \"r.io/o\"\nchannels = []\n")).unwrap();
+	bootcher_in(tmp.path(), &proj)
+		.args(["info"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("at least one channel"));
+	fs::write(&path, format!("{manifest}\n[registry]\nurl = \"r.io/o\"\n")).unwrap();
+	bootcher_in(tmp.path(), &proj)
+		.args(["info"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("channels"));
+	fs::write(&path, format!("{manifest}\n[deploy]\nregistry = \"r.io/o\"\n")).unwrap();
+	bootcher_in(tmp.path(), &proj)
+		.args(["info", "--format", "[{{ .Registry }}]"])
+		.assert()
+		.success()
+		.stdout("[]\n");
 }
 
 #[test]
@@ -416,6 +533,31 @@ fn info_rejects_an_unknown_format_field() {
 
 // ---------------------------------------------------------------- hooks
 
+/// Append a `[registry]` table with `url` and `channels` to a scaffolded manifest.
+fn set_registry(proj: &Path, url: &str, channels: &[&str]) {
+	let path = proj.join("bootcher.toml");
+	let manifest = fs::read_to_string(&path).unwrap();
+	let channels: Vec<String> = channels.iter().map(|c| format!("\"{c}\"")).collect();
+	fs::write(
+		&path,
+		format!("{manifest}\n[registry]\nurl = \"{url}\"\nchannels = [{}]\n", channels.join(", ")),
+	)
+	.unwrap();
+}
+
+/// Replace the scaffold's `remotes = []` with `remotes`.
+fn set_remotes(proj: &Path, remotes: &[&str]) {
+	let path = proj.join("bootcher.toml");
+	let manifest = fs::read_to_string(&path).unwrap();
+	assert!(manifest.contains("remotes = []\n"), "scaffold remotes changed: {manifest}");
+	let list: Vec<String> = remotes.iter().map(|r| format!("\"{r}\"")).collect();
+	fs::write(
+		&path,
+		manifest.replace("remotes = []\n", &format!("remotes = [{}]\n", list.join(", "))),
+	)
+	.unwrap();
+}
+
 /// Append a raw `[hooks.<phase>]` table (the caller writes the whole block) to a
 /// scaffolded manifest. The scaffold ships the section only as commented
 /// examples, so tests opt in by writing real keys.
@@ -426,7 +568,7 @@ fn set_hooks(proj: &Path, table: &str) {
 }
 
 /// Point the scaffold's `[builder] image` at a (never-contacted) remote host, so
-/// `provision`'s preflight doesn't require the local builder's privileged `sudo sh`.
+/// `device provision`'s preflight doesn't require the local builder's privileged `sudo sh`.
 /// For tests that exercise a failure *before* the disk build, which would otherwise
 /// hinge on the host's sudo setup (no tty under `assert_cmd`, so sudo can't prompt).
 fn use_remote_image_builder(proj: &Path) {
@@ -444,10 +586,12 @@ fn init_scaffolds_commented_hooks_examples() {
 	let (_tmp, proj) = project("demo");
 	let manifest = read(&proj, "bootcher.toml");
 	assert!(manifest.contains("# [hooks.build]"), "manifest documents hooks: {manifest}");
-	assert!(
-		manifest.contains("# [hooks.upgrade]"),
-		"manifest documents the upgrade hook: {manifest}"
-	);
+	for phase in ["publish", "promote", "upgrade"] {
+		assert!(
+			manifest.contains(&format!("# [hooks.{phase}]")),
+			"manifest documents the {phase} hook: {manifest}"
+		);
+	}
 	assert!(
 		manifest.contains("# [hooks.takeover]"),
 		"manifest documents the takeover hook: {manifest}"
@@ -518,29 +662,24 @@ fn a_failing_hook_aborts_the_command() {
 
 #[test]
 fn provision_without_key_on_non_tty_errors() {
-	// Inside a project, `provision` collects the admin SSH key up front. With no
-	// --ssh-key and a non-TTY stdin (assert_cmd), collection must fail fast — before
-	// the build — rather than producing a keyless device. `--skip-build` exercises
-	// the disk-only path (no container build) while still requiring the key.
+	// Inside a project, `device provision` collects the admin SSH key up front.
+	// With no --ssh-key and a non-TTY stdin (assert_cmd), collection must fail fast —
+	// before the build — rather than producing a keyless device. Without a registry
+	// `--direct` is implied, so no mode flag is needed.
 	let (tmp, proj) = project("demo");
 	use_remote_image_builder(&proj);
-	// No --platform: the arch defaults to the manifest's `[targets]` keys
-	// (seeded by init).
 	bootcher_in(tmp.path(), &proj)
-		.args(["provision", "--skip-build"])
+		.args(["device", "provision", "--skip-build"])
 		.assert()
 		.failure()
 		.stderr(predicate::str::contains("no key"));
 }
 
 #[test]
-fn provision_skip_build_without_registry_or_local_image_errors() {
-	// `--skip-build` reuses an already-built container: from local storage, else
-	// pulled from the registry. A freshly-scaffolded project is LAN mode (no
-	// `[deploy] registry`) and its container was never built, so there's nothing to
-	// reuse and nowhere to pull from — the seeding step must fail with a pointer to
-	// `bootcher build`, not an opaque podman error. (A registry-mode reuse needs a
-	// real registry to pull from, so it lives in the e2e suite.)
+fn direct_provision_skip_build_without_local_images_errors() {
+	// A direct `--skip-build` reuses the images already in local storage — there's no
+	// registry fallback. A fresh project never built them, so it must fail with a
+	// pointer at `bootcher build`, not an opaque podman error.
 	let (tmp, proj) = project("demo");
 	use_remote_image_builder(&proj);
 	// A key so secret collection passes and we actually reach the seeding step;
@@ -548,43 +687,88 @@ fn provision_skip_build_without_registry_or_local_image_errors() {
 	let key = proj.join("admin_key");
 	fs::write(format!("{}.pub", key.display()), "ssh-ed25519 AAAA placeholder\n").unwrap();
 	bootcher_in(tmp.path(), &proj)
-		.args(["provision", "--skip-build", "--ssh-key"])
+		.args(["device", "provision", "--skip-build", "--ssh-key"])
 		.arg(&key)
 		.assert()
 		.failure()
-		.stderr(predicate::str::contains("no `[deploy] registry`"));
+		.stderr(predicate::str::contains("run `bootcher build` first"));
+}
+
+#[test]
+fn provision_with_a_registry_needs_a_mode_off_a_tty() {
+	let (tmp, proj) = project("demo");
+	set_registry(&proj, "registry.example.com/org", &["stable"]);
+	bootcher_in(tmp.path(), &proj).args(["device", "provision"]).assert().failure().stderr(
+		predicate::str::contains("--channel <stable>").and(predicate::str::contains("--direct")),
+	);
+}
+
+#[test]
+fn device_commands_need_remotes_and_yes() {
+	let (tmp, proj) = project("demo");
+	bootcher_in(tmp.path(), &proj)
+		.args(["device", "deploy", "--skip-build"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("lists none"));
+	// D5: off a TTY takeover never picks hosts by itself.
+	set_remotes(&proj, &["admin@vps1.invalid"]);
+	bootcher_in(tmp.path(), &proj)
+		.args(["device", "takeover", "--direct"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("needs `--remote <host>`"));
+	bootcher_in(tmp.path(), &proj)
+		.args(["device", "switch", "--direct"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("needs `--remote <device>`"));
+	bootcher_in(tmp.path(), &proj)
+		.args(["device", "deploy", "--remote", "nope"])
+		.assert()
+		.failure()
+		.stderr(predicate::str::contains("matches no configured remote"));
 }
 
 // ---------------------------------------------------------------- channels
 
 #[test]
-fn deploy_channel_without_registry_is_rejected() {
-	// `--channel` is a registry-mode concept (a mutable registry tag with no LAN
-	// equivalent). A freshly-scaffolded project is LAN mode, so any non-default channel
-	// must fail fast at resolution — before any build — with a pointer to set a
-	// registry. (`latest` is always valid; only a *named* channel needs one.)
+fn channel_without_registry_is_rejected() {
+	// A channel is a registry tag. Without `[registry]` every device is direct, so a
+	// `--channel` must fail fast at resolution — before any build — with a pointer at
+	// the registry.
 	let (tmp, proj) = project("demo");
 	bootcher_in(tmp.path(), &proj)
-		.args(["deploy", "--channel", "stable"])
+		.args(["device", "provision", "--channel", "stable"])
 		.assert()
 		.failure()
 		.stderr(predicate::str::contains("needs a registry"));
 }
 
 #[test]
-fn deploy_undeclared_channel_is_rejected() {
-	// In registry mode a channel must be one the manifest declares in `[deploy]
-	// channels` (plus the implicit `latest`), so a typo can't silently mint a stray
-	// tag. The rejection names the valid choices and fails before any build.
+fn undeclared_channel_is_rejected() {
+	// A channel must be one the manifest declares in `[registry] channels` — `latest`
+	// included, which is no longer implicit. The rejection names the valid choices
+	// and fails before any build.
 	let (tmp, proj) = project("demo");
 	fs::write(
 		proj.join("bootcher.toml"),
-		"[general]\nname = \"demo\"\n[targets]\nx86_64 = \"qcow2\"\n\
-		 [deploy]\nregistry = \"registry.example.com/org\"\nchannels = [\"stable\"]\n",
+		"remotes = [\"admin@x\"]\n[general]\nname = \"demo\"\n[targets]\nx86_64 = \"qcow2\"\n\
+		 [registry]\nurl = \"registry.example.com/org\"\nchannels = [\"stable\"]\n",
 	)
 	.unwrap();
+	for channel in ["nightly", "latest"] {
+		bootcher_in(tmp.path(), &proj)
+			.args(["device", "provision", "--channel", channel])
+			.assert()
+			.failure()
+			.stderr(
+				predicate::str::contains("declared channel")
+					.and(predicate::str::contains("stable")),
+			);
+	}
 	bootcher_in(tmp.path(), &proj)
-		.args(["deploy", "--channel", "nightly"])
+		.args(["device", "switch", "--channel", "nightly", "--remote", "x"])
 		.assert()
 		.failure()
 		.stderr(

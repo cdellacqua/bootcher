@@ -1,13 +1,14 @@
 //! `bootcher-core`: the engine behind the `bootcher` CLI.
 //!
 //! The public surface is two tiers. The high-level driver API the binary runs —
-//! [`context`], [`jobs`], [`pipelines`], [`cache`], [`progress`]'s
+//! [`context`], [`jobs`] (one module per command domain), [`cache`], [`progress`]'s
 //! [`Scope`](progress::Scope), [`signals`], [`podman::sweep_working_containers`],
 //! and [`ssh`]'s [`Ssh`](ssh::Ssh) type (which leaks through [`context::ToSsh`])
 //! — plus a lower-level building-block tier the end-to-end test harness uses to
 //! stand up VMs and fixtures: [`qemu`], [`fetch`], [`exec`], and
 //! [`podman::reap_container`]. Everything else — the image builders, the fleet
-//! fan-out, lifecycle hooks, pre-flight checks, the LAN mini-registry, and the
+//! fan-out, device classification, the registry reads, the interactive prompt
+//! rules, lifecycle hooks, pre-flight checks, the loopback mini-registry, and the
 //! sudo session — is internal plumbing behind `pub(crate)`. `unreachable_pub`
 //! keeps that boundary honest: a `pub` item the outside can't reach is a
 //! warning, so the qualifiers mean what they say (the `unreachable_pub` lint is
@@ -16,14 +17,16 @@
 pub(crate) mod builder;
 pub mod cache;
 pub mod context;
+pub(crate) mod device;
 pub mod exec;
 pub mod fedora;
 pub mod fetch;
 pub(crate) mod fleet;
 pub(crate) mod hooks;
+pub(crate) mod interactive;
 pub mod jobs;
 pub(crate) mod known_hosts;
-pub mod pipelines;
+pub(crate) mod oci;
 pub mod podman;
 pub(crate) mod preflight;
 pub mod progress;

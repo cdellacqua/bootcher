@@ -1,343 +1,81 @@
+//! The two device steps every device-touching command is built from, plus the
+//! reboot/online plumbing they share.
+//!
+//! - **Direct device step** ([`run_direct`] / [`apply_direct`]): serve the local
+//!   manifest list from a loopback registry, have each device pull its arch member
+//!   over an `ssh -R` tunnel into its containers-storage as
+//!   `localhost/<name>:latest`, `bootc switch --transport containers-storage` to
+//!   it, upgrade, and reboot into it.
+//! - **Channel device step** ([`apply_channel`]): with signing on, make sure the
+//!   trust files are current, then `bootc switch [--enforce-container-sigpolicy]
+//!   <channel ref>`, `bootc upgrade`, and reboot into the staged deployment.
+//!
+//! Both are idempotent: running them on a device that already runs the target is
+//! cheap (nothing staged ⇒ no reboot), which is what lets a re-run retry exactly
+//! the devices a failed run missed.
+
 use crate::{
-	context::{Arch, ImageRef, Manifest, SigningConfig, ToSsh},
-	exec::{run_argv_labeled, sh_quote},
+	context::{Arch, ImageRef},
+	exec::sh_quote,
 	fleet,
-	hooks::{HookMetadata, Phase, Stage},
-	preflight::{self, Checks},
+	preflight::Checks,
 	progress::Scope,
 	registry, signals,
 	ssh::Ssh,
 };
 use anyhow::{Context, Ok, Result, bail};
 use duct::cmd;
-use std::ffi::OsString;
 use std::io::Write;
 use std::num::NonZeroUsize;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Check the external tools the push/upgrade phase needs: `podman` always (build
-/// the manifest list, push, inspect); `ssh` whenever the push reaches devices —
-/// always in LAN mode (the transfer *is* an ssh tunnel), and in registry mode only
-/// when listed remotes are upgraded immediately (`!skip_bootc_upgrade`). Co-located
-/// with [`run`]; invoked before the push starts.
+/// Check the external tools the direct device step needs: `podman` (serve the
+/// local list) and `ssh` (the tunnelled transfer).
 ///
 /// # Errors
 ///
 /// Returns an error listing every missing prerequisite.
-pub(crate) fn preflight(manifest: &Manifest, skip_bootc_upgrade: bool) -> Result<()> {
+pub(crate) fn preflight_direct() -> Result<()> {
 	let mut checks = Checks::default();
-	checks.bin("podman", preflight::PODMAN_HINT);
-	let ssh_needed = match manifest.registry() {
-		// LAN mode: the image is shipped to each device over an SSH-tunnelled push.
-		None => true,
-		// Registry mode: ssh only to run `bootc upgrade` on listed remotes.
-		Some(_) => !manifest.deploy_remotes().is_empty() && !skip_bootc_upgrade,
-	};
-	if ssh_needed {
-		checks.bin("ssh", "reach the deploy targets over SSH");
-	}
+	checks.bin("podman", crate::preflight::PODMAN_HINT);
+	checks.bin("ssh", "reach the devices over SSH");
 	checks.finish()
 }
 
-/// Push the freshly built image to the configured targets and stage a `bootc
-/// upgrade` on each. `images` is one [`ImageRef`] per built arch (see
-/// [`crate::context::Manifest::images`]); they share a name and registry, so the
-/// first decides the backend. Dispatches on whether the manifest configures a
-/// registry (see [`Manifest::registry_list_ref`]): a configured registry takes
-/// the registry backend (assemble + `podman manifest push` the multi-arch list,
-/// then per-device `bootc switch <ref>`), otherwise the LAN backend (identify
-/// each device's arch over ssh, then an SSH-tunnelled `podman pull` of the
-/// matching member from a loopback mini-registry on the builder + `bootc switch
-/// --transport containers-storage`).
-///
-/// `remotes` is the `[deploy] remotes` list. LAN requires at least one — there's
-/// no path to a device without it — but registry mode accepts an empty list:
-/// the push is then the whole job (every target pulls the new revision on its
-/// next auto-update); listed remotes are additionally upgraded immediately.
-///
-/// `hooks` carries the manifest's `[hooks.upgrade]` `pre`/`post` commands, run
-/// once around the whole push + per-device rollout — so they fire for `deploy`
-/// (which calls this, with or without `--skip-build`). The `pre` hook runs after
-/// the target-arch check but before the push; `post` after every device has
-/// finished, even if some failed (each device's outcome in its metadata
-/// `results`) — the run still fails afterwards if any device did.
-///
-/// `max_workers` is the manifest's `[concurrency] upgrade` cap (`None` =
-/// unbounded), bounding how many devices roll out at once.
+/// Direct device step across `targets`: serve the local manifest list `list_ref`
+/// once from a single loopback registry shared by the whole fleet (it handles
+/// concurrent pulls), and ship each device the member of `images` matching its
+/// arch, stored on the device as `device_ref` (the project's
+/// `localhost/<name>:latest`). Returns the per-device [`fleet::Report`], failures
+/// included, for the caller to raise after its `post` hook.
 ///
 /// # Errors
 ///
-/// Returns an error if no target arches are configured, a hook fails, the push fails,
-/// or any device's upgrade fails.
-pub(crate) fn run(
-	manifest: &Manifest,
-	skip_bootc_upgrade: bool,
-	channel: &str,
-	job: &mut Scope,
-) -> Result<()> {
-	let images = manifest.images();
-	let remotes = manifest.deploy_remotes().to_ssh();
-	let hooks = manifest.hooks();
-	if images.is_empty() {
-		bail!("no target arches to deploy — set `[targets]` in bootcher.toml");
-	}
-	let remote_hosts: Vec<String> = remotes.iter().map(|s| s.host().to_owned()).collect();
-	let provenance = crate::context::GitProvenance::detect(std::path::Path::new("."), job);
-	// Compute the immutable CalVer tag now, while `provenance` is still whole (its
-	// fields are moved into `meta` just below). The commit suffix pins the tag to source.
-	let calver = crate::context::calver_now(provenance.short_sha().as_deref());
-	let mut meta = HookMetadata {
-		phase: Phase::Upgrade,
-		stage: Stage::Pre,
-		image_name: manifest.general.name.clone(),
-		arches: images.iter().map(|i| i.arch).collect(),
-		// The ref pushed/served and recorded as the device bootc origin: the registry
-		// list ref for this run's channel in registry mode, else the LAN-served local
-		// list ref (LAN has no channels).
-		image_ref: manifest.registry_list_ref(channel).unwrap_or_else(|| manifest.local_list_ref()),
-		revision: provenance.revision,
-		version: provenance.version,
-		output_dir: None,
-		targets: None,
-		remotes: (!remote_hosts.is_empty()).then_some(remote_hosts),
-		credential: None,
-		results: None,
-	};
-	crate::hooks::run(&meta, hooks.upgrade.pre.as_deref(), job)?;
-	let report = if let Some(channel_ref) = manifest.registry_list_ref(channel)
-	// The immutable companion tag for this push (see `run_registry`); both refs
-	// come from the manifest, not any one arch's image.
-	 && let Some(version_ref) = manifest.registry_version_ref(&calver)
-	{
-		let signing = manifest.signing();
-		run_registry(
-			&manifest.local_list_ref(),
-			(&channel_ref, &version_ref),
-			&remotes,
-			signing.as_ref(),
-			manifest.concurrency().upgrade,
-			skip_bootc_upgrade,
-			job,
-		)?
-	} else if remotes.is_empty() {
-		bail!(
-			"LAN deploys need at least one target in the `[deploy] remotes` array \
-			 (user@host) to ship the image to; or set `registry` in bootcher.toml \
-			 to push to a registry without one"
-		);
-	} else {
-		run_lan(&images, &manifest.local_list_ref(), &remotes, manifest.concurrency().upgrade, job)?
-	};
-	crate::hooks::run_post(&mut meta, hooks.upgrade.post.as_deref(), &report, job)
-}
-
-/// Registry backend: assemble the per-arch members into one multi-arch manifest
-/// list, push it to the configured registry (under an immutable `CalVer` tag —
-/// `:YYYYMMDD.HHMMSS.g<short-sha>`, or `:YYYYMMDD.HHMMSS` with no git — then the
-/// run's mutable channel tag — `:latest` by default — for the same digest), then
-/// point each listed device's bootc origin at the (suffix-free) registry ref and upgrade it now. With no
-/// remotes the push is the whole job — every target's auto-update timer fetches
-/// the new revision (and resolves its own arch out of the list) on its own. The
-/// first switch is idempotent against a registry-mode provision (origin already
-/// the ref). Returns the per-device [`fleet::Report`] (empty when no device was
-/// switched), failures included, for the caller to raise after its `post` hook.
-fn run_registry(
-	local_list_ref: &str,
-	// `(channel_ref, version_ref)`: the run's mutable channel tag (`:latest` by
-	// default) and the immutable CalVer tag (see `calver_now`), both for the same
-	// pushed digest.
-	refs: (&str, &str),
-	remotes: &[Ssh],
-	signing: Option<&SigningConfig>,
-	max_workers: Option<NonZeroUsize>,
-	skip_bootc_upgrade: bool,
-	job: &mut Scope,
-) -> Result<fleet::Report> {
-	let (channel_ref, version_ref) = refs;
-	let enforce_sig = push_multiarch_list(local_list_ref, channel_ref, version_ref, signing, job)?;
-
-	if remotes.is_empty() || skip_bootc_upgrade {
-		job.println(format!(
-			"pushed {channel_ref} (also tagged {version_ref}) — targets will pull it on their next \
-			 auto-update; add a target to `[deploy] remotes` to apply it immediately"
-		));
-		return Ok(fleet::Report::empty("upgrade", "device"));
-	}
-
-	// Apply to every listed device in parallel, attempting all (see `fleet`).
-	fleet::for_each_remote(remotes, "upgrade", max_workers, job, |remote, scope| {
-		apply_registry(channel_ref, enforce_sig, remote, scope)
-	})
-}
-
-/// Assemble the per-arch members into one multi-arch manifest list and push it to
-/// the registry under both the immutable `version_ref` (`CalVer`, see `calver_now`)
-/// tag and the mutable `channel_ref` (`:<channel>`, `:latest` by default) tag — the
-/// same digest under both. Returns whether signature enforcement is in effect
-/// (`true` iff `signing` is configured), so the caller records a verifying origin on
-/// each device.
-///
-/// The version tag goes first and the channel only moves once it has landed, so a
-/// build devices follow always carries a durable tag: were the channel moved first
-/// and the version push then failed, the next deploy would leave that build
-/// untagged — out of rollback history and fair game for registry cleanup.
-///
-/// Shared by `upgrade`/`deploy` (which then switch + reboot each device) and
-/// [`crate::jobs::takeover`] (where each host pulls the pushed ref directly): both
-/// need the image *in* the registry before a device can fetch it.
-///
-/// # Errors
-///
-/// Returns an error if either push fails (e.g. this host isn't logged in to the
-/// registry), or if the two pushes produce different digests.
-pub(crate) fn push_multiarch_list(
-	local_list_ref: &str,
-	channel_ref: &str,
-	version_ref: &str,
-	signing: Option<&SigningConfig>,
-	job: &mut Scope,
-) -> Result<bool> {
-	// Assemble + push the multi-arch image to the registry. `podman manifest push`
-	// streams line-oriented progress to a pipe (not a TTY), so `run_command`'s
-	// line-forwarding renders it cleanly without clobbering the live bars.
-	// Push auth is the builder's own concern (this machine's `podman login`),
-	// distinct from the read-only pull token baked into the image.
-	job.step("push image");
-	// The list object was assembled by the build phase; `local_list_ref` just names it.
-
-	// With signing configured, the version push carries
-	// `--sign-by-sigstore-private-key` (having ensured this host is configured to
-	// store the cosign signature attachment), and the caller records a
-	// signature-enforcing origin so every later upgrade verifies the signature
-	// against the injected policy. One signature is enough: sigstore attachments are
-	// keyed by manifest *digest*, and both tags name the same digest, so bootc
-	// verifies it whichever tag the device resolved it through.
-	let sign = match signing {
-		Some(cfg) => {
-			let ns = crate::jobs::signing::registry_namespace(channel_ref);
-			crate::jobs::signing::ensure_push_attachments(ns, job)?;
-			Some(crate::jobs::signing::sign_args(cfg)?)
-		}
-		None => None,
-	};
-	let enforce_sig = sign.is_some();
-
-	let version_digest = push_list(job, local_list_ref, version_ref, sign)?;
-	// Same content ⇒ only a manifest PUT, no layer re-upload.
-	let channel_digest = push_list(job, local_list_ref, channel_ref, None)?;
-
-	// Both pushes serialize the same local list, so they must produce the same
-	// digest — that is what lets the one signature cover the channel too. Check it
-	// rather than assume it.
-	if version_digest != channel_digest {
-		bail!(
-			"pushing the same build produced different digests: {version_ref} is \
-			 {version_digest} but {channel_ref} is {channel_digest}{}",
-			if enforce_sig {
-				" — only the version tag's digest is signed, so devices enforcing signatures \
-				 will reject the channel"
-			} else {
-				""
-			}
-		);
-	}
-
-	Ok(enforce_sig)
-}
-
-/// `podman manifest push --all` the local list `local_list_ref` to `dest`, returning
-/// the pushed list's digest. `--all` ships every member manifest + blobs the list
-/// references, not just the host-arch one, so the registry ends up with the full
-/// multi-arch image. `sign` splices in the signing flags; the temp passphrase file it
-/// holds is removed when it drops, right after this push.
-fn push_list(
-	job: &Scope,
-	local_list_ref: &str,
-	dest: &str,
-	sign: Option<crate::jobs::signing::SignArgs>,
-) -> Result<String> {
-	let digest_dir = tempfile::tempdir().context("creating a temp dir for the pushed digest")?;
-	let digest_file = digest_dir.path().join("digest");
-	let mut argv: Vec<OsString> =
-		["podman", "manifest", "push", "--all"].iter().map(OsString::from).collect();
-	argv.push(OsString::from("--digestfile"));
-	argv.push(digest_file.clone().into_os_string());
-	if let Some(sign) = &sign {
-		argv.extend(sign.flags().iter().cloned());
-	}
-	argv.push(OsString::from(local_list_ref));
-	argv.push(OsString::from(dest));
-	run_argv_labeled(job, &argv, "podman manifest push").with_context(|| {
-		let host = dest.split('/').next().unwrap_or(dest);
-		format!(
-			"`podman manifest push` to {dest} failed — is this machine logged in? (`podman login {host}`)"
-		)
-	})?;
-	drop(sign);
-	let digest = std::fs::read_to_string(&digest_file)
-		.with_context(|| format!("reading the digest `podman manifest push` wrote for {dest}"))?;
-	Ok(digest.trim().to_owned())
-}
-
-/// Switch one device's bootc origin to `channel_ref` and reboot it into the upgrade.
-/// When `enforce_sig` (i.e. signing is configured in `[deploy] registry`), the switch carries
-/// `--enforce-container-sigpolicy`, which records the origin so bootc verifies the
-/// image against `/etc/containers/policy.json` and rejects an unsigned/tampered one
-/// on this and every later `upgrade` (`upgrade` has no flag of its own — the origin
-/// remembers). Runs on its own concurrent [`Scope`] (the device name is its
-/// header), so each step renders as a live bar beneath without a per-device counter.
-fn apply_registry(
-	channel_ref: &str,
-	enforce_sig: bool,
-	remote: &Ssh,
-	job: &mut Scope,
-) -> Result<()> {
-	// 1. Point bootc at the registry ref. Idempotent: "Image specification is
-	//    unchanged" on every run after the first (incl. the switch away from a LAN
-	//    containers-storage origin). The signing flag is a no-op to re-apply.
-	let flag = if enforce_sig { "--enforce-container-sigpolicy " } else { "" };
-	remote.run_sh(job, "bootc switch", &[], format!("sudo bootc switch {flag}{channel_ref}"))?;
-
-	// 2. Stage a new deployment, pulling from the registry.
-	remote.run_sh(job, "bootc upgrade", &[], "sudo bootc upgrade".into())?;
-	// 3. Reboot into it and check it's what booted. Nothing staged means the device
-	//    already runs this image (e.g. its auto-update got there first).
-	reboot_into_staged(remote, job)
-}
-
-/// LAN backend: ship to and reboot each listed device in turn. Each device is a
-/// single arch, identified over ssh, so it gets the matching member out of
-/// `images`. Returns the per-device [`fleet::Report`], failures included, like
-/// [`run_registry`].
-fn run_lan(
+/// Returns an error if the list can't be served, or a signal cut the rollout short.
+pub(crate) fn run_direct(
 	images: &[ImageRef],
-	local_list_ref: &str,
-	remotes: &[Ssh],
+	list_ref: &str,
+	device_ref: &str,
+	targets: &[Ssh],
 	max_workers: Option<NonZeroUsize>,
 	job: &mut Scope,
 ) -> Result<fleet::Report> {
-	// Serve the multi-arch list (assembled by the build phase) once, from a single
-	// loopback registry shared by the whole fleet (it handles concurrent pulls),
-	// rather than standing one up per device. Each device pulls the suffix-free
-	// `latest` list over its own forward and resolves its own arch member out of it.
-	let reg = registry::serve_manifest_list(local_list_ref, "latest", job)?;
+	let reg = registry::serve_manifest_list(list_ref, "latest", job)?;
 	let port = reg.port();
-
-	// Apply to every device in parallel, attempting all (see `fleet`).
-	let result = fleet::for_each_remote(remotes, "upgrade", max_workers, job, |remote, scope| {
-		apply_lan(images, local_list_ref, remote, port, scope)
+	let result = fleet::for_each_remote(targets, "upgrade", max_workers, job, |remote, scope| {
+		apply_direct(images, device_ref, remote, port, scope)
 	});
-
 	// Keep serving until every device has finished pulling, then tear it down.
 	drop(reg);
 	result
 }
 
-fn apply_lan(
+/// The direct device step on one device; see [`run_direct`].
+pub(crate) fn apply_direct(
 	images: &[ImageRef],
-	local_list_ref: &str,
+	device_ref: &str,
 	remote: &Ssh,
 	port: u16,
 	job: &mut Scope,
@@ -349,21 +87,12 @@ fn apply_lan(
 	let Some(image) = images.iter().find(|i| i.arch == arch) else {
 		let built: Vec<_> = images.iter().map(|i| i.arch.to_string()).collect();
 		bail!(
-			"{} is {arch}, but `[targets]` only builds {} — \
-			 add \"{arch}\" to deploy to this device",
+			"{} is {arch}, but this run built only {} — add \"{arch}\" to `[targets]` to \
+			 update this device",
 			remote.host(),
 			built.join(", ")
 		);
 	};
-
-	// Fully rootless on the builder: `registry::serve` reads the image from the
-	// user's rootless storage where `build::run` placed it, and `ssh` uses the
-	// invoking user's `~/.ssh/`. Remote-side `sudo` is embedded in the ssh
-	// commands below (and the tunnelled `podman pull` in `transfer`).
-	//
-	// The device stores and switches to the suffix-free `local_list_ref` (its single
-	// pulled member is tagged as it), so a multi-arch project pins every device to
-	// the same `localhost/<name>:latest` origin.
 
 	// Pre-flight: if the device already stores this exact image (the arch member's
 	// local ID against the device's stored list tag), skip the multi-GB transfer.
@@ -371,29 +100,26 @@ fn apply_lan(
 	// shutdown — so the switch + upgrade below still run, and bootc stages nothing
 	// when the booted deployment already matches.
 	let local_id = local_podman_image_id(&image.tag())?;
-	let stored = remote_podman_image_id(remote, local_list_ref)?.is_some_and(|id| id == local_id);
+	let stored = remote_podman_image_id(remote, device_ref)?.is_some_and(|id| id == local_id);
 
-	// Runs on its own concurrent `Scope` (header = the device name), so each step
-	// below renders as a live bar beneath it without a per-device step counter.
-
-	// 1. Ship the image to the target's local containers-storage. The builder
-	//    serves it from a loopback-only mini-registry and the device pulls over
-	//    an SSH remote forward, so podman only fetches the layers the device is
-	//    missing and the secret-bearing bytes ride the trusted SSH channel, not
-	//    cleartext LAN HTTP.
+	// 1. Ship the image to the target's local containers-storage over the SSH
+	//    tunnel (see `transfer`).
 	if !stored {
-		transfer(job, image, local_list_ref, remote, port)?;
+		transfer(job, image, device_ref, remote, port)?;
 	}
 
 	// 2. Pin the bootc image spec to the containers-storage transport. Without this
 	//    bootc defaults to the `registry` transport and tries to fetch
 	//    https://localhost/v2/... from a non-existent local registry. Idempotent:
 	//    a no-op ("Image specification is unchanged") on every run after the first.
+	//    This also re-pins a fresh direct device from the signature-enforcing origin
+	//    its install recorded to an unverified one: a direct device's trust is the
+	//    SSH channel, not a signature.
 	remote.run_sh(
 		job,
 		"bootc switch",
 		&[],
-		format!("sudo bootc switch --transport containers-storage {local_list_ref}"),
+		format!("sudo bootc switch --transport containers-storage {device_ref}"),
 	)?;
 
 	// 3. Stage a new deployment from the (now updated) local image.
@@ -416,6 +142,32 @@ fn apply_lan(
 	reboot_into_staged(remote, job)
 }
 
+/// The channel device step on one device: run `trust_script` first when signing is
+/// on (it installs or refreshes the trust files — they must land before
+/// `--enforce-container-sigpolicy`, which a permissive default policy makes bootc
+/// refuse), then point the origin at `channel_ref` (verifying when `enforce`),
+/// upgrade, and reboot into it. Idempotent: "Image specification is unchanged" and
+/// nothing staged on a device already there.
+///
+/// # Errors
+///
+/// Returns an error if any remote step fails, or the device boots something other
+/// than what was staged.
+pub(crate) fn apply_channel(
+	channel_ref: &str,
+	trust_script: Option<&str>,
+	remote: &Ssh,
+	job: &mut Scope,
+) -> Result<()> {
+	if let Some(script) = trust_script {
+		remote.run_sh(job, "install trust files", &[], script.to_owned())?;
+	}
+	let flag = if trust_script.is_some() { "--enforce-container-sigpolicy " } else { "" };
+	remote.run_sh(job, "bootc switch", &[], format!("sudo bootc switch {flag}{channel_ref}"))?;
+	remote.run_sh(job, "bootc upgrade", &[], "sudo bootc upgrade".into())?;
+	reboot_into_staged(remote, job)
+}
+
 /// Reboot `remote` into its staged bootc deployment and check that it booted it.
 /// Nothing staged means the booted deployment already is the image `bootc upgrade`
 /// was pointed at, so there's nothing to reboot for.
@@ -433,7 +185,7 @@ fn reboot_into_staged(remote: &Ssh, job: &Scope) -> Result<()> {
 	wait_online(remote, job)?;
 
 	let booted = bootc_status_after_reboot(remote)?.booted;
-	if booted.as_ref() != Some(&staged) {
+	if booted.as_ref().map(|b| &b.digest) != Some(&staged.digest) {
 		let booted = booted.map_or_else(|| "no bootc deployment".to_owned(), |b| b.to_string());
 		bail!(
 			"{} rebooted into {booted} instead of the staged {staged}: the staged deployment \
@@ -447,7 +199,7 @@ fn reboot_into_staged(remote: &Ssh, job: &Scope) -> Result<()> {
 /// [`bootc_status`], retried for a while: right after a reboot one ssh login can get
 /// in and the next still be reset while the device settles (sshd restarting,
 /// qemu user-net), and that blip says nothing about what booted.
-fn bootc_status_after_reboot(remote: &Ssh) -> Result<BootcStatus> {
+fn bootc_status_after_reboot(remote: &Ssh) -> Result<crate::device::HostStatus> {
 	const ATTEMPTS: u32 = 15;
 	const RETRY: Duration = Duration::from_secs(2);
 	let mut attempt = 1;
@@ -462,49 +214,13 @@ fn bootc_status_after_reboot(remote: &Ssh) -> Result<BootcStatus> {
 	}
 }
 
-/// A bootc deployment's image, as `bootc status --format json` reports it: the
-/// manifest digest identifies it, the version label (if any) names it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DeployedImage {
-	digest: String,
-	version: Option<String>,
-}
-
-impl std::fmt::Display for DeployedImage {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		match &self.version {
-			Some(v) => write!(f, "version {v} ({})", self.digest),
-			None => f.write_str(&self.digest),
-		}
-	}
-}
-
-/// The booted and staged deployments' images on a device.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct BootcStatus {
-	booted: Option<DeployedImage>,
-	staged: Option<DeployedImage>,
-}
-
-/// Read `remote`'s booted and staged deployments from `bootc status --format json`.
-fn bootc_status(remote: &Ssh) -> Result<BootcStatus> {
+/// Read `remote`'s bootc status (spec, booted and staged deployments).
+fn bootc_status(remote: &Ssh) -> Result<crate::device::HostStatus> {
 	let json = remote
 		.read_sh("sudo bootc status --format json")
 		.with_context(|| format!("reading `bootc status` on {}", remote.host()))?;
-	parse_bootc_status(&json)
+	crate::device::parse_status(&json)
 		.with_context(|| format!("parsing `bootc status --format json` from {}", remote.host()))
-}
-
-fn parse_bootc_status(json: &str) -> Result<BootcStatus> {
-	let v: serde_json::Value = serde_json::from_str(json)?;
-	let image = |slot: &str| {
-		let img = v.pointer(&format!("/status/{slot}/image"))?;
-		Some(DeployedImage {
-			digest: img.get("imageDigest")?.as_str()?.to_owned(),
-			version: img.get("version").and_then(|v| v.as_str()).map(str::to_owned),
-		})
-	};
-	Ok(BootcStatus { booted: image("booted"), staged: image("staged") })
 }
 
 /// Trigger a reboot and block until the device has actually left the network.
@@ -650,7 +366,7 @@ fn classify_probe(success: bool, stderr: &str) -> Probe {
 }
 
 /// Ship `image` to the target's local containers-storage incrementally, from the
-/// fleet's shared loopback registry on `port` ([`run_lan`] stands up one for the
+/// fleet's shared loopback registry on `port` ([`run_direct`] stands up one for the
 /// whole rollout). The device `podman pull`s the suffix-free `latest` list over an
 /// `ssh -R` remote forward — resolving its own arch member — so podman only
 /// fetches the layers the device lacks, and the transfer inherits SSH's encryption +
@@ -658,8 +374,7 @@ fn classify_probe(success: bool, stderr: &str) -> Probe {
 /// so its bytes must never cross the LAN in the clear.
 ///
 /// The pull lands under the ephemeral `127.0.0.1:<port>/…` ref, so it's re-tagged
-/// to the stable `local_list_ref` (the project's [`Manifest::local_list_ref`],
-/// `localhost/…:latest`); the following `bootc switch --transport
+/// to the stable `local_list_ref` (the project's `localhost/<name>:latest`); the following `bootc switch --transport
 /// containers-storage <tag>` then records a port-independent origin.
 pub(crate) fn transfer(
 	job: &Scope,
@@ -683,7 +398,7 @@ pub(crate) fn transfer(
 	Ok(())
 }
 
-/// Identify a LAN deploy target's CPU arch over ssh (`uname -m`), mapped to an
+/// Identify a device's CPU arch over ssh (`uname -m`), mapped to an
 /// [`Arch`] bootcher builds for, so it's shipped the matching member of a
 /// multi-arch project. A machine string bootcher doesn't build is an error.
 pub(crate) fn remote_arch(remote: &Ssh) -> Result<Arch> {
@@ -711,10 +426,10 @@ fn local_podman_image_id(tag: &str) -> Result<String> {
 /// with the full upgrade.
 fn remote_podman_image_id(remote: &Ssh, tag: &str) -> Result<Option<String>> {
 	// `unchecked()`: a missing image makes `podman image inspect` exit 125, which
-	// is the expected "not present" case here (e.g. a device provisioned via the
-	// registry backend has no `localhost/…` ref). Without it, duct's `read()`
+	// is the expected "not present" case here (e.g. a device provisioned from a
+	// channel device has no `localhost/…` ref). Without it, duct's `read()`
 	// turns that non-zero exit into an error before we ever get to inspect the
-	// captured "Error: …" text below, breaking the LAN pre-flight entirely.
+	// captured "Error: …" text below, breaking the direct pre-flight entirely.
 	let id = remote
 		.sh_expr(&format!("sudo podman image inspect -f '{{{{.Id}}}}' {}", sh_quote(tag)))
 		.stderr_to_stdout()
@@ -730,34 +445,6 @@ fn remote_podman_image_id(remote: &Ssh, tag: &str) -> Result<Option<String>> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-
-	#[test]
-	fn bootc_status_reads_booted_and_staged() {
-		let json = r#"{"apiVersion":"org.containers.bootc/v1","kind":"BootcHost","status":{
-			"staged":{"image":{"image":{"image":"localhost/x:latest","transport":"containers-storage"},
-				"version":"3978a03","timestamp":null,"imageDigest":"sha256:bbb"},"pinned":false},
-			"booted":{"image":{"image":{"image":"localhost/x:latest","transport":"containers-storage"},
-				"timestamp":null,"imageDigest":"sha256:aaa"},"pinned":false},
-			"rollback":null}}"#;
-		let status = parse_bootc_status(json).unwrap();
-		assert_eq!(
-			status.booted,
-			Some(DeployedImage { digest: "sha256:aaa".into(), version: None })
-		);
-		assert_eq!(
-			status.staged,
-			Some(DeployedImage { digest: "sha256:bbb".into(), version: Some("3978a03".into()) })
-		);
-		assert_eq!(status.staged.unwrap().to_string(), "version 3978a03 (sha256:bbb)");
-	}
-
-	#[test]
-	fn bootc_status_without_staged_deployment() {
-		let json = r#"{"status":{"staged":null,"booted":{"image":{"imageDigest":"sha256:aaa"}}}}"#;
-		let status = parse_bootc_status(json).unwrap();
-		assert!(status.staged.is_none());
-		assert_eq!(status.booted.unwrap().digest, "sha256:aaa");
-	}
 
 	#[test]
 	fn probe_success_is_up() {

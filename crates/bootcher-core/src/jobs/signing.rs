@@ -35,7 +35,7 @@ use toml_edit;
 
 /// Env var supplying the signing-key passphrase on a non-TTY (CI) run, where
 /// there's no prompt. Mirrors `BOOTCHER_PULL_TOKEN` in [`crate::jobs::secrets`].
-const ENV_SIGN_PASSPHRASE: &str = "BOOTCHER_SIGN_PASSPHRASE";
+pub(crate) const ENV_SIGN_PASSPHRASE: &str = "BOOTCHER_SIGN_PASSPHRASE";
 
 /// PEM block type containers/image (`podman --sign-by-sigstore-private-key`)
 /// requires; any other label is rejected with "unsupported pem type".
@@ -85,14 +85,15 @@ pub fn enroll(key_path: &Path, pub_path: &Path, force: bool) -> Result<()> {
 }
 
 /// The bootc install drop-in [`enable_signing`] bakes into the project's `sysroot/`
-/// overlay, so a freshly provisioned device enforces the signature policy from its
-/// very first boot — not only after the first `deploy` switches the origin. See
-/// `bootc-install-config(5)`.
+/// overlay, so every install of the image records a signature-enforcing origin from
+/// its very first boot. See `bootc-install-config(5)`. A direct device installs and
+/// boots fine with it and no trust files (S1); its first `device deploy` re-pins it
+/// to an unverified `containers-storage` origin.
 const ENFORCE_SIGPOLICY_CONFIG: &str = "\
-# Enforce the container signature policy (written by `bootcher sign enroll`). Makes
-# bootc record a verifying origin and reject an image whose signature doesn't
-# satisfy /etc/containers/policy.json. Remove this (and change `[deploy] registry`
-# back to a plain URL string) to go back to unsigned images.
+# Enforce the container signature policy (written by `bootcher signing enroll`).
+# Makes bootc record a verifying origin and reject an image whose signature doesn't
+# satisfy /etc/containers/policy.json. Remove this (and `key` from [registry]) to go
+# back to unsigned images.
 [install]
 enforce-container-sigpolicy = true
 ";
@@ -101,47 +102,51 @@ enforce-container-sigpolicy = true
 /// `sysroot/` overlay (copied to `/` by the scaffold Containerfile's `COPY sysroot/ /`).
 pub const ENFORCE_SIGPOLICY_PATH: &str = "sysroot/usr/lib/bootc/install/30-bootcher-signing.toml";
 
-/// Outcome of [`enable_signing`]: the relative key/pub filenames it wrote, plus
-/// whether `[deploy] registry` was actually patched (false ⇒ LAN mode, no registry
-/// to wire — the caller should error).
+/// Outcome of [`enable_signing`]: the relative key/pub filenames it wrote.
 pub struct Enrolled {
 	/// The private-key filename, e.g. `cosign.key` (relative to the project root).
 	pub key: String,
 	/// The public-key filename, e.g. `cosign.pub`.
 	pub public: String,
-	/// `false` if `bootcher.toml` had no `[deploy] registry` entry to patch.
-	pub registry_patched: bool,
 }
 
 /// Fully enable image signing for the bootcher project rooted at `root`: generate a
-/// `<prefix>.key`/`<prefix>.pub` keypair, patch `[deploy] registry` to the signing
-/// inline-table form, and (when a registry is configured) bake the
-/// `enforce-container-sigpolicy` bootc install drop-in into `sysroot/`. This is the
-/// single source of truth for the signing wiring, shared by `bootcher sign enroll`
-/// (`root` = cwd) and `bootcher init` (`root` = the freshly scaffolded project dir),
-/// so the two can't drift.
+/// `<prefix>.key`/`<prefix>.pub` keypair, set `[registry] key`, and bake the
+/// `enforce-container-sigpolicy` bootc install drop-in into `sysroot/`. The local
+/// half of `bootcher signing enroll`, shared with `bootcher init` (`root` = the
+/// freshly scaffolded project dir), so the two can't drift.
 ///
-/// The sigpolicy drop-in is written only when absent, so a key rotation
-/// (`enroll <newprefix>`) refreshes the keypair without clobbering a drop-in the
-/// user may have edited.
+/// The sigpolicy drop-in is written only when absent, so a user-edited one is left
+/// alone.
 ///
 /// # Errors
 ///
-/// Returns an error if the key already exists (without `force`), passphrase
-/// collection or key generation fails, or any file can't be read/written.
-pub fn enable_signing(root: &Path, prefix: &str, force: bool) -> Result<Enrolled> {
+/// Returns an error if the manifest has no `[registry]`, the key already exists,
+/// passphrase collection or key generation fails, or any file can't be read/written.
+pub fn enable_signing(root: &Path, prefix: &str) -> Result<Enrolled> {
 	let key = format!("{prefix}.key");
 	let public = format!("{prefix}.pub");
-	enroll(&root.join(&key), &root.join(&public), force)?;
-
-	let registry_patched = patch_registry_key(&root.join(crate::context::MANIFEST), &key)?;
-
-	// The drop-in only matters alongside a configured registry; in LAN mode (no
-	// registry to patch) skip it and let the caller report the missing registry.
-	if registry_patched {
-		write_enforce_sigpolicy(root)?;
+	let manifest = root.join(crate::context::MANIFEST);
+	if !has_registry_table(&manifest)? {
+		bail!(
+			"signing protects registry pulls, but bootcher.toml has no `[registry]` — add one \
+			 (with `url` and `channels`) first"
+		);
 	}
-	Ok(Enrolled { key, public, registry_patched })
+	enroll(&root.join(&key), &root.join(&public), false)?;
+	patch_registry_key(&manifest, &key)?;
+	write_enforce_sigpolicy(root)?;
+	Ok(Enrolled { key, public })
+}
+
+/// Whether the manifest at `path` has a `[registry]` table.
+fn has_registry_table(path: &Path) -> Result<bool> {
+	let content =
+		fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+	let doc = content
+		.parse::<toml_edit::DocumentMut>()
+		.with_context(|| format!("parsing {}", path.display()))?;
+	Ok(doc.get("registry").is_some_and(toml_edit::Item::is_table_like))
 }
 
 /// Write [`ENFORCE_SIGPOLICY_CONFIG`] into `root`'s `sysroot/` overlay (creating
@@ -159,16 +164,11 @@ fn write_enforce_sigpolicy(root: &Path) -> Result<()> {
 		.with_context(|| format!("writing {}", path.display()))
 }
 
-/// Patch the `[deploy] registry` entry in `bootcher.toml` so it includes
-/// `key = <key_path>`, preserving all existing comments and formatting.
+/// Set `key = <key_path>` in the `[registry]` table of the manifest at
+/// `manifest_path`, preserving all existing comments and formatting (a `[registry]`
+/// table or an inline `registry = { … }` both work).
 ///
-/// Handles three shapes:
-/// - `registry = "url"` → replaced with `registry = { url = "url", key = "<key_path>" }`
-/// - `registry = { url = "...", ... }` → `key` field added or updated in-place
-/// - `[deploy.registry]` dotted table → `key` field added or updated in-place
-///
-/// Returns `true` if the file was updated, `false` if `[deploy] registry` is
-/// absent (file exists but registry not yet configured — caller should error).
+/// Returns `true` if the file was updated, `false` if there is no `[registry]`.
 ///
 /// # Errors
 ///
@@ -187,26 +187,13 @@ pub fn patch_registry_key(manifest_path: &Path, key_path: &str) -> Result<bool> 
 		.parse::<toml_edit::DocumentMut>()
 		.with_context(|| format!("parsing {}", manifest_path.display()))?;
 
-	let registry = &mut doc["deploy"]["registry"];
-	if registry.is_none() {
-		return Ok(false);
-	}
-
-	if let Some(url) = registry.as_str().map(str::to_owned) {
-		let mut t = toml_edit::InlineTable::new();
-		t.insert("url", url.into());
-		t.insert("key", key_path.into());
-		*registry = toml_edit::Item::Value(toml_edit::Value::InlineTable(t));
-	} else if let Some(t) = registry.as_inline_table_mut() {
+	let Some(registry) = doc.get_mut("registry") else { return Ok(false) };
+	if let Some(t) = registry.as_inline_table_mut() {
 		t.insert("key", key_path.into());
 	} else if let Some(t) = registry.as_table_mut() {
 		t.insert("key", toml_edit::value(key_path));
 	} else {
-		bail!(
-			"unexpected `[deploy] registry` shape in {} — expected a string, inline table, or \
-			 dotted table",
-			manifest_path.display()
-		);
+		bail!("unexpected `registry` shape in {} — expected a table", manifest_path.display());
 	}
 
 	fs::write(manifest_path, doc.to_string())
@@ -216,7 +203,7 @@ pub fn patch_registry_key(manifest_path: &Path, key_path: &str) -> Result<bool> 
 
 /// Check the external tools [`verify`] needs: just `podman` (the pull that
 /// performs the signature check). Unlike the other jobs' `preflight`, it takes no
-/// manifest — `sign verify` can run outside a project when `--pubkey` is passed.
+/// manifest — `signing verify` can run outside a project when `--pubkey` is passed.
 ///
 /// # Errors
 ///
@@ -234,16 +221,17 @@ pub fn preflight_verify() -> Result<()> {
 /// signature from `pubkey_path`. Wraps `podman pull --signature-policy` with a
 /// throwaway policy requiring sigstoreSigned from the given key — the same
 /// verification path the device uses on `bootc upgrade`. Exits with an error if
-/// the signature is missing or invalid.
+/// the signature is missing or invalid. A plain-HTTP registry (a local test one) is
+/// declared the usual way, `insecure = true` in `registries.conf`.
 ///
 /// # Errors
 ///
 /// Returns an error if the signature is missing or invalid, or a `podman` command fails.
-pub fn verify(image_ref: &str, pubkey_path: &Path, tls_verify: bool, job: &Scope) -> Result<()> {
+pub fn verify(image_ref: &str, pubkey_path: &Path, job: &Scope) -> Result<()> {
 	let ns = registry_namespace(image_ref);
 
 	// Ensure the build host's registries.d enables sigstore-attachment lookups
-	// for this namespace (same as deploy does on push).
+	// for this namespace (same as a publish does on push).
 	ensure_push_attachments(ns, job)?;
 
 	let tmp = tempfile::tempdir().context("temp dir for verify policy")?;
@@ -260,13 +248,10 @@ pub fn verify(image_ref: &str, pubkey_path: &Path, tls_verify: bool, job: &Scope
 		.context("writing verify policy.json")?;
 	let policy_str = tmp_policy.to_str().context("policy path is not valid UTF-8")?;
 
-	let tls = if tls_verify { "--tls-verify=true" } else { "--tls-verify=false" };
-
 	let argv: Vec<std::ffi::OsString> = vec![
 		"podman".into(),
 		"pull".into(),
 		"--quiet".into(),
-		tls.into(),
 		"--signature-policy".into(),
 		policy_str.into(),
 		format!("docker://{image_ref}").into(),
@@ -328,6 +313,7 @@ pub(crate) fn collect_passphrase(confirm: bool) -> Result<String> {
 /// The push-time signing flags plus the temp passphrase file they reference.
 /// Splice [`flags`](Self::flags) into a `podman manifest push` argv; keep the
 /// guard alive until the push returns so the file isn't removed early.
+#[cfg_attr(not(test), allow(dead_code))] // the publishing commands sign with it
 pub(crate) struct SignArgs {
 	/// Kept solely for its `Drop` (removes the temp passphrase file).
 	_pass_file: tempfile::NamedTempFile,
@@ -337,6 +323,7 @@ pub(crate) struct SignArgs {
 impl SignArgs {
 	/// `--sign-by-sigstore-private-key <key> --sign-passphrase-file <file>`.
 	#[must_use]
+	#[cfg_attr(not(test), allow(dead_code))]
 	pub(crate) fn flags(&self) -> &[OsString] {
 		&self.flags
 	}
@@ -345,21 +332,27 @@ impl SignArgs {
 /// Build the `podman` signing flags for `signing`: resolve the private key path
 /// (relative to the project root / cwd) and write the collected passphrase to a
 /// temp 0600 file podman reads via `--sign-passphrase-file` (so it never hits the
-/// argv or the process list). Used by the registry deploy push ([`crate::jobs::upgrade`]).
+/// argv or the process list). Used by every signed push.
 ///
 /// # Errors
 ///
 /// Returns an error if the signing key is missing, passphrase collection fails, or
 /// the temp passphrase file can't be created or written.
+#[cfg_attr(not(test), allow(dead_code))] // the publishing commands sign with it
 pub(crate) fn sign_args(signing: &SigningConfig) -> Result<SignArgs> {
-	let key = &signing.key;
+	sign_args_with(&signing.key, &collect_passphrase(false)?)
+}
+
+/// [`sign_args`] for the private key at `key` with an already-collected
+/// `passphrase` (a rotation signs with a key it just generated).
+#[cfg_attr(not(test), allow(dead_code))] // the publishing commands sign with it
+pub(crate) fn sign_args_with(key: &str, passphrase: &str) -> Result<SignArgs> {
 	if !Path::new(key).is_file() {
 		bail!(
-			"signing key {key} not found — generate one with `bootcher sign enroll` and set \
-			 `key` in `[deploy] registry`"
+			"signing key {key} not found — generate one with `bootcher signing enroll` (it sets \
+			 `key` in `[registry]`)"
 		);
 	}
-	let passphrase = collect_passphrase(false)?;
 	let mut pass_file =
 		tempfile::NamedTempFile::new().context("creating a temp passphrase file")?;
 	// 0600 before writing the secret.
@@ -382,8 +375,9 @@ pub(crate) fn sign_args(signing: &SigningConfig) -> Result<SignArgs> {
 /// (off by default → "writing sigstore attachments is disabled by configuration"),
 /// and podman has no per-push override, so bootcher writes a scoped drop-in into
 /// the invoking user's `~/.config/containers/registries.d`. Idempotent — the same
-/// content every run, written once. The device gets the equivalent config via
-/// provision (see [`crate::jobs::secrets`]); this is its build-host counterpart.
+/// content every run, written once. A channel device gets the equivalent config
+/// with its trust files (see [`crate::jobs::secrets`]); this is the build-host
+/// counterpart, which skopeo reads too.
 ///
 /// # Errors
 ///
@@ -560,12 +554,35 @@ mod tests {
 				assert!(std::time::Instant::now() < deadline, "registry did not start within 10s");
 				std::thread::sleep(std::time::Duration::from_millis(100));
 			}
+			// Declare the plain-HTTP loopback registry insecure the one way both podman
+			// and skopeo honour: a user `registries.conf.d` drop-in (removed on drop).
+			if let Some(conf) = insecure_dropin(host_port) {
+				let _ = std::fs::create_dir_all(conf.parent().unwrap());
+				let _ = std::fs::write(
+					&conf,
+					format!(
+						"[[registry]]\nlocation = \"localhost:{host_port}\"\ninsecure = true\n"
+					),
+				);
+			}
 			Self { name, host_port }
 		}
 	}
 
+	/// The per-user `registries.conf.d` drop-in marking `localhost:<port>` insecure.
+	fn insecure_dropin(port: u16) -> Option<std::path::PathBuf> {
+		let home = std::env::var_os("HOME")?;
+		Some(
+			Path::new(&home)
+				.join(format!(".config/containers/registries.conf.d/bootcher-test-{port}.conf")),
+		)
+	}
+
 	impl Drop for TestRegistry {
 		fn drop(&mut self) {
+			if let Some(conf) = insecure_dropin(self.host_port) {
+				let _ = std::fs::remove_file(conf);
+			}
 			// Reap the container and its anonymous blob volume.
 			crate::podman::reap_container(self.name);
 			// These tests tag/build/pull images under `localhost:<port>/…` into the
@@ -767,8 +784,8 @@ mod tests {
 			.run()
 			.expect("unsigned push failed");
 
-		let signed = verify(SIGNED, &pubk, false, &scope);
-		let unsigned = verify(UNSIGNED, &pubk, false, &scope);
+		let signed = verify(SIGNED, &pubk, &scope);
+		let unsigned = verify(UNSIGNED, &pubk, &scope);
 
 		assert!(signed.is_ok(), "verify rejected a validly signed image: {signed:?}");
 		assert!(unsigned.is_err(), "verify accepted an unsigned image");
