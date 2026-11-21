@@ -600,8 +600,7 @@ fn run_device(cmd: DeviceCmd, manifest: &Manifest) -> Result<()> {
 			device::deploy(manifest, skip_build, &remotes.remote, yes.yes)
 		}
 		DeviceCmd::Refresh { remotes, force, yes } => {
-			let _ = (remotes, force, yes);
-			anyhow::bail!("`device refresh` is not implemented yet")
+			device::refresh(manifest, &remotes.remote, force, yes.yes)
 		}
 		DeviceCmd::Switch { mode, remotes, skip_build, pull, yes } => device::switch(
 			manifest,
@@ -648,10 +647,7 @@ fn run_release(cmd: ReleaseCmd, manifest: &Manifest) -> Result<()> {
 		ReleaseCmd::Refresh { name, force, skip_build } => {
 			release::refresh(manifest, &name, force, skip_build)
 		}
-		ReleaseCmd::List { format } => {
-			let _ = format;
-			anyhow::bail!("`release list` is not implemented yet")
-		}
+		ReleaseCmd::List { format } => release::list(manifest, format.format.as_deref()),
 	}
 }
 
@@ -671,9 +667,29 @@ fn run_channel(cmd: ChannelCmd, manifest: &Manifest) -> Result<()> {
 				},
 			)
 		}
-		ChannelCmd::Status { .. } | ChannelCmd::Refresh { .. } => {
-			anyhow::bail!("`channel status` and `channel refresh` are not implemented yet")
+		ChannelCmd::Status { channels, format } => {
+			channel::status(manifest, &channels, format.as_deref())
 		}
+		ChannelCmd::Refresh {
+			channels,
+			exclude,
+			force,
+			skip_build,
+			remotes,
+			skip_remotes,
+			yes,
+		} => channel::refresh(
+			manifest,
+			&channel::RefreshArgs {
+				channels,
+				exclude,
+				force,
+				skip_build,
+				remotes: remotes.remote,
+				skip_remotes: skip_remotes.skip_remotes,
+				yes: yes.yes,
+			},
+		),
 	}
 }
 
