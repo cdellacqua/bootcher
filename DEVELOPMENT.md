@@ -107,6 +107,32 @@ cargo xtask release major   # 0.0.1 -> 1.0.0
 cargo xtask release 1.2.3   # set an explicit version
 ```
 
+Pre-releases are `vX.Y.Z-rc.N` tags. The release workflow publishes them as a
+GitHub prerelease and leaves the image's `latest` tag where it is:
+
+```sh
+cargo xtask release 0.2.0-rc.1   # start an rc for a minor/major release explicitly
+cargo xtask release rc           # 0.2.0-rc.1 -> 0.2.0-rc.2 (from a final 0.1.0: 0.1.1-rc.1)
+cargo xtask release minor        # finish it: 0.2.0-rc.2 -> 0.2.0 (patch would too)
+```
+
+From a pre-release, `patch`/`minor`/`major` finish it when it already has the
+shape the bump would produce, rather than skipping past it.
+
+Release candidates only come from `main`. To publish a test build of any other
+branch, cut a snapshot:
+
+```sh
+cargo xtask release snap         # 0.2.7 -> 0.2.8-snap.g1a2b3c4 (HEAD's short hash)
+cargo xtask release snap minor   # 0.2.7 -> 0.3.0-snap.g1a2b3c4
+```
+
+The hash makes each snapshot unique, so parallel branches never collide and
+nothing needs renumbering after a merge. The bump commit is made on a detached
+HEAD and pushed only as its tag, so the branch, and later `main`, never carry a
+snapshot version. Snapshots skip the scaffold's Fedora-release check, since they
+aren't what `bootcher init` users get.
+
 The version bump lives in [`crates/xtask/src/release.rs`](crates/xtask/src/release.rs),
 so the workflow needs no external tooling like `cargo-edit`/`cargo-release` — it
 edits `[workspace.package].version` in [Cargo.toml](Cargo.toml) in place with

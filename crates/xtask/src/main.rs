@@ -135,11 +135,21 @@ enum Cmd {
 	Changelog,
 	/// Cut a release: bump the workspace version, commit, tag vX.Y.Z, and push —
 	/// which triggers the release/image jobs in .github/workflows/release.yml.
-	/// Must be on a clean `main`.
+	/// Must be on a clean `main`, except for `snap`. Pre-release tags
+	/// (`vX.Y.Z-rc.N`, `vX.Y.Z-snap.g<sha>`) publish as a GitHub prerelease and
+	/// leave the image's `latest` tag alone.
 	Release {
-		/// `patch`, `minor`, `major`, or an explicit `X.Y.Z`.
+		/// `patch`, `minor`, `major`, `rc`, `snap`, or an explicit version
+		/// (`X.Y.Z`, `X.Y.Z-rc.1`). From a pre-release, `patch`/`minor`/`major`
+		/// finish it (`1.3.0-rc.2` → `1.3.0`); `rc` bumps `rc.N` → `rc.N+1`, or
+		/// starts `X.Y.(Z+1)-rc.1` from a final version. `snap` releases HEAD of
+		/// any branch as `X.Y.Z-snap.g<sha>`, committing the bump off-branch so
+		/// only the tag is pushed.
 		#[arg(default_value = "patch")]
 		bump: String,
+		/// For `snap` only: the base it's a snapshot of — `patch` (default),
+		/// `minor`, or `major`.
+		level: Option<String>,
 	},
 }
 
@@ -217,7 +227,7 @@ fn run() -> Result<ExitCode> {
 			cmd!(sh, "mdbook serve docs/").run()?;
 		}
 		Cmd::Changelog => print!("{}", changelog::unreleased(&sh)?),
-		Cmd::Release { bump } => release::release(&sh, &bump)?,
+		Cmd::Release { bump, level } => release::release(&sh, &bump, level.as_deref())?,
 	}
 	Ok(ExitCode::SUCCESS)
 }
