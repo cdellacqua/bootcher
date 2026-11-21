@@ -58,7 +58,7 @@ To preview the landing page, open `docs/site/index.html` in a browser after `car
 ### Runtime tools (for `cargo xtask run`)
 
 Building this repo needs only the Rust toolchain above, but actually *running* the
-binary against a project (`cargo xtask run build` / `disk` / `deploy` …) shells out to
+binary against a project (`cargo xtask run build` / `device provision` / `device deploy` …) shells out to
 `podman`, `ssh`, `sudo`, and — for the `vm` builder — `qemu`. The full matrix
 (which tool each subcommand needs, and the install hints) lives in the user-facing
 [Installation › Runtime dependencies](docs/src/installation.md#runtime-dependencies)
@@ -133,11 +133,11 @@ in two gated suites.
 ### Same-arch VM + registry (`cargo xtask e2e`)
 
 Builds and boots disks for the **host** architecture, KVM-accelerated. Covers
-the LAN rotate + upgrade lifecycle, the registry lifecycle + pull-token rotation
-+ signing enrollment, the LAN→registry origin switch, registry-mode image
-signing, release channels (a device tracks its channel, not `:latest`), and (on
-x86-64 hosts) `bootcher takeover` of a stock Debian cloud VM
-under both UEFI and legacy BIOS — the Debian image is downloaded once and cached
+the direct-device lifecycle (rotate, deploy, refresh), the channel lifecycle (publish,
+promote, refresh, pull-token rotation, signing enrollment), `device switch` in both
+directions, signing (rotate/retire, and a direct install in a signing project), a mixed
+fleet, and (on x86-64 hosts) `bootcher device takeover` of a stock Debian cloud VM in
+both modes, under UEFI and legacy BIOS — the Debian image is downloaded once and cached
 under `/var/tmp`. Prerequisites:
 
 - **podman** — to build and push container images
@@ -176,7 +176,7 @@ cargo xtask ci --e2e-cross
 
 ## Project layout
 
-- [`crates/bootcher-core/`](crates/bootcher-core/) — library: builders, jobs, pipelines, LAN registry, lifecycle hooks
+- [`crates/bootcher-core/`](crates/bootcher-core/) — library: builders, one job module per command domain, device classification, registry reads, the loopback registry, lifecycle hooks
 - [`crates/bootcher-core/scaffold/`](crates/bootcher-core/scaffold/) — embedded project template stamped out by `bootcher init`
 - [`crates/bootcher-cli/`](crates/bootcher-cli/) — the `bootcher` binary
 - [`crates/xtask/`](crates/xtask/) — dev-only task runner ([cargo-xtask](https://github.com/matklad/cargo-xtask) pattern) behind the `cargo xtask` alias; never published

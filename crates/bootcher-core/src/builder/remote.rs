@@ -211,7 +211,7 @@ impl RemoteBuilder {
 	) -> Result<Option<String>> {
 		let tag = image.tag();
 		if self.resident.borrow().contains(&tag) {
-			// Built here already: image-builder builds from `source_ref`, so in registry mode
+			// Built here already: image-builder builds from `source_ref`, so for a channel device
 			// alias it onto the resident localhost tag (a no-op when they're equal).
 			if source_ref != tag {
 				let argv = self.ssh.argv(&[], &format!("sudo podman tag {tag} {source_ref}"));

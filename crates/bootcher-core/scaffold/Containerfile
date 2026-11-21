@@ -44,14 +44,14 @@ RUN dnf clean all
 COPY sysroot/ /
 
 # Create the dir the sshd drop-in's `AuthorizedKeysFile /etc/ssh/authorized_keys.d/%u`
-# points at. fedora-bootc ships none, and `bootcher provision` drops the admin key
+# points at. fedora-bootc ships none, and `bootcher device provision` drops the admin key
 # into it via image-builder — which won't create a missing parent — so bake it here (0755,
 # root-owned) to keep the image self-consistent.
 RUN mkdir -p /etc/ssh/authorized_keys.d && chmod 0755 /etc/ssh/authorized_keys.d
 
-# Dirs the image-signing files land in when signing is enabled (via `[deploy] registry`
+# Dirs the image-signing files land in when signing is enabled (`[registry] key`
 # inline table): the cosign public key (/etc/pki/containers) and the
-# use-sigstore-attachments drop-in (/etc/containers/registries.d). `bootcher provision`
+# use-sigstore-attachments drop-in (/etc/containers/registries.d). `bootcher device provision`
 # injects those files via image-builder, which won't create a missing parent, so bake the dirs
 # here. Harmless when signing is off (two empty dirs).
 RUN mkdir -p /etc/pki/containers /etc/containers/registries.d \
@@ -62,8 +62,8 @@ RUN mkdir -p /etc/pki/containers /etc/containers/registries.d \
 # Mode 0440 is mandatory; sudo refuses to read drop-ins with looser permissions.
 RUN chmod 0440 /etc/sudoers.d/wheel-nopasswd
 
-# The admin SSH authorized key and (in registry mode) the /etc/ostree/auth.json
-# pull secret are NOT baked here — `bootcher provision` injects them into the
+# The admin SSH authorized key and (for a channel device) the /etc/ostree/auth.json
+# pull secret are NOT baked here — `bootcher device provision` injects them into the
 # device's persistent /etc, where the ostree 3-way merge keeps them across
 # upgrades. The image stays secret-free.
 RUN chmod 0755 /usr/libexec/derive-userdb.sh

@@ -91,7 +91,7 @@ pub const DEVICE_ADMIN_AUTHORIZED_KEYS_DIR: &str = "/etc/ssh/authorized_keys.d";
 /// a signature-enforcing origin (`bootc switch --enforce-container-sigpolicy` /
 /// the baked install config) so `bootc upgrade` honours it. Injected into
 /// persistent `/etc` like [`DEVICE_AUTH_JSON`] (3-way merged across upgrades,
-/// editable over ssh by `rotate sign-key`).
+/// editable over ssh by `signing rotate`).
 pub const DEVICE_POLICY_JSON: &str = "/etc/containers/policy.json";
 
 /// Device-side `containers-registries.d` directory; in signing mode provision

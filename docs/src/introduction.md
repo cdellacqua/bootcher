@@ -1,41 +1,54 @@
 # bootcher
 
-bootcher is an opinionated tool for the full lifecycle of a [bootc](https://bootc-dev.github.io/bootc/) image project: scaffold, build, provision disk images, and roll updates — without touching the individual steps by hand.
+bootcher is an opinionated tool for the full lifecycle of a [bootc](https://bootc-dev.github.io/bootc/) image project: scaffold, build, provision disk images, publish releases, and keep devices updated and patched — without touching the individual steps by hand.
 
-A **bootcher project** is one logical image — potentially built for multiple architectures into a multi-arch manifest list — described by a `bootcher.toml` in the working directory. The image name, target architectures, build location, and deploy targets all come from that manifest.
+A **bootcher project** is one logical image — potentially built for multiple architectures into a multi-arch manifest list — described by a `bootcher.toml` in the working directory. The image name, target architectures, build location, registry and devices all come from that manifest.
 
-## The two main flows
+Commands are grouped by what they act on: the project (`init`, `info`, `build`, `clean`), the **devices** (`device …`), the **releases** published to a registry (`release …`), the **channels** devices follow (`channel …`), and image **signing** (`signing …`).
+
+## Two kinds of device
 
 ```mermaid
 flowchart LR
-    init["bootcher init"] --> provision["bootcher provision<br/>[build + disk]"]
-    provision --> boot["first boot"]
-    boot --> deploy["bootcher deploy<br/>[build + upgrade]"]
-    deploy --> updated["devices updated"]
-    updated -->|next release| deploy
+    checkout["your checkout"] -->|device deploy| direct["direct devices"]
+    checkout -->|release publish v1.4| release[":v1.4"]
+    release -->|channel promote v1.4 stable| channel[":stable"]
+    channel -->|auto-update timer| fleet["channel devices"]
 ```
 
-**First-time provisioning** — `bootcher provision`
+- A **direct** device runs what you build on your machine: `bootcher device deploy` builds
+  the checkout and pushes it over SSH. No registry, nothing hosted — the inner loop, and
+  all you need for a small fleet you can reach.
+- A **channel** device follows a channel in your registry (`:stable`, `:next`) and
+  updates itself. You publish named releases from clean commits and promote them to
+  channels; base-image patches are rebuilt from the same commits by `channel refresh`.
 
-Builds the container image and the bootable disk artifact (via image-builder), collecting any one-time secrets (admin SSH key, optional registry pull token) up front and baking them into the disk image's persistent `/etc`. The artifact lands under `output/` for you to write to the target device.
-
-**Subsequent deploys** — `bootcher deploy`
-
-Rebuilds the container, pushes the update to the running device, and triggers `bootc upgrade`. The push backend is selected automatically based on the manifest: a direct LAN transfer over SSH, or a container registry for OTA-capable fleets.
+A project with a registry usually has both: the bench boards direct, the fleet on
+channels. Only `bootcher device switch` moves a device between them.
 
 ## Quick start
 
+Direct only:
+
 ```sh
-bootcher init my-os      # scaffold a new project
+bootcher init my-os                  # "publish to a registry?" → no
 cd my-os
-bootcher provision       # build + disk; asks for SSH key on first run
+bootcher device provision            # build + disk; asks for an SSH key
+# write the disk, boot it, add it to `remotes` in bootcher.toml
+bootcher device deploy               # every change after that
 ```
 
-After the first boot, rolling an update is:
+With a registry and channels:
 
 ```sh
-bootcher deploy
+bootcher init my-os                  # registry → yes, channels → stable
+bootcher release publish v1.0        # from a clean commit
+bootcher channel promote v1.0 stable
+bootcher device provision --channel stable
 ```
+
+See [Project setup](workflows/setup.md), [Direct devices](workflows/direct.md) and
+[Publishing releases](workflows/releases.md).
 
 ## Install
 

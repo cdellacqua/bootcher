@@ -14,8 +14,9 @@ An opinionated tool for crafting [bootc](https://bootc-dev.github.io/bootc/) ima
 SSH, sudo, firewalld + fail2ban + chrony, auto-updates) layered on top — then
 drives the lifecycle: build the container (`podman build`), turn it into a
 bootable disk image with
-[image-builder](https://github.com/osbuild/image-builder), and roll
-subsequent updates to running devices.
+[image-builder](https://github.com/osbuild/image-builder), push updates straight to
+devices over SSH, or publish named releases to a registry and move the channels your
+fleet follows — base-image patches included.
 
 The tool is image-agnostic: it carries the scaffold as an embedded template and
 otherwise knows nothing about what you build on top. Your project is yours to
@@ -35,15 +36,17 @@ bootcher is **Linux-only** (Podman is a native Linux tool; use the container ima
 
 | Dependency | Required for | Notes |
 |---|---|---|
-| **podman** | All operations | Builds the container image (`bootcher build`), runs image-builder (`bootcher disk` / `bootcher provision`), and pushes to registries (`bootcher deploy`). Version ≥ 4 recommended. |
-| **ssh / ssh-keygen** | `bootcher provision`, `bootcher deploy` / `upgrade` | Key generation at provision time; SSH tunnel and remote commands for deploy. Usually provided by `openssh-clients`. |
-| **sudo** | `bootcher disk` / `bootcher provision` | image-builder must run as root; bootcher invokes it via `sudo`. Passwordless `sudo sh` is required for unattended runs. |
-| **qemu** (`qemu-system-<arch>`, `qemu-img`) + UEFI firmware | `[builder] = "vm"` | Only when a build step is routed to a throwaway local VM (e.g. for cross-arch builds). Firmware is OVMF (x86_64) / AAVMF (aarch64). Not needed for the default in-process `local` builder. |
-| **qemu-user** (binfmt_misc handler, e.g. `qemu-user-static`) | Cross-arch in-process builds | Only when building a foreign-arch image with the default `local` builder; not needed if that arch's steps are routed to a `vm`. |
+| **podman** | All operations | Builds the container image, runs image-builder (`device provision`), serves images to direct devices and pushes releases. Version ≥ 5 recommended. |
+| **skopeo** | `release …`, `channel …`, `signing …`, `device … --channel` | Reads and copies registry images. Not needed for a direct-only project. |
+| **git** | `release publish`, the refreshes | Records the commit a release is built from; checks out a release's commit for a refresh. |
+| **ssh / ssh-keygen** | every `device …` command | The SSH tunnel and remote commands. Usually provided by `openssh-clients`. |
+| **sudo** | `device provision` | image-builder must run as root; bootcher invokes it via `sudo`. Passwordless `sudo sh` is required for unattended runs. |
+| **qemu** (`qemu-system-<arch>`, `qemu-img`) + UEFI firmware | `[builder] = "vm"` | Only when a build step is routed to a throwaway local VM (e.g. for cross-arch builds). |
+| **qemu-user** (binfmt_misc handler) | Cross-arch in-process builds | Only when building a foreign-arch image with the default `local` builder. |
 
 image-builder itself is pulled as a pinned container image by Podman — you do not need to install it separately.
 
-Each subcommand checks the tools it actually needs **before doing any work** and fails immediately, naming any that are missing and how to install them — so a missing tool never surfaces as a bare spawn error partway through a long build. A given run only needs the rows matching its `[builder]` / `[deploy]` configuration.
+Each subcommand checks the tools it actually needs **before doing any work** and fails immediately, naming any that are missing and how to install them — so a missing tool never surfaces as a bare spawn error partway through a long build.
 
 ## Install
 
@@ -90,156 +93,137 @@ sudo podman run --rm -it --privileged \
 
 ## Quickstart
 
+Direct only — no registry, nothing hosted:
+
 ```sh
-# interactive setup; pass -y to accept defaults
-bootcher init my-os
+bootcher init my-os                  # "publish to a registry?" → no
 cd my-os
-# interactive first provisioning, it will ask for one-time
-# configurations such as ssh key and registry authentication for
-# automated future updates 
-bootcher provision
+bootcher device provision            # build + disk; asks for your admin SSH key
+# write output/<arch>/<type>/disk.* to the device, boot it, add it to `remotes`
+bootcher device deploy               # every change after that: build here, push over SSH
+bootcher device status               # what each device runs
+bootcher device refresh              # base-image patches: rebuild what each device runs
 ```
 
-After the first boot, deploying updates to the running device can be done by simply launching:
+With a registry, channels and releases:
 
 ```sh
-bootcher deploy
+bootcher init my-os                  # registry → yes, channels → stable, next
+bootcher release publish v1.4 --promote next     # from a clean commit
+bootcher channel promote v1.4 stable
+bootcher device provision --channel stable --target aarch64 --disk raw
+bootcher channel status              # stale base? → bootcher channel refresh
 ```
 
-## The two flows
+## Commands
 
-- **First-time install** — `bootcher provision`: build → disk image. It leaves
-  the image-builder artifact under `output/<name>/<arch>/` for you to write or
-  upload to your target (the format is the manifest's `disk_type`, `qcow2` by
-  default). The image grows its root filesystem to fill the disk on first boot.
-  Project-specific post-processing (e.g. embedding firmware or files outside the
-  Containerfile's reach) goes in a `[hooks.disk] post` lifecycle hook — see
-  [Lifecycle hooks](#lifecycle-hooks).
-- **Subsequent deploys** — `bootcher deploy`: build → push to the
-  running target and `bootc upgrade`. `[deploy] remotes` lists the SSH
-  destinations (e.g. `["admin@192.168.1.42"]`). The *push* half runs over one of two
-  backends — a direct LAN transfer or a container registry — selected
-  automatically; see [Deploy backends](#deploy-backends-lan-vs-registry).
+```text
+bootcher init [name] | info [--format] | build [--target] | clean      the project
 
-Per-stage shortcuts exist too: `bootcher build`, `bootcher disk`,
-`bootcher upgrade`. Run `bootcher --help` for the full list.
+bootcher device status | provision | takeover | deploy | refresh | switch | rotate
+bootcher release publish X | refresh X | list
+bootcher channel status | promote X ch | refresh
+bootcher signing enroll | rotate | retire | verify
+```
 
-## Project layout
+Off a TTY, every command that touches devices or moves a channel needs `-y`; on a TTY
+it asks, with the options read from live state, and prints the equivalent command. See
+the [command reference](https://cdellacqua.github.io/bootcher/book/reference/commands.html).
 
-`bootcher init` scaffolds:
+## Direct and channel devices
 
-- `bootcher.toml` — the manifest: `[general]` holds `name` (the image name,
-  used for the container tag and output dir) and `rootfs`; `[targets]` maps each
-  target arch to its disk type(s) (one arch, or several for a multi-arch image);
-  `[deploy]` holds `remotes` (SSH targets) and
-  an optional `registry` for registry-mode deploys (see
-  [Deploy backends](#deploy-backends-lan-vs-registry)). Its presence marks the
-  directory as a bootcher project.
-- `Containerfile` — `FROM quay.io/fedora/fedora-bootc:${FEDORA_VERSION}` plus the
-  security baseline. `FEDORA_VERSION` is the Fedora release current at `init`; bump it
-  to upgrade (the CI recipes check it weekly and flag it before end of life). **This is yours to edit** — add `dnf install`s, units, and assets as
-  plain `RUN`/`COPY` steps; replace or `systemctl disable` anything the baseline
-  ships.
-- `sysroot/` — an overlay `COPY`ed into the image (`COPY sysroot/ /`): sshd / sudoers
-  drop-ins, firewalld zone, fail2ban jail, the admin userdb records, and
-  `/usr/libexec/derive-userdb.sh`.
-- `.gitignore` — keeps build artifacts and rendered secrets out of git.
-- `.containerignore` — excludes files and directories from the `podman build` context.
-- `output/<name>/<arch>/` — image-builder artifacts (gitignored).
+The devices bootcher manages are listed in `bootcher.toml`'s top-level `remotes`. What
+each one follows is read live from the device (`bootc status`), never from config:
+
+- A **direct** device runs `localhost/<name>:latest` — what you build here.
+  `device deploy` serves the image from a throwaway, loopback-only registry and the
+  device pulls it through an SSH remote-forward (`ssh -R`): only the missing layers move,
+  and the bytes ride your SSH session, so the device needs no registry, certificate or
+  credential. Rollback is `bootc rollback` on the device; base patches come from `device
+  refresh`, which rebuilds **the commit each device booted** (deploy from a clean commit
+  to make a device refreshable).
+- A **channel** device follows `<registry>/<name>:<channel>` and updates itself on its
+  `bootc-fetch-apply-updates.timer`. Moving the channel is the deploy.
+
+A project with a registry usually has both — the bench board on your desk direct, the
+field units on `:stable`, a canary rack on `:next` — and every command reaches exactly
+its own devices: `device deploy` only the direct ones, `channel promote` only the devices
+on that channel. **Only `device switch` moves a device**, onto a channel or to direct.
+
+## Releases and channels
+
+- A **release** `:X` is any valid OCI tag you choose (`v1.4`). `release publish` builds it
+  from a **clean** commit, records that commit in every member's `bootcher.source` label,
+  annotates the multi-arch index `bootcher.release=X`, and pushes it (signed, if you
+  enabled signing). `:X` only ever holds that one commit: republishing from it is a
+  no-op, from any other commit it's refused.
+- A **channel** (`[registry] channels`) is a byte-for-byte copy of a release.
+  `channel promote X ch` copies it by digest after checking the signature and that its
+  base is current, then updates the devices on `ch`. Rollback is a promote of the
+  previous release (`release refresh` it first if its base moved).
+- **Base patches**: `channel status` reports channels whose base image moved;
+  `channel refresh` rebuilds the release each serves **from its own commit**, under that
+  commit's own config, re-pushes it and re-copies the channels. A scheduled CI job runs it
+  (pause a channel with `--exclude`); see [`recipes/ci/`](recipes/ci/).
+
+Two credentials exist for channel devices: a read-only **pull token** baked on each
+device (rotate it with `device rotate pull-token`), and your own **push auth**
+(`podman login`), which never leaves your machine or CI.
+
+## Image signing
+
+`bootcher signing enroll` turns it on: a cosign keypair, `[registry] key`, and an install
+drop-in that makes every install record a signature-enforcing origin. Releases are signed
+at publish, `channel promote` refuses a release the key doesn't verify, and channel
+devices verify on every upgrade. Direct devices don't: their trust is the SSH channel, and
+a direct install needs no trust files. On a running fleet, `enroll` also signs what the
+channels serve (digests unchanged) and enforces signatures on the channel devices.
+`signing rotate` adds a key with no window in which any device rejects its channel;
+`signing retire` drops the old key once every device — including ones not in `remotes` —
+has the new one.
 
 ## Lifecycle hooks
 
-Hooks allow performing project-specific tasks when building with `bootcher`, by providing a way of injecting custom behavior between the standard steps.
-
-Each phase — the container build, the disk-image step, the deploy upgrade, the
-in-place takeover, and the credential rotation —
-is a `[hooks.<phase>]` table with an optional `pre` and `post` command:
+Each phase — the container build, the disk-image step, publishing a release, moving a
+channel, the device rollout, the in-place takeover, and the credential rotation — is a
+`[hooks.<phase>]` table with an optional `pre` and `post` command:
 
 ```toml
 [hooks.build]
-pre  = "echo 'here you could prepare some artifacts that your Containerfile could reference in a COPY command'"
-post = "echo 'here you could perform some cleanups'"
+pre  = "echo 'prepare artifacts your Containerfile COPYs'"
 
 [hooks.disk]
-pre  = "echo 'here you could perform some tests on the built artifact before turning it into a disk image'"
-post = "echo 'here you could edit the disk image to embed stuff that is outside of the Containerfile reach (e.g. files in the ESP/EFI partition)'"
+post = "echo 'edit the disk image: embed files outside the Containerfile reach (e.g. the ESP)'"
+
+[hooks.publish]
+post = "echo 'announce the release'"
+
+[hooks.promote]
+post = "echo 'a channel moved'"
 
 [hooks.upgrade]
-pre  = "echo 'here you could drain or notify the fleet before rolling out'"
-post = "echo 'here you could run a post-deploy smoke test against the devices'"
+pre  = "echo 'drain the devices before the rollout'"
+post = "echo 'smoke-test the devices'"
 
 [hooks.takeover]
-pre  = "echo 'here you could snapshot the hosts before converting them'"
-post = "echo 'here you could run a smoke test against the converted hosts'"
+pre  = "echo 'snapshot the hosts before converting them'"
 
 [hooks.rotate]
-pre  = "echo 'here you could store the new credential in your secrets manager'"
-post = "echo 'here you could revoke the old credential at its issuer'"
+post = "echo 'revoke the old credential at its issuer'"
 ```
 
-Each command is run with `sh -c` from the project root, with bootcher's progress
-UI suspended and the terminal handed over — so a hook may print freely, prompt, or
-`sudo` for the steps that need root. A non-zero exit aborts the run.
-
-A `post` hook runs once its phase succeeded — except on the phases that act on
-the whole fleet (`upgrade`, `takeover`, `rotate`), where it runs once every device
-has been attempted, even if some failed. Each device's outcome is in
-`BOOTCHER_METADATA`'s `results`, and the run still fails afterwards if any device
-did.
-
-The hooks fire wherever the phase runs, so they apply across the shortcuts too:
-`[hooks.build]` wraps the container build (`build`, `provision`, `deploy`);
-`[hooks.disk]` wraps the disk build (`disk`, `provision`); `[hooks.upgrade]`
-wraps the push + per-device `bootc upgrade` (`upgrade`, `deploy`);
-`[hooks.takeover]` wraps the image transfer + per-host conversion (`takeover`);
-`[hooks.rotate]` wraps the per-device credential rollout (every `rotate`
-subcommand).
+Each command runs with `sh -c` from the project root (for a refresh build, the release
+commit's worktree, whose own hooks run), with the progress UI suspended and the terminal
+handed over. A non-zero exit aborts the run. On the device phases (`upgrade`, `takeover`,
+`rotate`) `post` runs once every device has been attempted, even if some failed, with each
+outcome in `BOOTCHER_METADATA`'s `results`.
 
 ## Secrets: collected at provision, never stored
 
-The two per-deployment secrets — the admin SSH authorized key and (in registry
-mode) the registry pull token — are **not** baked into the container image. `disk` / `provision` collect them up front and inject them into the future persistent `/etc` of the device image (the installable image produced by image-builder). This way, the container image
-stays secret-free and can be safely published to a remote registry.
-
-## Deploy backends (LAN vs registry)
-
-`deploy` / `upgrade` push the freshly built image to the target over one of two
-backends, decided entirely by the manifest's `registry` field — there's no flag:
-
-- **LAN (default)** — when `registry` is unset in `bootcher.toml`. Your computer briefly
-  serves the image from a throwaway, loopback-only registry and the target pulls
-  it over an SSH remote-forward (`ssh -R`). Only
-  the layers the target is missing cross the wire, and the image rides your
-  existing SSH session — no TLS, certs, or registry config on the device is necessary thanks to the secure tunnel. Ideal
-  for a workshop bench or an air-gapped LAN. This configuration requires you to configure at least one remote (IP or domain name) in `bootcher.toml`.
-- **Registry** — when `registry = "registry.example.com/"` under
-  `[deploy]` in `bootcher.toml`. The image is `podman push`ed there and the target is pointed at
-  `<registry>/<name>:latest` with `bootc switch`. The
-  `bootc-fetch-apply-updates.timer` then becomes genuine OTA: push from this
-  machine *or* a cloud runner and targets pull on their own. If `[deploy] remotes` is configured, the upgrade is triggered immediately.
-
-In registry mode, two distinct credentials are needed:
-
-- **Pull token** — ends up on *every deployed device*, so use a
-  least-privilege, read-only token (a GitLab `read_registry` deploy token from
-  *Settings → Repository → Deploy tokens*, which yields a
-  `gitlab+deploy-token-N` username plus a secret; a registry robot account; etc.).
-- **Push auth** — this builder's own `podman login <host>`, needed for `deploy`
-  to push. It's powerful (write) and stays on the builder / in a CI secret;
-  `bootcher` never puts it on a device. Log in separately:
-  `podman login registry.gitlab.com`.
-
-## Updates
-
-Once provisioned, the target self-updates: `bootc-fetch-apply-updates.timer`
-fires periodically, runs `bootc upgrade --apply`, and reboots if a newer image
-revision is available.
-
-The timer only finds new revisions if the target's bootc origin points somewhere
-that *changes on its own* — i.e. a registry. In **registry** mode a push from
-this machine or a cloud runner is enough. In **LAN** mode the origin is the
-target's local containers-storage, so deploys are always push-driven and the
-timer is effectively a no-op.
+The per-device secrets — the admin SSH authorized key and, for a channel device of a
+private registry, the pull token — are **not** baked into the container image.
+`device provision` and `device takeover` collect them up front and inject them into the
+device's persistent `/etc`, so the container image stays secret-free and can be published.
 
 ## Users
 
@@ -252,7 +236,7 @@ markers are generated. See systemd's [user-record spec][user-record].
 
 SSH authorization is a **separate** concern — it is *not* in the userdb record.
 sshd reads the admin's keys from `/etc/ssh/authorized_keys.d/admin` (an
-`AuthorizedKeysFile` drop-in shipped in the scaffold), and `provision` injects
+`AuthorizedKeysFile` drop-in shipped in the scaffold), and `device provision` injects
 that file into the device's `/etc` — see
 [Secrets](#secrets-collected-at-provision-never-stored).
 
@@ -265,8 +249,9 @@ passwordless `sudo` through `wheel`, login shell `fish`.
 
 See [DEVELOPMENT.md](DEVELOPMENT.md) for build prerequisites and common workflows.
 
-- [`crates/bootcher-core/`](crates/bootcher-core/) — the library: builders, jobs,
-  pipelines, the LAN registry, lifecycle hooks.
+- [`crates/bootcher-core/`](crates/bootcher-core/) — the library: builders, one job
+  module per command domain, device classification, the registry reads, the loopback
+  registry, lifecycle hooks.
 - [`crates/bootcher-core/scaffold/`](crates/bootcher-core/scaffold/) — the embedded
   project template stamped out by `bootcher init`.
 - [`crates/bootcher-cli/`](crates/bootcher-cli/) — the `bootcher` binary.
@@ -276,5 +261,7 @@ warnings`, `cargo test`, and the CI recipe scripts' stdlib `unittest` suite, so 
 `python3`). The CLI integration tests
 ([`crates/bootcher-cli/tests/integration.rs`](crates/bootcher-cli/tests/integration.rs))
 scaffold throwaway projects with `bootcher init` and assert the project plumbing
-(no podman needed). `cargo xtask run <args>` runs a dev build of the binary;
+(no podman needed); the registry-level tests
+([`crates/bootcher-cli/tests/registry.rs`](crates/bootcher-cli/tests/registry.rs))
+publish, promote and refresh against a loopback `registry:2` (podman + skopeo, no VM). `cargo xtask run <args>` runs a dev build of the binary;
 `cargo xtask install` puts it on `PATH`.
