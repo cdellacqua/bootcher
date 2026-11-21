@@ -171,7 +171,7 @@ pub(crate) struct HookMetadata {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub targets: Option<Vec<DiskTargetMeta>>,
 	/// The deploy targets (`user@host`) — `upgrade`, `takeover` and `rotate` phases
-	/// only. Omitted at `upgrade` in pure-registry mode (no remotes listed); always
+	/// only. Omitted at `upgrade` in pure-a channel install (no remotes listed); always
 	/// set at `takeover` (as the steady-state `admin@host` each host ends up as) and
 	/// `rotate`.
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -179,7 +179,7 @@ pub(crate) struct HookMetadata {
 	/// The credential being rotated — `rotate` phase only.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub credential: Option<Credential>,
-	/// Each device's outcome, in `[deploy] remotes` order — `post` stage of the
+	/// Each device's outcome, in `remotes` order — `post` stage of the
 	/// `upgrade`, `takeover` and `rotate` phases only, which run `post` even after a
 	/// partial failure. Empty when the rollout attempted no device (e.g. a channel
 	/// rollout after a promote with no device on the channel).

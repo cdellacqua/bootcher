@@ -1,7 +1,7 @@
 //! `ssh` to a remote host — the one place that knows the connection details every
 //! ssh call needs, which the scattered bare `ssh <remote>` sites kept getting
 //! wrong. Used by both the deploy path (`upgrade`/`deploy`/`rotate`, reaching a
-//! `[deploy] remotes` device) and the remote image builder, which drives a build
+//! `remotes` device) and the remote image builder, which drives a build
 //! host the same way (a real box or a throwaway local VM).
 //!
 //! It bundles three things:

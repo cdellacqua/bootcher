@@ -1,69 +1,110 @@
 # Image signing
 
-bootcher supports opt-in cosign/sigstore image signing in registry mode. When enabled, every `deploy` signs the pushed image with a project-managed private key, and every device verifies the signature on `bootc upgrade`, rejecting tampered or unsigned images.
+bootcher supports opt-in cosign/sigstore signing. With it on, every release is signed when
+it's published, `channel promote` refuses a release the configured key doesn't verify,
+and every channel device verifies the signature on `bootc upgrade`, rejecting tampered or
+unsigned images.
 
-Signing is opt-in: run `bootcher sign enroll` once in a project that already has `[deploy] registry` set to a plain URL. It writes the keypair and rewrites that field to an inline table that pairs the URL with the new key — no manual TOML editing required. It has no effect in LAN mode (LAN integrity rides the trusted SSH channel).
+## Scope
 
-## Signing key lifecycle
+Signatures protect **registry pulls**, so it's **channel devices** that verify. A direct
+device's `containers-storage` origin is unverified: its trust is the SSH channel `device
+deploy` ships over, exactly as it always was.
 
+Enforcement lives in the **image**: `signing enroll` bakes
+`sysroot/usr/lib/bootc/install/30-bootcher-signing.toml`
+(`enforce-container-sigpolicy = true`), so every install of the image — a disk or a
+takeover, channel or direct — records a signature-enforcing origin. What differs is the
+**trust files** (the public key, a `policy.json` requiring a signature, and the
+registries.d drop-in that fetches signatures):
+
+- **Channel installs** (`device provision --channel`, `device takeover --channel`) bake
+  them, so the device verifies from its very first boot.
+- **Direct installs** bake none. They don't need any: the disk installs and boots with a
+  verifying origin and the stock policy, and the first `device deploy` re-pins it to an
+  unverified `containers-storage` origin. Until that first deploy, the device's
+  auto-update timer fails harmlessly — there's no registry to pull from.
+- **Every channel device step** installs or refreshes the trust files *before* `bootc
+  switch --enforce-container-sigpolicy`, which bootc refuses with the stock permissive
+  default policy.
+
+## Turning it on
+
+```sh
+bootcher signing enroll        # cosign.key (0600, git-ignored) + cosign.pub, [registry] key, the drop-in
+git add cosign.pub bootcher.toml sysroot && git commit -m "sign releases"
 ```
-┌─ SETUP (once) ──────────────────────────────────────────────────┐
-│  opt-in using `bootcher sign enroll`                            │
-│    ├─ cosign.key          private, 0600, gitignored             │
-│    ├─ cosign.pub          public, safe to commit                │
-│    └─ bootcher.toml       gets registry.key = "cosign.key"      │
-└───────────────┬─────────────────────────────────────────────────┘
-                │ cosign.pub will be injected at provision
-                ▼
-┌─ PROVISION (per disk-image) ────────────────────────────────────┐
-│  bootcher provision                                             │
-│    ├─ /etc/pki/containers/<name>.pub  ← cosign.pub              │
-│    ├─ /etc/containers/policy.json     ← require sigstore        │
-│    └─ bootc origin                    ← ostree-image-signed:    │
-└───────────────┬─────────────────────────────────────────────────┘
-                │
-                ▼
-┌─ DEPLOY (each release) ─────────────────────────────────────────┐
-│  bootcher deploy                                                │
-│    ├─ push image to registry                                    │
-│    └─ sign with cosign.key                                      │
-└───────────────┬─────────────────────────────────────────────────┘
-                │ signed image will be pulled from the registry
-                ▼
-┌─ VERIFY ────────────────────────────────────────────────────────┐
-│  bootc upgrade (device)                                         │
-│    └─ verify against cosign.pub — reject if invalid             │
-└─────────────────────────────────────────────────────────────────┘
+
+`signing enroll` refuses if a key is already configured (use `rotate`). On a new project,
+enroll before the first publish or provision. On a **running fleet** it also, after the
+local setup:
+
+1. signs every release a channel serves **in place** (`skopeo copy --all
+   --preserve-digests --sign-by-sigstore-private-key` onto itself) — adding a signature
+   leaves the digest unchanged, so nothing is re-pulled;
+2. runs the channel device step on the reachable channel devices: trust files, then
+   `bootc switch --enforce-container-sigpolicy`.
+
+`[registry] key` and the drop-in are written **after** both steps, so a failed run leaves
+the project unsigned and a re-run picks up the keypair it wrote. An unreachable device is
+only a warning: it gets its trust files with its next channel device step. Devices
+**outside `remotes`** can't be reached, so they keep an unverified origin until they're
+re-provisioned or switched.
+
+## Rotating the key
+
+```sh
+bootcher signing rotate        # 1. new keypair   2. sign served releases   3. trust old+new   4. repoint the config
+git add cosign-*.pub bootcher.toml && git commit -m "rotate signing key"
+# … once every device — including any not in `remotes` — trusts the new key:
+bootcher signing retire
 ```
+
+`signing rotate` (new key named `cosign-<fingerprint>` unless you pass a prefix):
+
+1. generates the new keypair;
+2. adds a new-key signature to every release a channel serves (the old signature stays,
+   the digest doesn't change);
+3. installs the old **and** new keys on the channel devices (`policy.json` lists both
+   under `keyPaths`);
+4. points `[registry] key` at the new key — **last**, so a failure part-way leaves the
+   config on the old key.
+
+No rebuild, no channel move, and no window in which any device — listed or not — rejects
+what its channel serves: an old-key device accepts the old signature, a new-key one the
+new. New releases are signed with the new key only.
+
+`signing retire` makes the channel devices trust only the current key and deletes the
+other key files. Run it only once every device has the new key: a device outside
+`remotes` that still has only the old one would reject every update from then on.
+It refuses while anything a channel serves doesn't verify under the current key (finish
+the rotate first). Releases no channel serves keep only their old signature; `channel
+promote` refuses them, pointing at `release refresh X --force` (re-signed with the
+current key).
 
 ## Passphrase
 
-On a TTY run, bootcher prompts for the signing passphrase; in CI set `BOOTCHER_SIGN_PASSPHRASE`. The env var wins over the prompt even when empty (cosign permits an empty passphrase).
+On a TTY bootcher prompts for the signing passphrase; in CI set
+`BOOTCHER_SIGN_PASSPHRASE`. The env var wins even when empty (cosign permits an empty
+passphrase). Only the commands that sign need the key and its passphrase: `release
+publish|refresh`, `channel refresh`, and `signing enroll|rotate`. `channel promote` only
+needs the public key.
 
-## Enrolling signing on a running fleet
+## Verifying
 
-If devices were provisioned before signing was enabled (i.e. without a `key` in `[deploy] registry`), you can enroll them without reprovisioning:
+```sh
+bootcher signing verify stable                 # a channel or release of this project
+bootcher signing verify reg.example.com/org/x:v1 --pubkey cosign.pub
+```
 
-1. Generate a keypair: `bootcher sign enroll`. The TOML is updated automatically.
-2. Push the signing config to every running device: `bootcher rotate sign-key`.
-3. Run `bootcher deploy` — it pushes a signed image and switches each device's bootc origin to the verifying transport (`--enforce-container-sigpolicy`). From this point on every upgrade verifies the signature.
-
-## Rotating the signing key
-
-If the signing key is leaked or expiring:
-
-1. Generate a new keypair: `bootcher sign enroll --force` (or `--prefix new-name` to change the key file prefix). The TOML is updated automatically in both cases.
-2. Push the new public key to every running device: `bootcher rotate sign-key`.
-3. The next `bootcher deploy` re-signs with the new key; devices accept it immediately.
-
-During the window between step 2 and step 3, devices attempting a `bootc upgrade` will fail signature verification (the registry still carries the old signature). They keep running their current image; SSH access is unaffected. The fleet is always recoverable.
-
-See [Signing key rotation](../workflows/rotate/sign-key.md) for the full workflow.
+`signing verify` pulls the image under a policy that requires a signature from the key —
+the check a device performs. A plain-HTTP registry is declared the usual way, `insecure =
+true` in `registries.conf`.
 
 ## On-device files
 
 | Path | Purpose |
 |---|---|
-| `/etc/pki/containers/<name>.pub` | The cosign public key the policy verifies against |
-| `/etc/containers/policy.json` | Requires a valid sigstore signature for the project's OS image (other images pull unsigned) |
-| `/etc/containers/registries.d/bootcher-<name>.yaml` | Enables `use-sigstore-attachments` so the signature is fetched alongside the image |
+| `/etc/pki/containers/<name>-<fp8>.pub` | A trusted public key, named by its fingerprint prefix so several can coexist during a rotation |
+| `/etc/containers/policy.json` | `default: reject`, and a sigstore signature from one of the keys (`keyPaths`) for the project's OS image; other images pull unsigned |
+| `/etc/containers/registries.d/bootcher-signing.yaml` | Enables `use-sigstore-attachments`, so the signature is fetched alongside the image |

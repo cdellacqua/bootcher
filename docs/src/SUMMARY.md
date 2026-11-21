@@ -5,15 +5,18 @@
 
 # Concepts
 
-- [Deploy backends: LAN vs registry](concepts/deploy-backends.md)
-- [Image identity & provenance](concepts/image-identity.md)
+- [Direct and channel devices](concepts/devices.md)
+- [Releases and channels](concepts/releases.md)
+- [Base-image patches](concepts/base-patches.md)
 - [Image signing](concepts/signing.md)
 - [Secrets](concepts/secrets.md)
 
 # Workflows
 
 - [Project setup](workflows/setup.md)
-- [Deploy updates](workflows/deploy.md)
+- [Direct devices](workflows/direct.md)
+- [Publishing releases](workflows/releases.md)
+- [Moving devices](workflows/moving.md)
 - [Takeover (convert a live host)](workflows/takeover.md)
 - [Credential rotation](workflows/rotate/index.md)
   - [Pull token](workflows/rotate/pull-token.md)
