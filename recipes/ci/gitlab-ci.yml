@@ -35,7 +35,7 @@
 
 default:
   image:
-    name: ghcr.io/cdellacqua/bootcher:latest
+    name: ghcr.io/cdellacqua/bootcher:v0.3.0
     entrypoint: [""] # the image's entrypoint is bootcher itself; we drive it from sh
   # Real-fs container store: a loopback ext4, so podman does one kernel overlay instead of
   # fuse-overlayfs on overlay. Self-skips on a real fs.
