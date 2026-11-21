@@ -119,6 +119,7 @@ pub const DEVICE_COSIGN_PUBKEY_DIR: &str = "/etc/pki/containers";
 	Debug,
 	PartialEq,
 	Eq,
+	Hash,
 	strum::Display,
 	strum::EnumString,
 	strum::VariantArray,
@@ -316,6 +317,11 @@ pub struct Manifest {
 	#[serde(skip)]
 	#[schemars(skip)]
 	pub root: PathBuf,
+	/// The manifest's path relative to [`Manifest::root`] (the `--manifest` value), so
+	/// a refresh loads the same relative path from a release commit's worktree.
+	#[serde(skip)]
+	#[schemars(skip)]
+	pub manifest_path: PathBuf,
 }
 
 /// Opt-in cosign/sigstore image signing config, derived from [`RegistryConfig::key`].
@@ -1090,8 +1096,8 @@ impl Manifest {
 	/// fails validation (an empty `[targets]`, a `[registry]` without valid
 	/// channels).
 	pub fn load_in(root: &Path, path: impl AsRef<Path>) -> Result<Self> {
-		let path =
-			if root == Path::new(".") { path.as_ref().to_path_buf() } else { root.join(path) };
+		let rel = path.as_ref();
+		let path = if root == Path::new(".") { rel.to_path_buf() } else { root.join(rel) };
 		let display = path.display();
 		let raw = match fs::read_to_string(&path) {
 			Ok(raw) => raw,
@@ -1116,6 +1122,7 @@ impl Manifest {
 			toml::from_str(&raw).with_context(|| format!("parsing {display}"))?
 		};
 		manifest.root = root.to_path_buf();
+		manifest.manifest_path = rel.to_path_buf();
 		manifest.validate().with_context(|| format!("invalid {display}"))?;
 		Ok(manifest)
 	}

@@ -17,10 +17,15 @@ use duct::cmd;
 ///
 /// Returns an error listing every missing prerequisite.
 pub fn preflight(manifest: &Manifest, target: Option<Arch>) -> Result<()> {
+	let arches: Vec<Arch> = manifest.images_for(target).iter().map(|i| i.arch).collect();
+	preflight_arches(manifest, &arches)
+}
+
+/// [`preflight()`] for an explicit arch set (a refresh's stale arches).
+pub(crate) fn preflight_arches(manifest: &Manifest, arches: &[Arch]) -> Result<()> {
 	let mut checks = Checks::default();
 	checks.bin("podman", preflight::PODMAN_HINT);
-	for image in manifest.images_for(target) {
-		let arch = image.arch;
+	for &arch in arches {
 		let spec = manifest.build_builder(arch);
 		preflight::builder_transport(spec, arch, &mut checks);
 		// A cross-arch in-process build runs the foreign userspace under qemu-user.
