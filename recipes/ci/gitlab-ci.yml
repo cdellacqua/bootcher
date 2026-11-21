@@ -1,296 +1,149 @@
-# bootcher CI for GitLab — multi-arch (x86_64 + aarch64).
+# bootcher CI — GitLab, multi-arch: releases, promotes, base-image refreshes, disks.
 #
 # Recipe docs: https://github.com/cdellacqua/bootcher/tree/main/recipes/ci
+# Copy to `.gitlab-ci.yml` at your repo root, with `bootcher.ci.toml` and the `ci/`
+# scripts beside it.
 #
-# Copy this to your bootcher project as `.gitlab-ci.yml` at the repo root, and the
-# recipe's `scripts/` directory (https://github.com/cdellacqua/bootcher/tree/main/recipes/ci/scripts)
-# to `ci/` beside it: the schedule-only checks run `python3 ci/<script>.py`. It builds
-# both architectures on native runners (no cross-arch emulation), assembles them into
-# one multi-arch image, and can produce a flashable disk per arch — in three stages:
+#   push a `v*` tag            → build (per arch, native runners) → publish the release
+#                                → manual promote:<channel> jobs (one per channel)
+#   run pipeline, RELEASE=v1.3 → manual promote jobs for that release (a rollback), and
+#                                with REFRESH=true a rebuild of it on today's base first
+#   schedule, SCHEDULE_CHANNEL → if that channel's base moved: rebuild the commit it
+#                                serves → `channel refresh` (re-push + re-copy)
+#   manual provision:<arch>    → a disk image following PROVISION_CHANNEL
+#   branch push                → nothing (direct devices update from a workstation)
 #
-#   build      — one job per arch (build:x86_64, build:aarch64), in parallel, each on a
-#                native-arch runner. `bootcher build --target <arch>` builds just that
-#                arch's container and stops at the per-arch member tag
-#                localhost/<name>:latest-<arch> (NO multi-arch list — `deploy` makes
-#                that). The job PUSHES the member to the Container Registry under a scratch
-#                tag (<image>:ci-<arch>) that `deploy` pulls — authenticating with the
-#                automatic $CI_JOB_TOKEN (read/write on this project's own registry, so no
-#                separate push credential). (See "Why the registry, not a job artifact".)
-#   deploy     — one job. It pulls both per-arch members from their scratch tags, retags
-#                them to the local member name, then `bootcher deploy --skip-build`
-#                (re)assembles the multi-arch manifest list from them and pushes
-#                <registry>/<name>:latest (+ an immutable CalVer tag) to this project's
-#                Container Registry (also the signing key, if enabled). Devices
-#                self-update.
-#   provision  — manual, one job per arch (provision:x86_64 → qcow2,
-#                provision:aarch64 → raw), each on a native-arch runner. `bootcher
-#                provision --target <arch> --disk <type> --skip-build` pulls that arch's
-#                member back from the registry `deploy` just pushed and builds the disk
-#                natively, then streams output/ to the generic Package Registry to
-#                download and flash. No second container build; the disk is
-#                byte-for-byte what devices auto-update to.
+# THE HAND-OFF. Each build job pushes its member as `<image>:ci-<sha12>-<arch>`; the
+# publish/refresh job pulls them back as `localhost/<name>:latest-<arch>`, which
+# `--skip-build` takes (each must record the release's commit). Through the registry, not
+# job artifacts: a full OS-image member exceeds GitLab.com's 1 GB artifact cap. Keep
+# `ci-.*` tags for a day or two in the cleanup policy (see the recipe docs).
 #
-# The pipeline is path-gated (see `.image-rules`): build/deploy run only when an image
-# input changed (Containerfile, sysroot/, the manifests), so a docs-only push is a
-# no-op; a `v*` tag always builds. Tune the allowlist there to your project.
+# A refresh builds the release's own commit under that commit's own `bootcher.ci.toml`
+# (full clone, `GIT_DEPTH: 0`); publishing stays with the default branch's config.
 #
-# Weekly rebuilds: add a pipeline schedule on the default branch (e.g. `17 3 * * 6`); it
-# rebuilds only if the base image moved (see `base-check`).
+# THE ARCHES come from `[targets]` (`bootcher info`): a build:<arch> or provision:<arch>
+# job whose arch isn't a target is a no-op, so a single-arch project copies this
+# unchanged (or deletes the job).
 #
-# Why split the build per arch? A multi-arch `bootcher deploy` on a single runner would
-# build the foreign arch under qemu-user emulation — slow and occasionally fragile.
-# Building each arch on its own native runner is faster and more reliable.
-#
-# Why the registry, not a job artifact? The per-arch members are handed between jobs
-# through the Container Registry: `build` pushes each to a scratch tag (<image>:ci-<arch>)
-# and `deploy` pulls it. A full OS-image member is large (easily >1GB) — GitLab.com caps
-# job artifacts at 1 GB, which it exceeds even zstd'd. The scratch tags dodge that limit;
-# they share layers with the :latest list `deploy` publishes, so they cost ~no extra
-# registry storage and are overwritten every run (no cleanup job needed — the same shared
-# behavior as the GitHub recipe). Tradeoff: `build` now logs in and pushes to the
-# Container Registry (with the automatic $CI_JOB_TOKEN — no new secret). This is CI-only,
-# so bootcher's own `build`/`deploy` on a dev box are untouched. NOTE: the stable
-# <image>:ci-<arch> tag assumes serial pushes; two overlapping pipelines could clobber
-# each other's member — fine for a low-traffic repo, else scope the tag with the commit
-# SHA (and add a registry cleanup policy for the leftovers).
-#
-# bootcher.toml must (1) point its registry at this project's registry and (2) list
-# BOTH arches in [targets], mapped to the disk type each should produce:
-#
-#   [deploy]
-#   registry = "registry.gitlab.com/<group>/<project>"   # == $CI_REGISTRY_IMAGE
-#
-#   [targets]
-#   x86_64  = "qcow2"   # a VM image
-#   aarch64 = "raw"     # a raw image for an edge device
-#
-# Every job runs with `--manifest bootcher.ci.toml` — a committed override that
-# `extend`s bootcher.toml and forces podman onto the host network, sidestepping
-# nested-podman nftables failures in the privileged job container. Copy
-# https://github.com/cdellacqua/bootcher/blob/main/recipes/ci/bootcher.ci.toml to your repo root beside bootcher.toml.
-#
-# Runners: the aarch64 jobs need an arm64 runner — on GitLab.com a hosted
-# `saas-linux-*-arm64` (tagged below; the small size is on all tiers). All these jobs
-# need a PRIVILEGED job container (podman builds containers and loop-mounts the store,
-# and the image-builder disk step launches a privileged container); GitLab.com's hosted
-# `saas-linux-*` runners already are, so this works as-is. A self-managed runner needs
-# `privileged = true` (or a shell runner on a podman host).
-#
-# CI/CD variables (Settings → CI/CD → Variables; mask them):
-#   ADMIN_SSH_PUBKEY         (provision) the admin SSH PUBLIC key (the `.pub` line),
-#                            baked into the disk as the `admin` login. Not secret — a
-#                            plain (unmasked) variable is fine. Keep the matching
-#                            private key wherever you SSH to devices from.
-#   BOOTCHER_PULL_USER /     (provision, registry mode) a LONG-LIVED read-only
-#   BOOTCHER_PULL_TOKEN      credential baked into the disk so the device can pull
-#                            updates. Create a Deploy Token with `read_registry`
-#                            scope under Settings -> Repository -> Deploy tokens
-#                            (NOT Settings -> Access tokens, which gives no
-#                            username). Copy BOTH one-time fields: the username
-#                            (gitlab+deploy-token-..., or a custom name) ->
-#                            BOOTCHER_PULL_USER, the secret -> BOOTCHER_PULL_TOKEN.
-#                            NOT $CI_JOB_TOKEN, which expires with the pipeline.
-#                            bootcher reads these env vars directly. Public
-#                            registry? Drop them and add `--anonymous` below.
-#   BOOTCHER_SIGN_PASSPHRASE (optional) the cosign key passphrase, if you enabled
-#                            signing and your key has one. Set it even when empty (to
-#                            "") so cosign doesn't prompt on the non-interactive runner.
-# Secure Files (Settings → CI/CD → Secure Files), only if you enabled signing:
-#   cosign.key               the cosign PRIVATE key `[deploy] registry.key` points at.
-#                            A Secure File, not a CI variable, because a PEM is
-#                            multi-line and so can't be a *masked* variable. The deploy
-#                            job fetches it before signing the push (see below).
-#                            Note: Secure Files can't be scoped to protected branches
-#                            the way a Protected variable can — protect your default
-#                            branch and keep deploy default-branch-only (it is) so only
-#                            trusted pipelines can fetch the key.
+# SECRETS: protect your `v*` tags (Settings → Repository → Protected tags) and mark
+# SIGN_KEY / SIGN_PASSPHRASE protected, so they reach publish and refresh and nothing
+# else. If you restore files with GitLab's secure files, ignore `.secure_files/` in
+# `.gitignore` — `release publish` refuses a dirty tree.
 
 default:
-  # The published bootcher image (multi-arch, bundles podman + qemu). Pin `:latest`
-  # to a released `:vX.Y.Z` for reproducible builds.
   image:
     name: ghcr.io/cdellacqua/bootcher:latest
     entrypoint: [""] # the image's entrypoint is bootcher itself; we drive it from sh
+  # Real-fs container store: a loopback ext4, so podman does one kernel overlay instead of
+  # fuse-overlayfs on overlay. Self-skips on a real fs.
   before_script:
-    # --- real-fs container store (nested-overlay workaround) -------------------
-    # GitLab's hosted saas runners run each job inside a container whose root fs is
-    # itself overlayfs. Rootful `podman build`'s overlay store then can't use the
-    # kernel overlay driver (the kernel refuses overlay-on-overlay) and falls back
-    # to fuse-overlayfs, whose userspace copy-up/mmap coherence breaks a large
-    # `dnf install`: rpm re-reads the rpmdb mid-transaction and "loses" base-provided
-    # sonames (`libssl.so.3 is needed by ...`) even though they're present. Small
-    # installs don't trip it; a chromium-scale one does.
-    #
-    # Fix: put the store on a REAL filesystem. A loopback-mounted ext4 image is a
-    # genuine block fs no matter where its backing file lives, so podman does a
-    # single, un-nested *kernel* overlay — no fuse, correct coherence. Unlike
-    # STORAGE_DRIVER=vfs (a full copy per layer → ENOSPC on a chromium build),
-    # ext4+overlay stores only deltas, so it fits the same disk. Needs the
-    # privileged job container (loop mount); the runner VM is ephemeral, so there's
-    # nothing to tear down. It also gives the deploy/provision jobs headroom to hold
-    # the loaded/pulled per-arch members.
-    #
-    # Self-managed shell/host runner whose store is already on a real fs? The guard
-    # detects the non-overlay case and skips itself, so this is safe to leave in.
     - |
       set -eu
       if [ "$(stat -f -c %T / 2>/dev/null)" = "overlayfs" ]; then
-        # Ceiling, not a reservation: the sparse image grows to the build's actual
-        # delta size, capped by the runner's free disk. Tune to `df -h` — smaller
-        # on saas-linux-small, larger if you have the room.
         : "${BOOTCHER_STORE_SIZE:=20G}"
-        img=/bootcher-store.img
-        truncate -s "$BOOTCHER_STORE_SIZE" "$img"
-        mkfs.ext4 -q -F "$img"
+        truncate -s "$BOOTCHER_STORE_SIZE" /bootcher-store.img
+        mkfs.ext4 -q -F /bootcher-store.img
         mkdir -p /var/lib/containers/storage
-        mount -o loop "$img" /var/lib/containers/storage
-        echo "relocated podman store onto loopback ext4 (${BOOTCHER_STORE_SIZE} ceiling)"
-      else
-        echo "container store already on a real fs; skipping loopback store"
+        mount -o loop /bootcher-store.img /var/lib/containers/storage
       fi
-      # Breadcrumb: log the store driver. Expect `overlay` (kernel); a regression
-      # to `fuse-overlayfs` means the store slipped back onto overlay-on-overlay
-      # and the rpmdb coherence bug is back.
-      podman info --format 'podman store: {{.Store.GraphDriverName}} @ {{.Store.GraphRoot}}'
+      git config --global --add safe.directory "$CI_PROJECT_DIR"
+      echo "$CI_REGISTRY_PASSWORD" | podman login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
+      echo "$CI_REGISTRY_PASSWORD" | skopeo login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
+      b() { bootcher --manifest bootcher.ci.toml "$@"; }
+      # Is $ARCH one of the `[targets]` arches?
+      is_target() { b info --format '{{ json .Arches }}' | jq -e --arg a "$ARCH" 'index($a)' >/dev/null; }
+      # Pull every member of SOURCE_REV back as the local `latest-<arch>` images.
+      pull_members() {
+        image="$(b info --format '{{ .Image }}')"; name="$(b info --format '{{ .Name }}')"
+        for arch in $(b info --format '{{ json .Arches }}' | jq -r '.[]'); do
+          scratch="$image:ci-$(printf %.12s "$SOURCE_REV")-$arch"
+          podman pull "$scratch"
+          podman tag "$scratch" "localhost/$name:latest-$arch"
+        done
+      }
+      # With signing on, restore the private key from SIGN_KEY (a protected variable,
+      # not a file one) to wherever `[registry] key` points: `signing rotate` repoints
+      # it, and `*.key` is git-ignored. Signing off: a no-op.
+      restore_key() {
+        key="$(b info --format '{{ .Key }}')"
+        [ -n "$key" ] || return 0
+        [ -n "${SIGN_KEY:-}" ] || { echo "signing is on ([registry] key = $key) but SIGN_KEY is empty (protected variable on an unprotected ref?)"; return 1; }
+        printf '%s' "$SIGN_KEY" > "$key"
+      }
 
-# No image ref to configure: the build/deploy jobs derive it from bootcher.toml at runtime
-# with `bootcher info --format '{{ .Image }}'` — the same resolved <registry>/<name> deploy
-# publishes (bootcher.toml's `[deploy] registry`, which you point at $CI_REGISTRY_IMAGE,
-# plus the project name). Resolving it in the tool follows the `extend` chain and the
-# inline-table `registry` (signing) form that a shell parse would trip over, so the value
-# CI tags scratch members by can't drift from the one bootcher pushes.
+variables:
+  PROVISION_CHANNEL: stable # the channel provision:<arch> disks follow
 
-stages: [build, deploy, provision]
+stages: [plan, build, publish, promote, provision]
 
-# --- when to run: only when something that affects the image changed --------------
-# The build context is the whole project root, so this is an ALLOWLIST of the inputs
-# that actually change the built image: the Containerfile, the sysroot/ overlay baked
-# into it, and the manifests (a registry/target/hook change there re-images too). A
-# docs/README-only push no longer spins up the whole multi-arch build → deploy.
-#
-# Shared by `.build` and `deploy` via `!reference` so they gate identically — if they
-# diverged, deploy could be scheduled with no build artifacts to assemble. provision
-# inherits the gate transitively: it `needs: [deploy]`, so when deploy is filtered out
-# provision drops with it (a manual disk build has nothing to pull anyway).
-#
-# Tags are deliberate releases: the tag rule has no `changes:`, so a `v*` tag always
-# builds even if its commit touched none of these paths.
-#
-# Adjust the list to YOUR project: if the Containerfile `COPY`s other paths, or a
-# [hooks] script lives outside sysroot/, add them — anything in the build context that
-# ends up in the image belongs here. `.gitlab-ci.yml` is included so a pipeline edit
-# re-runs itself. ci/ isn't: its scripts don't change the image. The base and release
-# checks run only on a schedule: test an edit with the schedule's Run (play) button,
-# which is a real refresh, or by running the script locally, from the repo root and
-# after `skopeo login` for a private image (both only read registries; base_check.py
-# needs IMAGE, and GITHUB_OUTPUT=/dev/stdout to print its results instead of appending
-# them to a base.env file). The recipe README has the details.
-.image-rules:
+# --- plan: what does this pipeline rebuild? ----------------------------------------
+# Tag pipeline: the tag's commit. Schedule: the commit SCHEDULE_CHANNEL serves, only if
+# its base moved (STALE). RELEASE + REFRESH=true: that release's commit.
+plan:
+  stage: plan
   rules:
-    - if: $CI_COMMIT_TAG
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      changes:
-        paths:
-          - Containerfile
-          - sysroot/**/*
-          - bootcher.toml
-          - bootcher.ci.toml
-          - .gitlab-ci.yml
-
-# --- base-check: did the base image move since the last publish? (schedules only) --
-# ci/base_check.py compares the base digest buildah recorded in each published member
-# with the base tag's current one; anything uncheckable rebuilds. Hands BASE_CHANGED (and
-# SOURCE_REV, the commit :latest ships) to `.build`/`deploy` as a dotenv report. A private
-# base image needs its own `skopeo login`.
-base-check:
-  stage: build
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "schedule"
-  needs: []
-  before_script: [] # no container store needed: this job only reads registries
+    - if: $CI_COMMIT_TAG =~ /^v/
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_CHANNEL
+    - if: $RELEASE && $REFRESH == "true"
   script:
-    - IMAGE="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')"
-    - test -n "$IMAGE" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see https://github.com/cdellacqua/bootcher/tree/main/recipes/ci)"; exit 1; }
-    - export IMAGE
-    - echo "$CI_REGISTRY_PASSWORD" | skopeo login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
-    - python3 ci/base_check.py
+    - |
+      set -eu
+      b() { bootcher --manifest bootcher.ci.toml "$@"; }
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        commit="$CI_COMMIT_SHA"; build=true
+      elif [ -n "${SCHEDULE_CHANNEL:-}" ]; then
+        b info --format '{{ json .Channels }}' | jq -e --arg c "$SCHEDULE_CHANNEL" 'index($c)' >/dev/null \
+          || { echo "this schedule's SCHEDULE_CHANNEL '$SCHEDULE_CHANNEL' isn't in [registry] channels: $(b info --format '{{ .Channels }}') — fix the variable in CI/CD → Pipeline schedules"; exit 1; }
+        set -- $(b channel status "$SCHEDULE_CHANNEL" --format '{{ .Stale }} {{ .Lags }} {{ .Commit }}')
+        stale="$1"; lags="$2"; commit="${3:-}"
+        echo ":$SCHEDULE_CHANNEL stale=$stale lags=$lags commit=$commit"
+        if [ "$stale" = true ] && [ -n "$commit" ]; then build=true
+        elif [ "$lags" = true ]; then build=none
+        else build=false; fi
+      else
+        commit="$(b release list --format '{{ .Release }} {{ .Commit }}' | awk -v r="$RELEASE" '$1 == r { print $2 }')"
+        test -n "$commit" || { echo "$RELEASE isn't published, or records no source commit"; exit 1; }
+        build=true
+      fi
+      printf 'SOURCE_REV=%s\nBUILD=%s\n' "$commit" "$build" > plan.env
   artifacts:
     reports:
-      dotenv: base.env
+      dotenv: plan.env
 
-# --- release-check: is the pinned Fedora release still supported? (schedules only) --
-# The Containerfile pins fedora-bootc to one Fedora release (`ARG FEDORA_VERSION`). Its
-# tag stops moving at end of life, and from then on `base-check` never sees a change, so
-# the fleet would stop getting security updates with every pipeline green. This job fails
-# once the pin is two releases behind (at or within weeks of end of life) and warns while
-# it's one behind. Nothing needs it: a failure here is the alert, not a reason to skip a
-# rebuild. It reads the pin from `ARG FEDORA_VERSION`; adapt the two settings at the top
-# of ci/release_check.py if your Containerfile or base differ.
+# Is the pinned Fedora release still supported? From its end of life no channel is ever
+# stale again. Warns at one release behind, fails at two; gates nothing.
 release-check:
-  stage: build
+  stage: plan
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule"
-  needs: []
-  before_script: [] # no container store needed: this job only reads a registry
+  before_script: []
   variables:
     WARNING_PREFIX: "warning: "
-    BEHIND_EXIT_CODE: "3" # one release behind: exit 3, an allowed failure (below)...
+    BEHIND_EXIT_CODE: "3"
   allow_failure:
-    exit_codes: [3] # ...so the job shows as a warning, not a failure
+    exit_codes: [3]
   script:
     - python3 ci/release_check.py
 
-# --- source checkout: a refresh rebuilds the commit :latest ships (SOURCE_REV) --
-.source-checkout:
-  script:
-    - |
-      if [ -n "${SOURCE_REV:-}" ]; then
-        git config --global --add safe.directory "$CI_PROJECT_DIR"
-        git fetch -q --depth 1 "$CI_REPOSITORY_URL" "$SOURCE_REV"
-        git checkout -q --detach FETCH_HEAD
-        # Tags on that commit (annotated ones peeled), so `git describe` names the release.
-        for t in $(git ls-remote --tags "$CI_REPOSITORY_URL" | awk -v r="$SOURCE_REV" '$1 == r { sub("^refs/tags/", "", $2); sub("\\^\\{\\}$", "", $2); print $2 }' | sort -u); do
-          git fetch -q --depth 1 "$CI_REPOSITORY_URL" "+refs/tags/$t:refs/tags/$t"
-        done
-        echo "checked out $(git describe --tags --always)"
-      fi
-
-# --- build: one container per arch, on a native-arch runner -----------------------
-# `build --target <arch>` builds only that arch and stops at the per-arch member tag
-# localhost/<name>:latest-<arch> (no multi-arch list — `deploy` assembles that). The
-# member is pushed to the Container Registry under a scratch tag (<image>:ci-<arch>) that
-# `deploy` pulls. The push authenticates with the automatic $CI_JOB_TOKEN (read/write on
-# this project's own registry), so no separate push credential is configured here.
+# --- build: one member per arch, on a native-arch runner, of SOURCE_REV ------------
 .build:
   stage: build
-  # Gate on image-affecting changes (see `.image-rules` above); tags always build.
-  rules: !reference [.image-rules, rules]
-  needs:
-    - job: base-check
-      optional: true
+  needs: [plan]
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v/
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_CHANNEL
+    - if: $RELEASE && $REFRESH == "true"
+  variables:
+    GIT_DEPTH: 0 # a refresh checks out an older commit
   script:
-    - if [ "${BASE_CHANGED:-true}" = false ]; then echo "base image unchanged, nothing to build"; exit 0; fi
-    - !reference [.source-checkout, script]
-    # Derive the image ref from bootcher.toml (see the header): IMAGE is the base for the
-    # :ci-<arch> scratch tag. Empty ⇒ LAN mode (no `[deploy] registry`); registry-mode only,
-    # so fail fast before the multi-minute build.
-    - IMAGE="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')"
-    - test -n "$IMAGE" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see https://github.com/cdellacqua/bootcher/tree/main/recipes/ci)"; exit 1; }
-    - bootcher --manifest bootcher.ci.toml build --target "$ARCH"
-    # The build produced exactly one image tagged `:latest-<arch>`. Log in with the job
-    # token and push it under a scratch tag ($IMAGE:ci-<arch>) that `deploy` pulls — the
-    # build→deploy handoff goes through the Container Registry, not a job artifact (see
-    # the header for why). The scratch tag shares layers with the :latest list `deploy`
-    # later publishes, so it costs ~no extra storage and is overwritten each run. Unsigned:
-    # a CI-internal intermediate no device pulls; only :latest is signed (in deploy).
-    - echo "$CI_REGISTRY_PASSWORD" | podman login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
-    - |
-      img="$(podman images --format '{{.Repository}}:{{.Tag}}' | grep ":latest-${ARCH}\$" | head -n1)"
-      test -n "$img" || { echo "no built image tagged :latest-${ARCH}"; exit 1; }
-      scratch="$IMAGE:ci-${ARCH}"
-      podman tag "$img" "$scratch"
-      podman push "$scratch"
-      echo "member pushed: $scratch"
+    - if [ "$BUILD" != true ]; then echo "nothing to build"; exit 0; fi
+    - if ! is_target; then echo "$ARCH isn't in [targets] — nothing to build"; exit 0; fi
+    - git checkout -q --detach "$SOURCE_REV"
+    - b build --target "$ARCH"
+    - scratch="$(b info --format '{{ .Image }}'):ci-$(printf %.12s "$SOURCE_REV")-$ARCH"
+    - podman tag "localhost/$(b info --format '{{ .Name }}'):latest-$ARCH" "$scratch"
+    - podman push "$scratch"
 
 build:x86_64:
   extends: .build
@@ -301,154 +154,109 @@ build:aarch64:
   extends: .build
   variables:
     ARCH: aarch64
-  # aarch64 builds on a native arm64 runner (this recipe avoids cross-arch emulation).
-  # GitLab.com hosted arm64 runner; the small size is available on all tiers.
   tags: [saas-linux-small-arm64]
 
-# --- deploy: assemble the multi-arch image from the members and push --------------
-# Pulls both per-arch members the build jobs pushed to their scratch tags, retags them,
-# then `deploy --skip-build` (re)assembles the multi-arch manifest list from them and
-# pushes <registry>/<name>:latest (+ a CalVer tag). No container build, no disk step. The
-# scratch tags need no cleanup (they share layers with :latest and are overwritten each
-# run). To prune OLD CalVer releases as they accumulate, don't add a job — turn on the
-# project's built-in Container Registry cleanup policy (see "Pruning old
-# published images" in the recipe docs). The signing key is fetched here if enabled.
-deploy:
-  stage: deploy
-  # Sequence behind both build jobs and gate on them. artifacts: false — the members
-  # travel through the Container Registry now (see `.build`), not job artifacts.
-  needs:
-    - job: base-check
-      optional: true
-    - job: "build:x86_64"
-      artifacts: false
-    - job: "build:aarch64"
-      artifacts: false
-  # Same gate as the build jobs (see `.image-rules`) so deploy is scheduled exactly
-  # when its members were built — never with nothing to assemble. Tags always deploy.
-  rules: !reference [.image-rules, rules]
-  # Signing? Uncomment to set the cosign key's passphrase (use "" if it has none);
-  # the env var wins over cosign's TTY prompt even when empty, so the non-interactive
-  # runner doesn't hang/fail.
-  # variables:
-  #   BOOTCHER_SIGN_PASSPHRASE: ""
+# --- publish: the tag is the release name ------------------------------------------
+publish:
+  stage: publish
+  needs: [plan, "build:x86_64", "build:aarch64"]
+  resource_group: bootcher-registry
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v/
   script:
-    - if [ "${BASE_CHANGED:-true}" = false ]; then echo "base image unchanged, nothing to deploy"; exit 0; fi
-    - !reference [.source-checkout, script]
-    # Derive the refs from bootcher.toml (see the header). IMAGE is the scratch-tag base;
-    # NAME the local member basename `deploy --skip-build` retags to.
-    - IMAGE="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')"
-    - NAME="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Name }}')"
-    - test -n "$IMAGE" || { echo "no registry in bootcher.toml [deploy] — these CI recipes are registry-mode only (see https://github.com/cdellacqua/bootcher/tree/main/recipes/ci)"; exit 1; }
-    - echo "$CI_REGISTRY_PASSWORD" | podman login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
-    # Pull each per-arch member `build` pushed under its scratch tag and retag it to the
-    # local name `deploy --skip-build` expects — localhost/<name>:latest-<arch> — so the
-    # list is assembled from them as before, just sourced from the Container Registry. Keep
-    # this arch list in sync with the build jobs.
-    - |
-      for arch in x86_64 aarch64; do
-        scratch="$IMAGE:ci-${arch}"
-        podman pull "$scratch"
-        podman tag "$scratch" "localhost/${NAME}:latest-${arch}"
-      done
-    # Signing? The cosign key `[deploy] registry.key` points at is git-ignored, so fetch
-    # it from GitLab Secure Files (uploaded as cosign.key) before deploy signs the push.
-    # The installer downloads every secure file into ./.secure_files/; copy the key to
-    # where the manifest expects it (cosign.key), leaving the committed path unchanged
-    # for local runs. The bootcher image bundles curl and which (the installer probes for
-    # curl with `which curl`), so no dependency install is needed here.
-    # - curl --silent "https://gitlab.com/gitlab-org/incubation-engineering/mobile-devops/download-secure-files/-/raw/main/installer" | bash
-    # - install -m 600 .secure_files/cosign.key cosign.key
-    # `--skip-build` (re)assembles the multi-arch list from the loaded members and pushes
-    # it — no container build. `--skip-bootc-upgrade` leaves the rollout to each device's
-    # auto-update timer (keeps the admin SSH key out of CI and doesn't assume the runner
-    # can reach the fleet). Drop the flag (and wire an SSH key) to roll immediately.
-    - bootcher --manifest bootcher.ci.toml deploy --skip-build --skip-bootc-upgrade
+    - pull_members
+    - restore_key
+    - BOOTCHER_SIGN_PASSPHRASE="${SIGN_PASSPHRASE:-}" b release publish "$CI_COMMIT_TAG" --skip-build --git-tag no
 
-# --- provision: build a flashable disk per arch, natively -------------------------
-# Manual. `provision --target <arch> --disk <type> --skip-build` pulls that arch's
-# member back from the registry `deploy` just pushed and builds the disk natively (no
-# emulation), then streams output/ to the generic Package Registry to download + flash.
+# --- refresh: a channel's base patch, or a release rebuilt for a rollback ----------
+refresh:
+  stage: publish
+  needs: [plan, { job: "build:x86_64", optional: true }, { job: "build:aarch64", optional: true }]
+  resource_group: bootcher-registry
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_CHANNEL
+    - if: $RELEASE && $REFRESH == "true"
+  script:
+    - if [ "$BUILD" = false ]; then echo "base current, channel current — nothing to do"; exit 0; fi
+    - if [ "$BUILD" = true ]; then pull_members; fi
+    - restore_key
+    - |
+      export BOOTCHER_SIGN_PASSPHRASE="${SIGN_PASSPHRASE:-}"
+      if [ -n "${SCHEDULE_CHANNEL:-}" ]; then
+        b channel refresh "$SCHEDULE_CHANNEL" -y --skip-remotes --skip-build
+      else
+        b release refresh "$RELEASE" --skip-build
+      fi
+
+# --- promote: one manual job per channel ---------------------------------------------
+# Promotes the tag of a tag pipeline, or RELEASE in a run-pipeline (a rollback). A
+# protected environment per channel (Settings → CI/CD → Protected environments; a
+# Premium feature) gates who may promote — without it, anyone who can run the pipeline
+# can. Devices pick it up on their next auto-update (`--skip-remotes`: CI
+# can't reach them).
+.promote:
+  stage: promote
+  resource_group: bootcher-registry
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v/
+      when: manual
+    - if: $RELEASE
+      when: manual
+  # In a tag pipeline, wait for this pipeline's `publish` (a promote before the push
+  # would find no `:X`, or the previous one); a run-pipeline (RELEASE) has none.
+  needs: [{ job: publish, optional: true }]
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | skopeo login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
+  script:
+    - bootcher --manifest bootcher.ci.toml channel promote -y --skip-remotes "${RELEASE:-$CI_COMMIT_TAG}" "$CHANNEL"
+
+promote:next:
+  extends: .promote
+  variables:
+    CHANNEL: next
+  environment: next
+
+promote:stable:
+  extends: .promote
+  variables:
+    CHANNEL: stable
+  environment: stable
+
+# --- provision: a disk image per arch, following PROVISION_CHANNEL -----------------
+# Built from exactly what the channel serves (pulled, never rebuilt), with the pull
+# credential and (with signing on) the trust files baked in. Published as one `.zip`
+# per arch (the disk zstd-compressed inside) to the generic Package Registry.
 .provision:
   stage: provision
-  # `needs: []` fully decouples provision, matching the GitHub recipe
-  # (github-actions/provision.yml), where it's a standalone `workflow_dispatch`. The
-  # empty array is load-bearing: with no `needs` at all, GitLab falls back to stage
-  # ordering and the manual job would wait on every prior stage; `[]` lets you play it
-  # standalone without running them. `--skip-build` pulls whatever <registry>/<name>:latest
-  # currently is — so it always provisions from the last image deploy published, not
-  # necessarily this pipeline's. Play it after the build→deploy for the commit you want
-  # has finished publishing :latest.
   needs: []
   rules:
-    # Manual must live INSIDE the rule: a job-level `when: manual` is ignored once
-    # `rules` is present (a matched rule with no `when` defaults to on_success), so it
-    # would otherwise run automatically. `allow_failure: true` keeps this optional job
-    # from blocking the pipeline — start it from the UI when you need a disk.
-    - if: $CI_PIPELINE_SOURCE == "schedule" # a refresh, not a release to provision from
+    - if: $CI_PIPELINE_SOURCE == "schedule"
       when: never
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      when: manual
+    - when: manual
       allow_failure: true
-  variables:
-    # Generic Package Registry coordinates: versioned by commit so every provision is an
-    # immutable, retrievable build. A bootc disk is a large sparse file that won't fit a
-    # job artifact (GitLab.com caps those at 1 GB); zstd crushes it to a fraction of its
-    # size, and the Package Registry allows 5 GB/file.
-    PKG_NAME: disk
   script:
-    # No dependency install: the bootcher image bundles everything these steps need —
-    # sudo (image-builder disk step), zstd + zip (compress + pack the disk), curl (upload).
-    # `--skip-build` pulls the deploy-pushed image back, so this job needs read access.
-    # The job token is read+write on this project's registry and lives only for the
-    # pipeline — fine for a pull. Public registry? Drop this login (the pull is
-    # anonymous) and add `--anonymous` below.
-    - echo "$CI_REGISTRY_PASSWORD" | podman login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
-    # provision reads only the `.pub` sibling of `--ssh-key`, so the public key is all CI
-    # needs (`admin_key` itself never has to exist). Keeping the private key out of CI is
-    # safe: these jobs never SSH to a device.
+    - if ! is_target; then echo "$ARCH isn't in [targets] — nothing to provision"; exit 0; fi
     - printf '%s\n' "$ADMIN_SSH_PUBKEY" > admin_key.pub
-    # Build just this runner's arch + disk type. `--skip-build` pulls that arch's member
-    # out of <registry>/<name>:latest (deploy pushed it) and builds the disk natively.
-    # The disk bakes the admin pubkey and, in registry mode, the pull token
-    # ($BOOTCHER_PULL_USER/$BOOTCHER_PULL_TOKEN, read from the environment). For a public
-    # registry, append `--anonymous` instead.
-    - bootcher --manifest bootcher.ci.toml provision --ssh-key admin_key --target "$ARCH" --disk "$DISK" --skip-build
-    # Pack output/ into ONE published artifact per run: compress the disk in place (zstd
-    # --rm frees the raw as it goes) and STORE it in a .zip (`-0`, no re-compression — the
-    # member is already zstd; the `! -name '*.tar.*'` skips an already-compressed gce
-    # `disk.tar.gz`, which is just stored as-is). One file keeps each provision from cluttering the registry;
-    # the .zip extracts natively everywhere (Windows Explorer included), and the disk.*.zst
-    # inside feeds straight into rpi-imager / balenaEtcher, which decompress zstd on the fly.
-    # No `tar --sparse` anywhere: its sparse map is mis-decoded by gnome-autoar/Nautilus
-    # into a corrupt image (holes dropped), so we never rely on tar's sparse encoding.
-    #
-    # The compressed disk is a fraction of the raw, so — unlike a full tar — it fits the
-    # post-build scratch and is written to a file, which lets curl --retry a dropped PUT (a
-    # pipe couldn't rewind). pipefail still fails the job on a truncated pack.
+    # A public registry? Add `--anonymous` (no pull credential is baked). Builds the
+    # arch's `[targets]` disk types.
+    - b device provision --channel "$PROVISION_CHANNEL" --ssh-key admin_key --target "$ARCH"
     - |
-      if (set -o pipefail) 2>/dev/null; then set -o pipefail; fi
+      release="$(b channel status "$PROVISION_CHANNEL" --format '{{ .Release }}')"
       file="bootcher-output-${ARCH}.zip"
-      url="$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/$PKG_NAME/$CI_COMMIT_SHORT_SHA/$file"
+      url="$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/disk/$PROVISION_CHANNEL-$release/$file"
       find output -type f -name 'disk.*' ! -name '*.tar.*' -exec zstd -10 -T0 -q --rm {} +
       zip -0 -q -r "$file" output
-      curl --fail-with-body --retry 3 \
-        --header "JOB-TOKEN: $CI_JOB_TOKEN" \
-        --upload-file "$file" "$url"
+      curl --fail-with-body --retry 3 --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$file" "$url"
       echo
       echo "disk published: $url"
-      echo "download + unpack with: curl --header \"PRIVATE-TOKEN: <token>\" \"$url\" -o out.zip && unzip out.zip"
 
 provision:x86_64:
   extends: .provision
   variables:
     ARCH: x86_64
-    DISK: qcow2
 
 provision:aarch64:
   extends: .provision
   variables:
     ARCH: aarch64
-    DISK: raw
-  # Build the aarch64 raw disk on a native arm64 runner — no emulation.
   tags: [saas-linux-small-arm64]

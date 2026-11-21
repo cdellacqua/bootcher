@@ -14,7 +14,7 @@ def _find_scripts():
     copied them to `ci/` and these tests to `ci/tests/`."""
     here = pathlib.Path(__file__).resolve().parent
     for candidate in (here.parent / "scripts", here.parent):
-        if (candidate / "base_check.py").exists():
+        if (candidate / "release_check.py").exists():
             return candidate
     raise FileNotFoundError(f"no CI scripts found next to {here}")
 

@@ -1,409 +1,248 @@
 # Recipe: CI/CD for a bootcher project
 
-Multi-arch pipeline templates that run bootcher in CI — building **x86_64 and
-aarch64 on native runners** (no cross-arch emulation), in three stages:
+Multi-arch pipeline templates for a project with a `[registry]`: they publish
+**releases** from git tags, **promote** them to the channels your devices follow, keep
+those channels on a patched base with scheduled **refreshes**, and build **disk images**
+for new channel devices. Every build runs on a native runner per arch (x86_64 and
+aarch64), never under emulation.
 
-- **build** — one job per arch, in parallel on a native-arch runner each. `bootcher
-  build --target <arch>` builds just that arch's container and stops at the per-arch
-  member tag `<name>:latest-<arch>` (no multi-arch list yet), which the job **pushes to
-  the registry under a scratch tag `<image>:ci-<arch>`** that **deploy** pulls. Why the
-  registry, not a CI artifact? A full OS-image member is large (easily >1 GB) and blows
-  the free-tier artifact caps — GitHub's Actions artifact storage (~500 MB, and a single
-  member can exceed it outright) and GitLab.com's 1 GB job-artifact cap. The scratch tag
-  sidesteps that pool entirely and shares layers with the `:latest` list deploy publishes,
-  so it costs ~no extra registry storage and is overwritten each run. The push
-  authenticates with your repo's **automatic** token (`GITHUB_TOKEN` with `packages:
-  write` / GitLab's `$CI_JOB_TOKEN`), so no manual secret is needed. Why split per arch?
-  A single-runner multi-arch build would emulate the foreign arch under qemu-user — slow
-  and occasionally fragile; native runners are faster and sounder.
-- **deploy** — pulls both per-arch members from their scratch tags, retags them to the
-  local member name, and `bootcher deploy --skip-build` **assembles the multi-arch
-  manifest list from them** and pushes `<registry>/<name>:latest` (+ an immutable CalVer
-  tag) to the **registry associated with your repo** (GHCR for GitHub, the project
-  Container Registry for GitLab). It also holds the signing key, if enabled. The scratch
-  tags are left in place — they dedupe against `:latest` and are overwritten next run, so
-  they need no cleanup. Runs automatically on the default branch and on tags; devices
-  self-update from there.
-- **cleanup** (GitHub) — after a successful deploy, prunes old published versions,
-  keeping `:latest` + the newest `KEEP_PREVIOUS` immutable CalVer releases (a knob at
-  the top of the workflow). It's **multi-arch-safe**: GHCR stores each arch's child
-  manifest as its own version, so the job deletes by **digest** — building the set of
-  digests to keep (the kept releases, plus the `latest`/channel/`ci-<arch>` tags) and
-  extending it with the arch children those kept lists reference, then deleting only
-  what's outside it. A naive "keep N, delete the rest" would delete the members of the
-  release you're keeping and corrupt it. cosign signatures (also their own versions)
-  aren't counted as releases: each is kept exactly when the image it signs is. On **GitLab** this is a job you don't write:
-  turn on the project's built-in **Container Registry cleanup policy** instead (see
-  below).
-- **provision** — one job per arch (e.g. a qcow2 for x86_64, a raw for aarch64).
-  `bootcher provision --target <arch> --disk <type> --skip-build` builds the disk
-  natively and publishes `output/` as a single **`.zip`** (the disk `zstd`-compressed
-  inside) for you to download and flash — extract natively (Windows Explorer included),
-  then hand the `disk.*.zst` straight to rpi-imager / balenaEtcher, which read `zstd`
-  directly. Lands on a **per-commit GitHub Release asset** on GitHub, or the
-  project's **generic Package Registry** on GitLab. Both sidestep the run-artifact
-  size limits (GitLab.com caps job artifacts at 1 GB; a sparse bootc disk easily
-  exceeds that), give a stable versioned download, and don't expire the way an
-  artifact does. Runs on demand, since you only need a fresh disk when enrolling a new
-  device. `--skip-build` **reuses the image `deploy` pushed** — it pulls that arch's
-  member out of `<registry>/<name>:latest` instead of rebuilding the container — so
-  the job skips the multi-minute container build and the flashed disk is byte-for-byte
-  what devices auto-update to (a rebuild from source could drift). Because a disk build
-  should fire only when you want to flash a device, it's **manually gated** — but the
-  gate differs by platform, because GitHub Free can't pause a job inside a push pipeline
-  (Environment "Required reviewers" is public-repo-only on Free). On **GitLab** provision
-  stays in the pipeline, **chained behind deploy** (`needs`) with a `when: manual` play
-  button, so it reuses *this pipeline's* freshly built image. On **GitHub** provision is
-  its **own `workflow_dispatch` workflow** (`provision.yml`) you launch by hand from the
-  Actions tab — the "Run workflow" button is the gate, on every plan — and, decoupled from
-  a single run, it builds from the **current** `<registry>/<name>:<channel>` tip, so
-  dispatch it once the build→deploy run for the image you want has finished. The job logs
-  in to the registry to pull (read access is enough);
-  for a **public** registry, drop that login — the pull is anonymous — and separately
-  pass `--anonymous` to `bootcher provision` so it bakes no pull credential into the
-  disk either (the device pulls updates anonymously too).
+| Trigger | Jobs |
+|---|---|
+| push a `v*` git tag | per-arch `build --target` → hand-off → `release publish "$TAG" --skip-build` |
+| manual | `channel promote -y --skip-remotes <release> <channel>` |
+| manual, with a release | per-arch build of the release's commit → hand-off → `release refresh <release> --skip-build` |
+| schedule, one per channel | `channel status <channel>` → if its base moved: per-arch build of the commit it serves → hand-off → `channel refresh <channel> -y --skip-remotes --skip-build` |
+| manual, per arch | `device provision --channel <channel> --target <arch>` |
+| branch push | nothing |
 
-The per-arch members move between jobs through the registry (the `<image>:ci-<arch>`
-scratch tags), a CI-only handoff, so bootcher's own `build`/`deploy` on a dev box are
-unchanged. Single-arch project?
-Drop one arch from the matrix (GitHub) / delete the second `build:`/`provision:` job
-(GitLab), and list only that arch in `[targets]`.
+Branch pushes run nothing on purpose: **direct** devices (the bench board on your desk)
+are updated from a workstation with `bootcher device deploy`, and **channel** devices
+only ever get releases someone promoted. CI never reaches a device either
+(`--skip-remotes`): a fleet behind NAT isn't routable from a cloud runner, and channel
+devices update themselves on their `bootc-fetch-apply-updates.timer`. From a workstation
+that does reach them, run the same `channel promote` without `--skip-remotes` to update
+them right away.
 
 | Platform | File | Copy it to |
 |---|---|---|
-| GitHub Actions (deploy) | [`github-actions/deploy.yml`](github-actions/deploy.yml) | `.github/workflows/bootcher-deploy.yml` |
-| GitHub Actions (provision) | [`github-actions/provision.yml`](github-actions/provision.yml) | `.github/workflows/bootcher-provision.yml` |
+| GitHub Actions | [`github-actions/release.yml`](github-actions/release.yml) | `.github/workflows/bootcher-release.yml` |
+| GitHub Actions | [`github-actions/promote.yml`](github-actions/promote.yml) | `.github/workflows/bootcher-promote.yml` |
+| GitHub Actions | [`github-actions/refresh.yml`](github-actions/refresh.yml) | `.github/workflows/bootcher-refresh.yml` |
+| GitHub Actions | [`github-actions/provision.yml`](github-actions/provision.yml) | `.github/workflows/bootcher-provision.yml` |
 | GitLab CI | [`gitlab-ci.yml`](gitlab-ci.yml) | `.gitlab-ci.yml` (repo root) |
 | Both | [`bootcher.ci.toml`](bootcher.ci.toml) | `bootcher.ci.toml` (repo root, beside `bootcher.toml`) |
 | Both | [`scripts/`](scripts/) | `ci/` (repo root) |
 
-The deploy pipelines run a few stdlib-only Python scripts from `ci/`
-([`base_check.py`](scripts/base_check.py), [`release_check.py`](scripts/release_check.py),
-and on GitHub [`ghcr_cleanup.py`](scripts/ghcr_cleanup.py)), so copy the whole
-[`scripts/`](scripts/) directory into your repo as `ci/` alongside the workflow file(s).
-Each script's docstring says what it does and which environment variables it reads;
-they're yours to adapt like the workflows. [`tests/`](tests/) holds bootcher's own
-tests for them (stdlib `unittest`, with a fake `skopeo` and a fake GitHub API); you
-don't need to copy it, but it's a starting point if you change a script's decision
-logic (`check()` in the two checks, `plan()` in `ghcr_cleanup.py`). To use it, copy it
-into your repo as `ci/tests/`, so the scripts and their tests travel together, and run
-`python3 -B -m unittest discover -s ci/tests` from the repo root.
+The pipelines run inside the published bootcher image,
+[`ghcr.io/cdellacqua/bootcher`](https://ghcr.io/cdellacqua/bootcher) (multi-arch,
+bundling podman, skopeo, git and qemu), so there's nothing to install on the runner. Each
+recipe pins the image to the bootcher release it was written for (`:vX.Y.Z`, stamped by
+bootcher's release process), so a copied recipe keeps running the CLI it expects. Copy the
+recipes from the tag of the bootcher you use, and move the pin in every file together when
+you upgrade.
 
-**Release channels?** For a workflow where the default branch publishes the rolling
-`latest` channel and a `v*` git tag promotes to a `stable` channel for a production
-fleet, see the [`channels/`](channels/) variant of this recipe — same pipeline shape,
-with the trigger choosing which [channel](../../docs/src/reference/bootcher-toml.md#channels)
-each push publishes to.
+## The flow
 
-Both pipelines run **inside the published bootcher image**,
-[`ghcr.io/cdellacqua/bootcher`](https://ghcr.io/cdellacqua/bootcher) — multi-arch
-(amd64 + arm64), bundling podman and qemu — so there's nothing to install in the
-runner. They reference `:latest`; pin it to a released `:vX.Y.Z` for reproducible
-builds.
+```sh
+git tag v1.4 && git push origin v1.4     # CI publishes <registry>/<name>:v1.4
+# Actions → "bootcher promote" (GitHub) / the promote:next play button (GitLab)
+#   → :next serves v1.4; canary devices update on their next timer run
+# … later, the same for stable
+# scheduled: the base moved → v1.4 is rebuilt from its commit, :v1.4 re-pushed, the
+#   channels serving it re-copied
+```
+
+A release is named by its git tag, built from the tag's commit, and recorded at it
+(`bootcher.source`). Republishing a tag that's already published from the same commit is
+a no-op, so re-running a pipeline is safe.
+
+**Rollback** is a promote of the previous release (`channel promote` prints it). If that
+release's base has moved since, the promote refuses: refresh it first (the manual
+refresh with that release), then promote it. On a direct device, `bootc rollback` is the
+only rollback.
+
+**Pausing a channel's refresh**: drop its line from the schedules (GitHub: `schedule:`
+and the `SCHEDULES` table in `refresh.yml`; GitLab: its pipeline schedule). From a
+workstation, `bootcher channel refresh --exclude <channel>` does the same for one run.
+
+**More than three tags at once**: GitHub sends no push events when more than three tags
+are pushed in one `git push`. Push release tags one at a time, or run `release.yml` by
+hand on the tag.
+
+**`--git-tag push` costs a CI build**: publishing from a workstation with
+`bootcher release publish v1.5 --git-tag push` pushes the tag, which triggers the tag
+pipeline — a second, redundant build (the publish itself is then a no-op). Use
+`--git-tag local` and push the tag yourself when you want CI to do the publishing, or
+publish only from CI.
 
 ## Point the manifest at your repo's registry
 
-bootcher reads the registry from `bootcher.toml` (it's committed, not a secret), so
-set it to your repo's namespace. The image published is `<registry>/<name>:latest`,
-where `<name>` is `[general] name`.
+bootcher reads the registry from `bootcher.toml` (committed, not a secret). The image is
+`<url>/<name>`, where `<name>` is `[general] name`; channels are declared there too.
 
 ```toml
-# GitHub — lowercase owner; yields ghcr.io/<owner>/<name>
-[deploy]
-registry = "ghcr.io/<owner>"
+[registry]
+url = "ghcr.io/<owner>"                      # GitHub: lowercase owner
+# url = "registry.gitlab.com/<group>/<project>"  # GitLab: equals $CI_REGISTRY_IMAGE
+channels = ["stable", "next"]
 
-# GitLab — equals $CI_REGISTRY_IMAGE; yields registry.gitlab.com/<group>/<project>/<name>
-[deploy]
-registry = "registry.gitlab.com/<group>/<project>"
-```
-
-CI authenticates separately with `podman login` (GHCR via `GITHUB_TOKEN`, GitLab
-via the job's `CI_REGISTRY_*`), so the URL above carries no credential.
-
-**No image ref to configure.** The templates don't ask you to restate `<registry>/<name>`
-anywhere: each job derives it at runtime with `bootcher info --format '{{ .Image }}'`
-(and the member name from `{{ .Name }}`), which resolves the same ref `deploy` publishes.
-Doing it in the tool — not with a hand-written `IMAGE:` var or a `sed` over `bootcher.toml`
-— means the pipeline follows the `extend` chain and the inline-table `[deploy] registry`
-(signing) form, so the value CI tags scratch members and prunes packages by can't drift
-from the one bootcher pushes. `bootcher info` prints the whole resolved project as JSON
-by default; pass a `--format` template to pull one field.
-
-These templates are multi-arch, so `bootcher.toml` must also list **both** arches in
-`[targets]`, mapped to the disk type each should produce — the `build`/`provision`
-jobs scope to one arch with `--target`:
-
-```toml
 [targets]
 x86_64  = "qcow2"   # a VM image
 aarch64 = "raw"     # a raw image for an edge device
 ```
 
-## The `bootcher.ci.toml` override
+Keep the channel list in sync with the GitHub `channel` input options (`promote.yml`,
+`provision.yml`), the `SCHEDULES` table, and the GitLab `promote:<channel>` jobs. Every
+`refresh.yml` run, manual ones included, checks that each `schedule:` cron has a
+`SCHEDULES` line and each line names a declared channel, and fails naming the line to
+fix; a GitLab schedule whose `SCHEDULE_CHANNEL` isn't declared fails the same way.
 
-Both pipelines run with `--manifest bootcher.ci.toml`, a small committed override
-that [`extend`s](../../docs/src/reference/bootcher-toml.md#extend-top-level-optional)
-your `bootcher.toml` and changes one thing: it forces podman onto the host network
-(`--network=host`) for the build steps.
+The arches come from `[targets]` too: each GitHub workflow's first job turns `bootcher
+info --format '{{ json .Arches }}'` into the build matrix, mapping each arch to a native
+runner through the `RUNNERS` table at the top of the file (edit it for self-hosted or
+larger runners). GitLab has no dynamic matrix, so `build:<arch>` and `provision:<arch>`
+are written out for both arches, and a job whose arch isn't a target does nothing. A
+single-arch project copies the recipes unchanged.
 
-```toml
-extend = "bootcher.toml"
+The jobs never restate `<registry>/<name>`: each derives it at runtime with `bootcher
+info --format '{{ .Image }}'` (and the member name from `{{ .Name }}`), which follows the
+`extend` chain, so the value CI tags scratch members and prunes packages by can't drift
+from the one bootcher publishes.
 
-[builder]
-build = { type = "local", podman_opts = ["--network=host"] }
-image = { type = "local", podman_opts = ["--network=host"] }
-```
+## The hand-off between jobs
 
-Inside a privileged CI container, rootless/nested podman's per-container networking
-(netavark + nftables) is a common source of opaque build failures. `--network=host`
-makes podman reuse the runner's network namespace instead of programming its own,
-sidestepping the nftables path entirely. It's set on **both** roles so it covers the
-`build` jobs (the container build) and `provision` (the image-builder disk step).
-Everything else — name, registry, `[targets]`, deploy targets, hooks — is inherited
-from `bootcher.toml`, so this file never drifts: edit your real config there, not here.
+Each per-arch build job pushes its member under a scratch tag keyed by the commit,
+`<image>:ci-<sha12>-<arch>`; the publish or refresh job pulls them back as the local
+`localhost/<name>:latest-<arch>` images `--skip-build` takes. `--skip-build` checks that
+each one records the release's commit, so a stale or mismatched member is refused rather
+than published. The registry, not CI artifacts, because a full OS-image member easily
+exceeds the free-tier artifact caps (GitHub's ~500 MB storage, GitLab.com's 1 GB per
+job); the scratch tag shares its layers with the release, so it costs almost nothing.
+The push uses the platform's automatic token (`GITHUB_TOKEN` with `packages: write`,
+GitLab's `CI_REGISTRY_*`).
 
-Local runs (`bootcher deploy` / `provision` with no `--manifest`) are unaffected —
-they still use the plain `bootcher.toml`, where podman's default networking works
-fine.
+Publishing and moving channels never run at the same time for one image: GitHub puts
+`release.yml`, `promote.yml` and `refresh.yml` in one `concurrency` group without
+`cancel-in-progress`, GitLab uses a `resource_group`.
 
-## Secrets & variables
+## Base-image patches
 
-Set these under GitHub *Settings → Secrets and variables → Actions* or GitLab
-*Settings → CI/CD → Variables*. Mask the credentials below; `ADMIN_SSH_PUBKEY` is a
-public key, so add it as a plain (unmasked) **variable** rather than a secret.
+The `Containerfile` builds `FROM` a fedora-bootc tag that keeps moving with Fedora's
+updates, but a release only picks those up when it's rebuilt. The scheduled refresh does
+that per channel, without shipping unreleased source:
+
+1. `bootcher channel status <channel> --format '{{ .Stale }} …'` reads the release the
+   channel serves, its source commit, and whether each member's recorded base
+   (`org.opencontainers.image.base.digest`) is still the base tag's current digest for
+   that arch. Anything it can't verify counts as moved.
+2. If it moved, the build jobs check out **that release's commit** (a full clone) and
+   build it under **that commit's own** `bootcher.ci.toml`, on today's base.
+3. `bootcher channel refresh <channel> --skip-build` re-pushes the release (signed, same
+   name, same source) and re-copies every channel serving it. A channel a promote moved
+   in the meantime is left alone.
+
+Stagger the schedules so the canary channel runs a new base for a few days before
+production does. A refresh moves the channel's digest, so its devices download it and
+reboot on their next timer run: time the schedule ahead of the window you want that in.
+
+A refresh builds old source with the current bootcher and that commit's config. A
+breaking change to the build sections, or a commit without `bootcher.ci.toml`, makes that
+refresh fail loudly; publish a new release then. Gitignored or generated build inputs
+don't exist in the checkout either. Releases published before bootcher recorded
+`bootcher.source` can't be refreshed: publish them again.
+
+**The pinned Fedora release.** The scaffold pins one Fedora release (`ARG
+FEDORA_VERSION`), and that release's tag stops moving at end of life — from then on no
+channel is ever stale again. The scheduled `release-check` job
+([`ci/release_check.py`](scripts/release_check.py)) compares the pin with the release
+`fedora-bootc:latest` points at: it warns at one release behind and fails at two. It
+gates nothing; the failure is the alert. Bump `FEDORA_VERSION`, commit, tag a release,
+promote it.
+
+## Disk images for new devices
+
+The manual provision jobs build each arch's `[targets]` disks with `bootcher device provision
+--channel <channel>`: the disk is built from exactly what the channel serves (pulled by
+digest, never rebuilt), with the read-only pull credential and, with signing on, the
+trust files baked in, and its bootc origin set to the channel. The `.zip` (each disk
+`zstd`-compressed inside) lands on a GitHub Release `disk-<channel>-<release>`, or in
+GitLab's generic Package Registry under `disk/<channel>-<release>/`. Extract it natively,
+then hand the `disk.*.zst` to rpi-imager / balenaEtcher, which read `zstd` directly.
+
+For a **public** registry, drop the pull credential and pass `--anonymous`: no
+`auth.json` is baked and the device pulls anonymously.
+
+## Secrets and variables
 
 | Secret | Used by | What it is |
 |---|---|---|
-| `ADMIN_SSH_PUBKEY` | provision | Admin SSH **public** key (the `.pub` line), baked in as the `admin` login. **Not secret** — provision reads only the public half, so a plain repository **variable** is enough (GitHub: the *Variables* tab; GitLab: an unmasked CI/CD variable). Keep the matching private key wherever you SSH to devices from. |
-| `PULL_USER` / `PULL_TOKEN` (GitHub)<br>`BOOTCHER_PULL_USER` / `BOOTCHER_PULL_TOKEN` (GitLab) | provision, registry mode | A **long-lived, read-only** registry credential baked into the disk so the device can pull updates. **GitHub:** `PULL_USER` is your GitHub username (or org), `PULL_TOKEN` a PAT with `read:packages`. **GitLab:** create a **Deploy Token** with `read_registry` scope under *Settings → Repository → Deploy tokens* — **not** *Settings → Access tokens* (that page gives no username). After creating, copy **both** fields from the one-time banner: the username (`gitlab+deploy-token-…`, or a custom name if you set one) → `BOOTCHER_PULL_USER`, and the secret → `BOOTCHER_PULL_TOKEN`. The username isn't shown again, so if you navigate away first, delete and recreate the token. **Not** the ephemeral `GITHUB_TOKEN` / `CI_JOB_TOKEN` — those expire when the run ends, leaving a device that can't update. Omit for a public registry and pass `--anonymous` (see the comments in each file). |
-| `SIGN_KEY` / `SIGN_PASSPHRASE` | both, optional | The cosign private key and its passphrase — only if you enabled [image signing](../../docs/src/concepts/signing.md). The `*.key` is git-ignored, so CI must restore it from a secret; the passphrase is read from `BOOTCHER_SIGN_PASSPHRASE`. |
+| `ADMIN_SSH_PUBKEY` | provision | The admin SSH **public** key (the `.pub` line), baked in as the `admin` login. Not secret: a plain repository/CI **variable** is enough. |
+| `PULL_USER` / `PULL_TOKEN` (GitHub)<br>`BOOTCHER_PULL_USER` / `BOOTCHER_PULL_TOKEN` (GitLab) | provision | A **long-lived, read-only** registry credential baked into the disk so the device can pull updates. GitHub: your username and a PAT with `read:packages`. GitLab: a **Deploy Token** with `read_registry` (Settings → Repository → Deploy tokens; copy both fields from the one-time banner). **Not** the job token — it expires with the run. |
+| `SIGN_KEY` / `SIGN_PASSPHRASE` | publish, refresh | The cosign private key and its passphrase, with [image signing](../../docs/src/concepts/signing.md) on. The `*.key` is git-ignored, so CI restores `SIGN_KEY` to the path `[registry] key` names (`bootcher info --format '{{ .Key }}'`), which follows a `signing rotate`; with signing off the step does nothing, and with it on an empty secret fails it. The passphrase is read from `BOOTCHER_SIGN_PASSPHRASE`. After a rotation, replace both secrets with the new key's. On GitLab, protect your `v*` tags and mark both variables protected (plain variables, not *file* ones), so they reach the tag pipelines and nothing else. |
 
-The push credential for **deploy** is the platform's built-in job token — no manual
-secret needed.
+If you restore files with GitLab's *secure files*, add `.secure_files/` to `.gitignore`:
+`release publish` refuses a dirty tree.
 
-## Why deploy uses `--skip-bootc-upgrade`
+Promote needs neither the signing key nor a build environment: it checks the release's
+signature against the public key and copies by digest. Gate who may promote with an
+Environment per channel (GitHub `environment:` on the promote job; GitLab protected
+environments for the `promote:<channel>` jobs). Those gates are paid features outside
+public repos: GitHub's required reviewers need Enterprise in a private repo (branch
+restrictions Pro or Team), and GitLab's protected environments need Premium. Without
+them the environment gates nothing, and anyone who can run the workflow can promote.
 
-In registry mode `deploy` pushes the image and then SSHes into each `[deploy]
-remotes` device as `admin@host` to run `bootc upgrade`. The templates skip that
-second half because it's the wrong place to do it, not because it's impossible:
+## Pruning old images
 
-- it needs the admin **private key** in the runner and a pinned host key, and
-- it needs CI to actually reach each device — fine for a public-IP VPS fleet, but
-  edge/kiosk/home devices behind NAT/LAN/VPN aren't routable from a cloud runner.
+Releases, refreshes and scratch tags accumulate.
 
-And it's unnecessary: registry mode means devices self-update on their
-`bootc-fetch-apply-updates.timer`, so publishing the image *is* the deploy. Drop
-`--skip-bootc-upgrade` (and supply the key + reachability) only if you want CI to
-roll the fleet immediately; otherwise run a plain `bootcher deploy` from an
-operator machine that can reach the devices.
+**GitHub** — the `cleanup` job (after a publish or a refresh, with
+[`ci/ghcr_cleanup.py`](scripts/ghcr_cleanup.py)) keeps every channel, every release a
+channel serves (read from the `bootcher.release` annotation on each channel's index entries, so a channel that
+lags its release keeps both), the in-flight `ci-*` scratch tags (younger than
+`CI_MAX_AGE_HOURS`, default 24), and the newest `KEEP_PREVIOUS` other releases. It
+deletes the rest: older releases, old scratch tags, and the untagged digests a refresh
+orphaned when it re-pushed a release. It's multi-arch-safe — GHCR stores each arch's
+member as its own (untagged) package version, so it deletes by digest, keeping the members
+the kept lists reference — and each cosign signature (`sha256-<digest>.sig`) follows the
+image it signs. Set `DRY_RUN: "true"` to log the plan first. An org-owned package may
+need a `CLEANUP_TOKEN` PAT with `delete:packages` as `GH_TOKEN`.
 
-(LAN mode — no `registry` in the manifest — can't be driven from CI at all: it
-tunnels the image to devices over SSH from the operator's machine. These recipes
-assume registry mode.)
+**GitLab** — use the project's built-in **Container Registry cleanup policy**
+(Settings → Packages and registries → Clean up image tags) instead of a job. Keep the
+signature attachments (`sha256-.*`), your channel names, and recent `ci-.*` tags in *Keep
+tags matching*; let it remove older release tags beyond the number you keep. GitLab's
+registry garbage collection then reclaims unreferenced layers.
 
-## Weekly rebuilds for base-image updates
+## The scripts
 
-The `Containerfile` builds `FROM` a fedora-bootc tag that keeps moving with Fedora's
-updates (the scaffold's pinned release tag, e.g. `:45`), but that tag only moves your
-image when you rebuild. Without a rebuild, a fleet that sees no commits never gets
-Fedora's security updates. So the pipeline also rebuilds on a schedule:
+The pipelines run two stdlib-only Python scripts from `ci/`:
+[`release_check.py`](scripts/release_check.py) (both platforms) and
+[`ghcr_cleanup.py`](scripts/ghcr_cleanup.py) (GitHub). Each docstring says what it does
+and which environment variables it reads. [`tests/`](tests/) holds bootcher's own tests
+for them (stdlib `unittest`, with a fake `skopeo` and a fake GitHub API); copy it as
+`ci/tests/` if you change a script's decision logic (`check()`, `plan()`), and run
+`python3 -B -m unittest discover -s ci/tests`.
 
-- **GitHub** — `deploy.yml` has a weekly `schedule:` trigger plus `workflow_dispatch`
-  for an on-demand rebuild. GitHub disables schedules in a public repo after 60 days
-  without activity, so re-enable it from the Actions tab if the repo goes quiet.
-- **GitLab** — add a pipeline schedule on the default branch (Build → Pipeline
-  schedules). `rules:changes` evaluates to true when there's no push to diff, so the
-  path gate lets it through.
+## The `bootcher.ci.toml` override
 
-**A scheduled run only rebuilds when the base image moved.** Every rebuild produces a new
-digest, and devices download it and **reboot** on their next
-`bootc-fetch-apply-updates.timer` run, so rebuilding onto an unchanged base would cost a
-reboot for nothing. buildah stamps each built image with its base
-(`org.opencontainers.image.base.name` / `.base.digest` annotations, `ARG`s resolved),
-and those survive into the published per-arch members. The scheduled check compares
-each member's recorded base digest with the base tag's current digest for that arch,
-and skips the build if they all match. Anything it can't verify about the base (first
-run, an image built before the check existed, a base it can't inspect) rebuilds, so a
-broken check never costs you a security update. If it can't read the published image at
-all (an expired token, a registry outage), the run fails instead of skipping quietly.
+Every job runs with `--manifest bootcher.ci.toml`, a committed override that
+[`extend`s](../../docs/src/reference/bootcher-toml.md#extend-top-level-optional) your
+`bootcher.toml` and changes one thing: podman uses the host network for both build roles
+(`--network=host`), sidestepping nested podman's netavark/nftables setup inside a
+privileged CI container, a common source of opaque build failures. Everything else is
+inherited. A refresh builds an older commit under **its** `bootcher.ci.toml`, so keep the
+file committed.
 
-A refresh rebuilds **the commit `:latest` currently ships** (its
-`org.opencontainers.image.revision` label) rather than whatever the default branch points
-at. Normally those are the same source; if `:latest` has no label, the default branch
-it is.
+## Requirements and troubleshooting
 
-- **GitHub** — the `changes` job runs the check on a schedule (skopeo is on the runner;
-  `bootcher info` runs from the published bootcher image) and gates `build` on it.
-- **GitLab** — a schedule-only `base-check` job runs it and hands `BASE_CHANGED` to
-  `build`/`deploy` as a dotenv report; with `false` they exit early, green. It needs
-  skopeo, which the bootcher image ships from v0.2.6.
-
-A **manual run always rebuilds** (on GitHub, only from the default branch or a `v*`
-tag). Use it after a Fedora advisory, or for packages your
-`Containerfile` layers on top: those only refresh on a schedule when the base moves too,
-which for fedora-bootc is usually within the week.
-
-**A scheduled run also checks the Fedora release.** The scaffold pins one Fedora release
-(`ARG FEDORA_VERSION` in the `Containerfile`), and that release's tag stops moving at
-end of life. From then on the base never moves, every scheduled run skips the rebuild,
-and the fleet stops getting security updates while the pipeline stays green. The
-`release-check` job compares it with the release `fedora-bootc:latest` currently points
-at (skopeo plus [`ci/release_check.py`](scripts/release_check.py)) on each schedule: it
-warns while the pin is one release behind and fails once it is two behind (at or within
-weeks of end of life). It gates nothing, so the failure is the alert: bump
-`FEDORA_VERSION`, push, and the normal pipeline rebuilds onto the new release. The
-script reads the pin from `ARG FEDORA_VERSION` and the current release from
-`quay.io/fedora/fedora-bootc:latest`; adapt the two settings at its top if your
-Containerfile pins differently or you pull from a mirror.
-
-Time the schedule ahead of the window you want the reboot in. A private base image needs
-its own `skopeo login` in the check. Refreshes and pushes share `KEEP_PREVIOUS`, so with
-weekly refreshes it covers at most that many weeks of rollback, and fewer with several
-channels or frequent pushes. Scheduled pipelines don't offer the GitLab `provision` jobs:
-provision from a push or tag pipeline.
-
-With [channels](channels/README.md), each channel gets its own staggered schedule, and a
-refresh rebuilds the commit that channel currently ships (from its image's revision label).
-
-## Pruning old published images
-
-Every push publishes a new `:latest` list and a fresh immutable `:<CalVer>` tag, so the
-package accrues one release per deploy. Left alone it grows without bound.
-
-**GitHub** — the `deploy.yml` `cleanup` job (runs after a successful deploy, with
-[`ci/ghcr_cleanup.py`](scripts/ghcr_cleanup.py)) keeps `:latest` + the newest
-`KEEP_PREVIOUS` CalVer releases and deletes the rest. Tune `KEEP_PREVIOUS` (an `env` at
-the top of the workflow; `0` keeps only `:latest`). The prune is **multi-arch-safe** —
-the footgun it sidesteps: GHCR stores each arch's child manifest as its own package
-*version*, usually untagged, so the obvious "keep the N most recent versions, delete the
-rest" deletes the arch members of the release you meant to keep and leaves a `:latest`
-that won't pull. The job instead deletes by **digest**: it computes the digests to keep
-(the kept releases, plus any version tagged with a channel — `latest` and your `[deploy]
-channels` — or a `ci-<arch>` scratch tag), extends that set with the child manifests
-those kept lists reference (read from the registry), and deletes only versions outside
-it. With signing on, each cosign signature (`sha256-<digest>.sig`, again its own
-version) follows its image: it's kept exactly when the list or arch member it signs is
-kept, and never takes up a `KEEP_PREVIOUS` slot. It refuses to run if that would delete
-everything.
-
-- **Token** — it deletes with the built-in `GITHUB_TOKEN` (`packages: write`), which
-  works for a package **linked to this repo**. If the package is org-owned and the token
-  is refused (403), set a `CLEANUP_TOKEN` secret (a PAT / GitHub App token with
-  `delete:packages`) and swap it into the job's `GH_TOKEN`.
-- **Dry run** — flip the job's `DRY_RUN` to `"true"` to log the exact keep/delete split
-  without deleting, confirm it on a first run, then set it back.
-
-**GitLab** — don't write a job for this; use the project's built-in **Container Registry
-cleanup policy** (*Settings → Packages and registries → Clean up image tags*). Keep the N
-most recent tags, match the immutable `CalVer` tags for removal, and add `latest`, your
-channel names, and `ci-.*` to *Keep tags matching* so the mutable pointers and scratch
-members are never swept. GitLab's own registry garbage collection then reclaims the
-unreferenced layers safely — it won't drop a manifest a kept tag still points at.
-
-## Architecture
-
-The templates build **both** arches, each on a native-arch runner, and assemble them
-into one multi-arch image — no cross-arch emulation. The arch fan-out is the runner
-each job lands on: on GitHub a matrix over `runs-on: ubuntu-24.04` (x86_64) and
-`ubuntu-24.04-arm` (aarch64); on GitLab a job per arch, the aarch64 one tagged for a
-hosted arm64 runner — `tags: [saas-linux-small-arm64]` (the small size is on all
-tiers; medium/large are Premium/Ultimate only) — the x86_64 one on the default runner.
-Each `build`/`provision` job scopes bootcher to its runner's arch with `--target`
-(and `provision` picks the disk type with `--disk`), all from the **one shared
-`bootcher.toml`** — no per-arch manifest.
-
-The split exists because building a foreign arch on a single runner means qemu-user
-emulation: slow and occasionally fragile. The per-arch members are handed between jobs
-through the registry (each build pushes a `<image>:ci-<arch>` scratch tag deploy pulls),
-which dodges the free-tier CI artifact caps and dedupes against the final `:latest`; the
-push uses the repo's automatic CI token, so no manual credential is needed. (If you'd
-rather not fan out — e.g. you only have x86_64 runners — point
-the aarch64 `[builder]` at a `vm`/remote and build everything in one job; expect the
-emulation cost.)
-
-**Single-arch project?** List only that arch in `[targets]`, and drop the other arch:
-on GitHub remove it from the `build`/`provision` `matrix.include`; on GitLab delete
-the second `build:`/`provision:` job. `--target` then names your one arch (a build for
-an arch not in `[targets]` is a hard error).
-
-## Only rebuild when the image actually changes
-
-Both templates path-gate the pipeline so a push that can't change the image — docs, a
-README tweak, an unrelated script — doesn't spin up the whole multi-arch build →
-deploy. The build context is the **entire project root**, so the gate is an
-**allowlist** of the inputs that genuinely re-image:
-
-- `Containerfile`
-- `sysroot/**` — the overlay baked into the image
-- `bootcher.toml` and `bootcher.ci.toml` — a registry/`[targets]`/`[hooks]` change re-images too
-- the CI file itself, so editing the pipeline re-runs it (not the `ci/` scripts: they
-  don't change the image; see [testing an edited script](#testing-an-edited-ci-script)).
-
-**A `v*` tag always builds**, path filter or not — a tag is a deliberate release. So
-does a manual run of the default branch or a `v*` tag, and a scheduled one does when the
-base image moved (see
-[Weekly rebuilds](#weekly-rebuilds-for-base-image-updates)).
-
-The gate is applied consistently across stages so the `needs` chain never breaks:
-`build` and `deploy` share it. On **GitLab**, `provision` inherits it transitively (it
-`needs` deploy, so when deploy is filtered out provision drops too — a disk build has
-nothing new to pull anyway). On **GitHub**, `provision` is a separate manual
-`workflow_dispatch` workflow, so the gate doesn't apply to it at all — you launch it only
-when you actually want a disk, and it builds from whatever image is already published.
-
-**Tune the allowlist to your project.** If your `Containerfile` `COPY`s other paths, or
-a `[hooks]` script lives outside `sysroot/`, add those paths — anything in the build
-context that ends up in the image belongs in the list.
-
-- **GitLab** — a hidden `.image-rules` job holds the `rules:` (`changes:` on the
-  default-branch rule, no `changes:` on the tag rule), `!reference`d from both `.build`
-  and `deploy`.
-- **GitHub** — a cheap `changes` pre-job (`dorny/paths-filter`, on a plain runner)
-  outputs a boolean (true on a manual run of the default branch or a `v*` tag, the
-  base-image check on a schedule) that
-  `build` gates on with
-  `if: needs.changes.outputs.image == 'true' || startsWith(github.ref, 'refs/tags/')`.
-
-### Testing an edited CI script
-
-An edited `ci/ghcr_cleanup.py` (GitHub) runs at the next deploy: a push that passes the
-path filter, or a manual run of the default branch or a `v*` tag (a manual run of any
-other branch builds and deploys nothing). Set the cleanup step's `DRY_RUN` to `"true"`
-for that first run, so trying the edit logs what it would delete instead of deleting
-live versions; check the plan, then set it back to `"false"`.
-
-The base and release checks run only on a schedule, which GitHub can't trigger by hand
-(on GitLab the schedule's Run button can, and that's a real refresh). Both only read
-registries, so the simplest test is to run the script locally. Run it from your repo
-root (`release_check.py` reads `./Containerfile`), with `skopeo` installed and, if the
-image (or a mirrored base) is private, logged in with `skopeo login <registry>` first:
-
-```sh
-python3 ci/release_check.py
-IMAGE="$(bootcher --manifest bootcher.ci.toml info --format '{{ .Image }}')" \
-  GITHUB_OUTPUT=/dev/stdout python3 ci/base_check.py
-```
-
-`base_check.py` needs `IMAGE`, plus `CHANNEL` to check a channel other than `latest`.
-Without `GITHUB_OUTPUT` it appends its results (`BASE_CHANGED`, `SOURCE_REV`) to a
-`base.env` file in the current directory, GitLab's dotenv report, which you don't want
-left behind in your repo; `GITHUB_OUTPUT=/dev/stdout` prints them instead.
-
-## Requirements & troubleshooting
-
-- Both pipelines run bootcher **inside its container image**, which needs a
-  **privileged** container so podman can build images (and the disk step can launch
-  the nested image-builder container).
-  - **GitHub**: the templates set `container.options: --privileged`; GitHub-hosted
-    runners allow it. No `/dev/kvm`, so the default in-process `local` builder is
-    the supported path.
-  - **GitLab**: the job container must be privileged. GitLab.com's hosted
-    `saas-linux-*` runners already run in privileged mode (each job in an isolated,
-    ephemeral VM), so the jobs work as-is — no runner setup needed. A self-managed
-    runner (`privileged = true`, or a shell-executor on a podman host) is only needed
-    if you want to narrow the privilege grant or route a build step to a `vm`/`/dev/kvm`.
-- **`podman build` networking errors** (netavark/nftables, "failed to set up
-  network", iptables/chain errors) inside the privileged container are handled up
-  front by [the `bootcher.ci.toml` override](#the-bootcherci-toml-override), which
-  runs the build steps with `--network=host`. If you drop that override, expect to
-  hit these on runners where nested podman can't program its own network.
+- The jobs run bootcher in its container image, which must be **privileged** so podman
+  can build (and image-builder can run nested). GitHub: `container.options:
+  --privileged` (hosted runners allow it). GitLab.com's hosted `saas-linux-*` runners are
+  privileged already; a self-managed runner needs `privileged = true`.
+- The aarch64 jobs run on native arm64 runners: `ubuntu-24.04-arm` on GitHub,
+  `tags: [saas-linux-small-arm64]` on GitLab. Single-arch project? List one arch in
+  `[targets]`: the GitHub matrices follow it, and the other GitLab jobs do nothing (or
+  delete them).
+- The build jobs `chown` the checkout to the container user: git refuses a checkout
+  owned by another uid ("dubious ownership"), and a build without git records no source,
+  which `release publish` then refuses.
