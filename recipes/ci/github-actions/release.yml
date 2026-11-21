@@ -54,7 +54,7 @@ jobs:
     permissions:
       contents: read
     container:
-      image: ghcr.io/cdellacqua/bootcher:latest
+      image: ghcr.io/cdellacqua/bootcher:v0.3.0-snap.g624a640
     outputs:
       matrix: ${{ steps.arches.outputs.matrix }}
     steps:
@@ -78,7 +78,7 @@ jobs:
       contents: read
       packages: write # push the scratch member
     container:
-      image: ghcr.io/cdellacqua/bootcher:latest
+      image: ghcr.io/cdellacqua/bootcher:v0.3.0-snap.g624a640
       options: --privileged
     steps:
       - uses: actions/checkout@v7
@@ -128,7 +128,7 @@ jobs:
       contents: read
       packages: write
     container:
-      image: ghcr.io/cdellacqua/bootcher:latest
+      image: ghcr.io/cdellacqua/bootcher:v0.3.0-snap.g624a640
       options: --privileged
     steps:
       - uses: actions/checkout@v7
@@ -175,7 +175,7 @@ jobs:
       contents: read
       packages: write # delete old package versions
     container:
-      image: ghcr.io/cdellacqua/bootcher:latest
+      image: ghcr.io/cdellacqua/bootcher:v0.3.0-snap.g624a640
     steps:
       - uses: actions/checkout@v7
       - name: Prune old image versions

@@ -55,7 +55,7 @@ jobs:
       contents: read
       packages: write # move the channel tag
     container:
-      image: ghcr.io/cdellacqua/bootcher:latest
+      image: ghcr.io/cdellacqua/bootcher:v0.3.0-snap.g624a640
     steps:
       - uses: actions/checkout@v7
       - name: Promote ${{ inputs.release }} to ${{ inputs.channel }}
