@@ -1,0 +1,93 @@
+# bootcher CI — GitHub Actions PROMOTE workflow: point a channel at a release.
+#
+# Recipe docs: https://github.com/cdellacqua/bootcher/tree/main/recipes/ci
+# Copy to `.github/workflows/bootcher-promote.yml`.
+#
+# Actions → "bootcher promote" → Run workflow → pick the channel, and either the release
+# or `from_channel`: the channel whose release to promote (`channel promote --from`, the
+# canary → production step). `--from` refuses a source channel that lags its release (the
+# release was refreshed since), since its devices never ran that build: promote the
+# release to the source channel first.
+#
+# `channel promote` copies `:<release>` onto `:<channel>` by digest (no rebuild, no
+# re-sign: signatures follow the digest), after checking the release is signed by the
+# configured key (with signing on) and built on the current base (`allow_stale_base` to
+# override). Devices following the channel pick it up on their next auto-update timer
+# run; CI can't reach a fleet behind NAT, so the device step is skipped here
+# (`--skip-remotes`). From a workstation that reaches the devices, run the same command
+# without it to update them right away.
+#
+# Rollback is a promote of the previous release (the job log prints it). A rollback to a
+# release whose base has moved since is refused: refresh it first (refresh.yml, the
+# `release` input), then promote it.
+#
+# Keep the `channel` and `from_channel` options in sync with `[registry] channels` in
+# bootcher.toml.
+
+name: bootcher promote
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Release to promote (e.g. v1.4) — or leave empty and pick from_channel
+        required: false
+        type: string
+      from_channel:
+        description: Or promote the release this channel serves
+        required: false
+        type: choice
+        options: [none, stable, next]
+        default: none
+      channel:
+        description: Channel to move
+        required: true
+        type: choice
+        options: [stable, next]
+      allow_stale_base:
+        description: Promote even if the release's base image has moved
+        type: boolean
+        default: false
+
+# Never alongside a publish or a refresh of the same image.
+concurrency:
+  group: bootcher-registry
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-24.04
+    # An Environment per channel is where to put "required reviewers" or a branch/tag
+    # restriction. In a private repo those rules are paid features (required reviewers:
+    # GitHub Enterprise; branch restrictions: Pro/Team or above): on a free private repo
+    # the environment gates nothing, and anyone who can run workflows can promote.
+    environment: ${{ inputs.channel }}
+    permissions:
+      contents: read
+      packages: write # move the channel tag
+    container:
+      image: ghcr.io/cdellacqua/bootcher:latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Promote ${{ inputs.release || format('what {0} serves', inputs.from_channel) }} to ${{ inputs.channel }}
+        run: |
+          set -eu
+          if [ "$FROM" = none ]; then FROM=''; fi
+          if [ -n "$RELEASE" ] && [ -n "$FROM" ]; then
+            echo "::error::give either release or from_channel, not both"; exit 1
+          elif [ -n "$RELEASE" ]; then
+            set -- channel promote -y --skip-remotes "$RELEASE" "$CHANNEL"
+          elif [ -n "$FROM" ]; then
+            set -- channel promote -y --skip-remotes --from "$FROM" "$CHANNEL"
+          else
+            echo "::error::give the release to promote, or from_channel"; exit 1
+          fi
+          echo "$GITHUB_TOKEN" | skopeo login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          if [ "$ALLOW_STALE" = true ]; then set -- "$@" --allow-stale-base; fi
+          bootcher --manifest bootcher.ci.toml "$@"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE: ${{ inputs.release }}
+          FROM: ${{ inputs.from_channel }}
+          CHANNEL: ${{ inputs.channel }}
+          ALLOW_STALE: ${{ inputs.allow_stale_base }}
