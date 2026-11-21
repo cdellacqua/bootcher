@@ -10,7 +10,7 @@ use semver::Version;
 use std::{fs, path::PathBuf};
 use xshell::{Shell, cmd};
 
-use crate::{cargo, workspace_root};
+use crate::{cargo, changelog, workspace_root};
 
 /// Absolute path to the workspace manifest. Anchored to the workspace root
 /// rather than the process CWD so it resolves the same from a `cargo xtask` run
@@ -21,7 +21,8 @@ fn manifest() -> PathBuf {
 }
 
 /// Cut a release from a clean `main`: bump the workspace version, commit, tag
-/// `vX.Y.Z`, and push both — which triggers the release/image jobs in
+/// `vX.Y.Z` (its message carrying the changelog since the previous release), and
+/// push both — which triggers the release/image jobs in
 /// `.github/workflows/release.yml` (they're gated on `refs/tags/v*`).
 ///
 /// `bump` is `patch`/`minor`/`major` or an explicit `X.Y.Z`.
@@ -54,6 +55,9 @@ pub(crate) fn release(sh: &Shell, bump: &str) -> Result<()> {
 
 	scaffold_release_is_current()?;
 
+	// Rendered before the bump commit exists; it would be skipped anyway.
+	let notes = changelog::unreleased(sh)?;
+
 	write(&next)?;
 	// Restore Cargo.lock too: bumping the version dirties the workspace members'
 	// lock entries. Offline and best-effort — a failure here only means the lock
@@ -62,9 +66,19 @@ pub(crate) fn release(sh: &Shell, bump: &str) -> Result<()> {
 	let _ = cmd!(sh, "{cargo} update --workspace --offline").ignore_stdout().ignore_stderr().run();
 
 	let commit_message = format!("release {tag}");
-	let tag_message = format!("Release {tag}");
+	// The tag's subject line is a title; its body is the changelog, which the
+	// release workflow publishes as the GitHub release description.
+	let tag_message = if notes.is_empty() {
+		format!("Release {tag}\n")
+	} else {
+		format!("Release {tag}\n\n{notes}")
+	};
 	cmd!(sh, "git commit -am {commit_message}").run()?;
-	cmd!(sh, "git tag -a {tag} -m {tag_message}").run()?;
+	// --cleanup=verbatim: the default `strip` mode treats lines starting with `#`
+	// as comments, which would delete every Markdown heading in the notes. Passed
+	// on stdin (`-F -`) so the message reaches git byte for byte.
+	cmd!(sh, "git tag -a --cleanup=verbatim -F - {tag}").stdin(&tag_message).run()?;
+	println!("{tag_message}");
 	cmd!(sh, "git push origin main {tag}").run()?;
 	println!("pushed {tag} — watch the release/image jobs in CI");
 	Ok(())
