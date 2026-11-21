@@ -369,12 +369,25 @@ pub(crate) fn device_registries_d_path() -> String {
 /// images from any other registry) keep working. `containers-storage` stays
 /// permissive so the device's already-pulled local images keep working.
 pub(crate) fn render_policy_json(repo: &str, keypaths: &[&str]) -> String {
+	render_policy(repo, "keyPaths", serde_json::json!(keypaths))
+}
+
+/// [`render_policy_json`] trusting the single key at `keypath`, as `keyPath`. The
+/// build host's one-off checks (`signing verify`, promote) use it, because an older
+/// containers/image (podman 4.9, as on Ubuntu 24.04) rejects `keyPaths` as an
+/// unknown key. Devices run a current containers/image and keep `keyPaths`.
+pub(crate) fn render_single_key_policy_json(repo: &str, keypath: &str) -> String {
+	render_policy(repo, "keyPath", serde_json::json!(keypath))
+}
+
+/// The policy document both renderers share, with `field: keys` as the key set.
+fn render_policy(repo: &str, field: &str, keys: serde_json::Value) -> String {
 	let mut req = serde_json::json!({
 		"type": "sigstoreSigned",
 		"signedIdentity": { "type": "matchRepository" }
 	});
 	let obj = req.as_object_mut().expect("just built an object");
-	obj.insert("keyPaths".into(), serde_json::json!(keypaths));
+	obj.insert(field.into(), keys);
 	let doc = serde_json::json!({
 		"default": [{ "type": "reject" }],
 		"transports": {
@@ -842,6 +855,12 @@ mod tests {
 		let v: serde_json::Value = serde_json::from_str(&policy).unwrap();
 		let req = &v["transports"]["docker"]["reg/org/name"][0];
 		assert_eq!(req["keyPaths"], serde_json::json!(["/k1.pub", "/k2.pub"]));
+		let single: serde_json::Value =
+			serde_json::from_str(&render_single_key_policy_json("reg/org/name", "/k1.pub"))
+				.unwrap();
+		let req = &single["transports"]["docker"]["reg/org/name"][0];
+		assert_eq!(req["keyPath"], "/k1.pub", "podman 4.9 only knows keyPath");
+		assert!(req.get("keyPaths").is_none());
 	}
 
 	#[test]

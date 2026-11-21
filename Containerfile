@@ -46,7 +46,7 @@ RUN cargo build --release --locked -p bootcher-cli
 # image manifest.
 #
 # git-core: bootcher stamps git provenance (`org.opencontainers.image.revision` /
-# `.version` labels, the CalVer tag's commit suffix) by shelling out to git, which is
+# `.version` labels, the `bootcher.source` commit a release is refreshed from) by shelling out to git, which is
 # silently skipped without it — and actions/checkout falls back to a .git-less tarball
 # download when the job container has no git.
 FROM quay.io/fedora/fedora:44
