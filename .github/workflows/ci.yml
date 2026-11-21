@@ -58,6 +58,14 @@ jobs:
       github.ref == 'refs/heads/main' &&
       github.event_name == 'push' &&
       (needs.verify.result == 'success' || needs.verify.result == 'skipped')
+    # Serialize deployments: two pushes to main in quick succession (e.g. a
+    # merge followed by the release bump) would otherwise race, and the second
+    # deploy-pages fails on the one already in progress. No cancel-in-progress,
+    # so a running deploy finishes; GitHub keeps only the newest pending run,
+    # so the site still ends up at the latest main.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     permissions:
       contents: read
